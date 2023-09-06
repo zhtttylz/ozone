@@ -292,10 +292,10 @@ Apache License 2.0
    com.google.guava:guava
    com.google.guava:listenablefuture
    com.google.inject.extensions:guice-assistedinject
-   com.google.inject.extensions:guice-multibindings
    com.google.inject.extensions:guice-servlet
    com.google.inject:guice
    com.google.j2objc:j2objc-annotations
+   com.googlecode.json-simple:json-simple
    com.jolbox:bonecp
    com.lmax:disruptor
    com.nimbusds:nimbus-jose-jwt
@@ -314,6 +314,7 @@ Apache License 2.0
    commons-logging:commons-logging
    commons-net:commons-net
    commons-validator:commons-validator
+   commons-fileupload:commons-fileupload
    info.picocli:picocli
    io.dropwizard.metrics:metrics-core
    io.grpc:grpc-api
@@ -357,8 +358,6 @@ Apache License 2.0
    jakarta.validation:jakarta.validation-api
    javax.enterprise:cdi-api
    javax.inject:javax.inject
-   net.minidev:accessors-smart
-   net.minidev:json-smart
    net.java.dev.jna:jna
    net.java.dev.jna:jna-platform
    org.apache.commons:commons-compress
@@ -366,6 +365,8 @@ Apache License 2.0
    org.apache.commons:commons-lang3
    org.apache.commons:commons-pool2
    org.apache.commons:commons-text
+   org.apache.curator:curator-client
+   org.apache.curator:curator-framework
    org.apache.derby:derby
    org.apache.hadoop:hadoop-annotations
    org.apache.hadoop:hadoop-auth
@@ -411,6 +412,8 @@ Apache License 2.0
    org.apache.ratis:ratis-thirdparty-misc
    org.apache.ratis:ratis-tools
    org.apache.thrift:libthrift
+   org.apache.zookeeper:zookeeper
+   org.apache.zookeeper:zookeeper-jute
    org.codehaus.jackson:jackson-core-asl
    org.codehaus.jackson:jackson-jaxrs
    org.codehaus.jackson:jackson-mapper-asl
@@ -430,7 +433,7 @@ Apache License 2.0
    org.jetbrains:annotations
    org.jetbrains.kotlin:kotlin-stdlib
    org.jetbrains.kotlin:kotlin-stdlib-common
-   org.jboss.weld.servlet:weld-servlet
+   org.jboss.weld.servlet:weld-servlet-shaded
    org.jheaps:jheaps
    org.jooq:jooq
    org.jooq:jooq-codegen
@@ -438,7 +441,6 @@ Apache License 2.0
    org.rocksdb:rocksdbjni
    org.springframework:spring-beans
    org.springframework:spring-core
-   org.springframework:spring-jcl
    org.springframework:spring-jdbc
    org.springframework:spring-tx
    org.xerial.snappy:snappy-java
@@ -450,6 +452,7 @@ Apache License 2.0
 MIT
 =====================
 
+   com.bettercloud:vault-java-driver
    com.kstruct:gethostname4j
    org.bouncycastle:bcpkix-jdk15on
    org.bouncycastle:bcprov-jdk15on
@@ -465,6 +468,8 @@ EPL 2.0
 
    jakarta.annotation:jakarta.annotation-api
    jakarta.ws.rs:jakarta.ws.rs-api
+   org.jgrapht:jgrapht-core
+   org.jgrapht:jgrapht-ext
 
 
 CDDL + GPLv2 with classpath exception
@@ -491,7 +496,6 @@ BSD 3-Clause
    com.google.re2j:re2j
    com.jcraft:jsch
    com.thoughtworks.paranamer:paranamer
-   org.ow2.asm:asm
 
 
 BSD 2-Clause
@@ -509,7 +513,7 @@ WTFPL
 
 
 --------------------------------------------------------------------------------
-hdds-server-scm, ozone-manager, ozone-s3gateway and hdds-server-framework
+hdds-server-scm, ozone-manager, ozone-s3gateway, hdds-rocks-native and hdds-server-framework
 contains the source of the following javascript/css components (See licenses/ for text of these licenses):
 
 Apache Software Foundation License 2.0

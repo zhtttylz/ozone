@@ -20,12 +20,15 @@ package org.apache.hadoop.ozone.security;
 
 import org.apache.commons.io.FileUtils;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
-import org.apache.hadoop.hdds.security.x509.SecurityConfig;
+import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
+import org.apache.hadoop.hdds.security.SecurityConfig;
 import org.apache.hadoop.hdds.security.x509.certificate.client.CertificateClient;
 import org.apache.hadoop.hdds.security.x509.certificate.utils.CertificateCodec;
 import org.apache.hadoop.hdds.security.x509.keys.HDDSKeyGenerator;
 import org.apache.hadoop.hdds.security.x509.keys.KeyCodec;
 import org.apache.hadoop.ozone.OzoneSecurityUtil;
+import org.apache.hadoop.ozone.om.OMStorage;
+import org.apache.hadoop.ozone.om.OzoneManager;
 import org.apache.hadoop.security.ssl.KeyStoreTestUtil;
 import org.apache.ozone.test.GenericTestUtils;
 import org.bouncycastle.cert.X509CertificateHolder;
@@ -35,6 +38,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -52,6 +56,8 @@ import static org.apache.hadoop.hdds.security.x509.certificate.client.Certificat
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.params.provider.Arguments.arguments;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * Test class for {@link OMCertificateClient}.
@@ -93,14 +99,23 @@ public class TestOmCertificateClientInit {
     keyPair = keyGenerator.generateKey();
     x509Certificate = getX509Certificate();
     certSerialId = x509Certificate.getSerialNumber().toString();
-    omCertificateClient = new OMCertificateClient(securityConfig, certSerialId);
+    OMStorage storage = mock(OMStorage.class);
+    when(storage.getOmCertSerialId()).thenReturn(certSerialId);
+    when(storage.getClusterID()).thenReturn("test");
+    when(storage.getOmId()).thenReturn(UUID.randomUUID().toString());
+    HddsProtos.OzoneManagerDetailsProto omInfo =
+        OzoneManager.getOmDetailsProto(config, storage.getOmId());
+    omCertificateClient =
+        new OMCertificateClient(
+            securityConfig, null, storage, omInfo, "", null, null, null);
     omKeyCodec = new KeyCodec(securityConfig, OM_COMPONENT);
 
     Files.createDirectories(securityConfig.getKeyLocation(OM_COMPONENT));
   }
 
   @AfterEach
-  public void tearDown() {
+  public void tearDown() throws IOException {
+    omCertificateClient.close();
     omCertificateClient = null;
     FileUtils.deleteQuietly(metaDirPath.toFile());
   }

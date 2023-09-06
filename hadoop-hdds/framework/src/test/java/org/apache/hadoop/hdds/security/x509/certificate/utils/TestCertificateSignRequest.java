@@ -20,9 +20,8 @@ package org.apache.hadoop.hdds.security.x509.certificate.utils;
 
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.security.exception.SCMSecurityException;
-import org.apache.hadoop.hdds.security.x509.SecurityConfig;
+import org.apache.hadoop.hdds.security.SecurityConfig;
 import org.apache.hadoop.hdds.security.x509.keys.HDDSKeyGenerator;
-import org.apache.hadoop.hdds.security.x509.keys.SecurityUtil;
 import org.bouncycastle.asn1.ASN1Encodable;
 import org.bouncycastle.asn1.ASN1ObjectIdentifier;
 import org.bouncycastle.asn1.ASN1Sequence;
@@ -52,17 +51,19 @@ import java.util.Iterator;
 import java.util.UUID;
 
 import static org.apache.hadoop.hdds.HddsConfigKeys.OZONE_METADATA_DIRS;
+import static org.apache.hadoop.hdds.security.x509.certificate.utils.CertificateSignRequest.getDistinguishedNameFormat;
+import static org.apache.hadoop.hdds.security.x509.certificate.utils.CertificateSignRequest.getPkcs9Extensions;
 
 /**
  * Certificate Signing Request.
  */
 public class TestCertificateSignRequest {
 
-  private static OzoneConfiguration conf = new OzoneConfiguration();
   private SecurityConfig securityConfig;
 
   @BeforeEach
   public void init(@TempDir Path tempDir) throws IOException {
+    OzoneConfiguration conf = new OzoneConfiguration();
     conf.set(OZONE_METADATA_DIRS, tempDir.toString());
     securityConfig = new SecurityConfig(conf);
   }
@@ -75,7 +76,7 @@ public class TestCertificateSignRequest {
     String scmID = UUID.randomUUID().toString();
     String subject = "DN001";
     HDDSKeyGenerator keyGen =
-        new HDDSKeyGenerator(securityConfig.getConfiguration());
+        new HDDSKeyGenerator(securityConfig);
     KeyPair keyPair = keyGen.generateKey();
 
     CertificateSignRequest.Builder builder =
@@ -84,11 +85,11 @@ public class TestCertificateSignRequest {
             .setScmID(scmID)
             .setClusterID(clusterID)
             .setKey(keyPair)
-            .setConfiguration(conf);
+            .setConfiguration(securityConfig);
     PKCS10CertificationRequest csr = builder.build();
 
     // Check the Subject Name is in the expected format.
-    String dnName = String.format(SecurityUtil.getDistinguishedNameFormat(),
+    String dnName = String.format(getDistinguishedNameFormat(),
         subject, scmID, clusterID);
     Assertions.assertEquals(dnName, csr.getSubject().toString());
 
@@ -101,7 +102,7 @@ public class TestCertificateSignRequest {
 
     // Verify CSR with attribute for extensions
     Assertions.assertEquals(1, csr.getAttributes().length);
-    Extensions extensions = SecurityUtil.getPkcs9Extensions(csr);
+    Extensions extensions = getPkcs9Extensions(csr);
 
     // Verify key usage extension
     Extension keyUsageExt = extensions.getExtension(Extension.keyUsage);
@@ -127,7 +128,7 @@ public class TestCertificateSignRequest {
     String scmID = UUID.randomUUID().toString();
     String subject = "DN001";
     HDDSKeyGenerator keyGen =
-        new HDDSKeyGenerator(securityConfig.getConfiguration());
+        new HDDSKeyGenerator(securityConfig);
     KeyPair keyPair = keyGen.generateKey();
 
     CertificateSignRequest.Builder builder =
@@ -136,7 +137,7 @@ public class TestCertificateSignRequest {
             .setScmID(scmID)
             .setClusterID(clusterID)
             .setKey(keyPair)
-            .setConfiguration(conf);
+            .setConfiguration(securityConfig);
 
     // Multi-home
     builder.addIpAddress("192.168.1.1");
@@ -148,7 +149,7 @@ public class TestCertificateSignRequest {
     PKCS10CertificationRequest csr = builder.build();
 
     // Check the Subject Name is in the expected format.
-    String dnName = String.format(SecurityUtil.getDistinguishedNameFormat(),
+    String dnName = String.format(getDistinguishedNameFormat(),
         subject, scmID, clusterID);
     Assertions.assertEquals(dnName, csr.getSubject().toString());
 
@@ -161,7 +162,7 @@ public class TestCertificateSignRequest {
 
     // Verify CSR with attribute for extensions
     Assertions.assertEquals(1, csr.getAttributes().length);
-    Extensions extensions = SecurityUtil.getPkcs9Extensions(csr);
+    Extensions extensions = getPkcs9Extensions(csr);
 
     // Verify key usage extension
     Extension sanExt = extensions.getExtension(Extension.keyUsage);
@@ -183,7 +184,7 @@ public class TestCertificateSignRequest {
     String scmID = UUID.randomUUID().toString();
     String subject = "DN001";
     HDDSKeyGenerator keyGen =
-        new HDDSKeyGenerator(securityConfig.getConfiguration());
+        new HDDSKeyGenerator(securityConfig);
     KeyPair keyPair = keyGen.generateKey();
 
     CertificateSignRequest.Builder builder =
@@ -192,7 +193,7 @@ public class TestCertificateSignRequest {
             .setScmID(scmID)
             .setClusterID(clusterID)
             .setKey(keyPair)
-            .setConfiguration(conf);
+            .setConfiguration(securityConfig);
 
     try {
       builder.setKey(null);
@@ -230,7 +231,7 @@ public class TestCertificateSignRequest {
     PKCS10CertificationRequest csr = builder.build();
 
     // Check the Subject Name is in the expected format.
-    String dnName = String.format(SecurityUtil.getDistinguishedNameFormat(),
+    String dnName = String.format(getDistinguishedNameFormat(),
         subject, scmID, clusterID);
     Assertions.assertEquals(dnName, csr.getSubject().toString());
 
@@ -252,7 +253,7 @@ public class TestCertificateSignRequest {
     String scmID = UUID.randomUUID().toString();
     String subject = "DN001";
     HDDSKeyGenerator keyGen =
-        new HDDSKeyGenerator(securityConfig.getConfiguration());
+        new HDDSKeyGenerator(securityConfig);
     KeyPair keyPair = keyGen.generateKey();
 
     CertificateSignRequest.Builder builder =
@@ -261,7 +262,7 @@ public class TestCertificateSignRequest {
             .setScmID(scmID)
             .setClusterID(clusterID)
             .setKey(keyPair)
-            .setConfiguration(conf);
+            .setConfiguration(securityConfig);
 
     PKCS10CertificationRequest csr = builder.build();
     byte[] csrBytes = csr.getEncoded();

@@ -23,6 +23,7 @@ import java.io.OutputStream;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -30,6 +31,7 @@ import org.apache.hadoop.fs.FSExceptionMessages;
 import org.apache.hadoop.fs.Syncable;
 import org.apache.hadoop.hdds.client.ReplicationConfig;
 import org.apache.hadoop.hdds.protocol.DatanodeDetails;
+import org.apache.hadoop.hdds.protocol.proto.HddsProtos.ReplicationType;
 import org.apache.hadoop.hdds.scm.ContainerClientMetrics;
 import org.apache.hadoop.hdds.scm.OzoneClientConfig;
 import org.apache.hadoop.hdds.scm.XceiverClientFactory;
@@ -66,6 +68,7 @@ import org.slf4j.LoggerFactory;
 public class KeyOutputStream extends OutputStream implements Syncable {
 
   private OzoneClientConfig config;
+  private final ReplicationConfig replication;
 
   /**
    * Defines stream action while calling handleFlushOrClose.
@@ -91,7 +94,9 @@ public class KeyOutputStream extends OutputStream implements Syncable {
 
   private long clientID;
 
-  public KeyOutputStream(ContainerClientMetrics clientMetrics) {
+  public KeyOutputStream(ReplicationConfig replicationConfig,
+      ContainerClientMetrics clientMetrics) {
+    this.replication = replicationConfig;
     closed = false;
     this.retryPolicyMap = HddsClientUtils.getExceptionList()
         .stream()
@@ -132,13 +137,14 @@ public class KeyOutputStream extends OutputStream implements Syncable {
       OzoneClientConfig config,
       OpenKeySession handler,
       XceiverClientFactory xceiverClientManager,
-      OzoneManagerProtocol omClient, int chunkSize,
+      OzoneManagerProtocol omClient,
       String requestId, ReplicationConfig replicationConfig,
       String uploadID, int partNumber, boolean isMultipart,
       boolean unsafeByteBufferConversion,
       ContainerClientMetrics clientMetrics
   ) {
     this.config = config;
+    this.replication = replicationConfig;
     blockOutputStreamEntryPool =
         new BlockOutputStreamEntryPool(
             config,
@@ -171,13 +177,13 @@ public class KeyOutputStream extends OutputStream implements Syncable {
    * @param openVersion the version corresponding to the pre-allocation.
    * @throws IOException
    */
-  public void addPreallocateBlocks(OmKeyLocationInfoGroup version,
+  public synchronized void addPreallocateBlocks(OmKeyLocationInfoGroup version,
       long openVersion) throws IOException {
     blockOutputStreamEntryPool.addPreallocateBlocks(version, openVersion);
   }
 
   @Override
-  public void write(int b) throws IOException {
+  public synchronized void write(int b) throws IOException {
     byte[] buf = new byte[1];
     buf[0] = (byte) b;
     write(buf, 0, 1);
@@ -196,7 +202,7 @@ public class KeyOutputStream extends OutputStream implements Syncable {
    * @throws IOException
    */
   @Override
-  public void write(byte[] b, int off, int len)
+  public synchronized void write(byte[] b, int off, int len)
       throws IOException {
     checkNotClosed();
     if (b == null) {
@@ -436,7 +442,7 @@ public class KeyOutputStream extends OutputStream implements Syncable {
   }
 
   @Override
-  public void flush() throws IOException {
+  public synchronized void flush() throws IOException {
     checkNotClosed();
     handleFlushOrClose(StreamAction.FLUSH);
   }
@@ -447,14 +453,21 @@ public class KeyOutputStream extends OutputStream implements Syncable {
   }
 
   @Override
-  public void hsync() throws IOException {
+  public synchronized void hsync() throws IOException {
+    if (replication.getReplicationType() != ReplicationType.RATIS) {
+      throw new UnsupportedOperationException(
+          "Replication type is not " + ReplicationType.RATIS);
+    }
+    if (replication.getRequiredNodes() <= 1) {
+      throw new UnsupportedOperationException("The replication factor = "
+          + replication.getRequiredNodes() + " <= 1");
+    }
     checkNotClosed();
+    final long hsyncPos = writeOffset;
     handleFlushOrClose(StreamAction.HSYNC);
-    //TODO HDDS-7593: send hsyncKey to update length;
-    //     where the hsyncKey op is similar to
-    //     blockOutputStreamEntryPool.commitKey(offset)
-    //     except that hsyncKey only updates the key length
-    //     instead of committing it.
+    Preconditions.checkState(offset >= hsyncPos,
+        "offset = %s < hsyncPos = %s", offset, hsyncPos);
+    blockOutputStreamEntryPool.hsyncKey(hsyncPos);
   }
 
   /**
@@ -531,7 +544,7 @@ public class KeyOutputStream extends OutputStream implements Syncable {
    * @throws IOException
    */
   @Override
-  public void close() throws IOException {
+  public synchronized void close() throws IOException {
     if (closed) {
       return;
     }
@@ -547,7 +560,8 @@ public class KeyOutputStream extends OutputStream implements Syncable {
     }
   }
 
-  public OmMultipartCommitUploadPartInfo getCommitUploadPartInfo() {
+  public synchronized OmMultipartCommitUploadPartInfo
+      getCommitUploadPartInfo() {
     return blockOutputStreamEntryPool.getCommitUploadPartInfo();
   }
 
@@ -563,8 +577,7 @@ public class KeyOutputStream extends OutputStream implements Syncable {
     private OpenKeySession openHandler;
     private XceiverClientFactory xceiverManager;
     private OzoneManagerProtocol omClient;
-    private int chunkSize;
-    private String requestID;
+    private final String requestID = UUID.randomUUID().toString();
     private String multipartUploadID;
     private int multipartNumber;
     private boolean isMultipartKey;
@@ -618,22 +631,8 @@ public class KeyOutputStream extends OutputStream implements Syncable {
       return this;
     }
 
-    public int getChunkSize() {
-      return chunkSize;
-    }
-
-    public Builder setChunkSize(int size) {
-      this.chunkSize = size;
-      return this;
-    }
-
     public String getRequestID() {
       return requestID;
-    }
-
-    public Builder setRequestID(String id) {
-      this.requestID = id;
-      return this;
     }
 
     public boolean isMultipartKey() {
@@ -687,7 +686,6 @@ public class KeyOutputStream extends OutputStream implements Syncable {
           openHandler,
           xceiverManager,
           omClient,
-          chunkSize,
           requestID,
           replicationConfig,
           multipartUploadID,

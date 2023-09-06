@@ -332,7 +332,7 @@ public class TestOzoneClientMultipartUploadWithFSO {
     bucketArgs.setDefaultReplicationConfig(
         new DefaultReplicationConfig(
             new ECReplicationConfig(3, 2, ECReplicationConfig.EcCodec.RS,
-                1024)));
+                (int) OzoneConsts.MB)));
 
     volume.createBucket(myBucket, bucketArgs.build());
     return volume.getBucket(myBucket);
@@ -407,6 +407,26 @@ public class TestOzoneClientMultipartUploadWithFSO {
   }
 
   @Test
+  public void testMultipartPartNumberExceedingAllowedRange() throws Exception {
+    String uploadID = initiateMultipartUpload(bucket, keyName,
+        RATIS, ONE);
+    byte[] data = "data".getBytes(UTF_8);
+
+    // Multipart part number must be an integer between 1 and 10000. So the
+    // part number 1, 5000, 10000 will succeed,
+    // the part number 0, 10001 will fail.
+    bucket.createMultipartKey(keyName, data.length, 1, uploadID);
+    bucket.createMultipartKey(keyName, data.length, 5000, uploadID);
+    bucket.createMultipartKey(keyName, data.length, 10000, uploadID);
+    OzoneTestUtils.expectOmException(OMException.ResultCodes.INVALID_PART,
+        () -> bucket.createMultipartKey(
+            keyName, data.length, 0, uploadID));
+    OzoneTestUtils.expectOmException(OMException.ResultCodes.INVALID_PART,
+        () -> bucket.createMultipartKey(
+            keyName, data.length, 10001, uploadID));
+  }
+
+  @Test
   public void testCommitPartAfterCompleteUpload() throws Exception {
     String parentDir = "a/b/c/d/";
     keyName = parentDir + UUID.randomUUID().toString();
@@ -440,8 +460,9 @@ public class TestOzoneClientMultipartUploadWithFSO {
     Assert.assertNotNull(omMultipartCommitUploadPartInfo);
 
     byte[] fileContent = new byte[data.length];
-    OzoneInputStream inputStream = bucket.readKey(keyName);
-    inputStream.read(fileContent);
+    try (OzoneInputStream inputStream = bucket.readKey(keyName)) {
+      inputStream.read(fileContent);
+    }
     StringBuilder sb = new StringBuilder(data.length);
 
     // Combine all parts data, and check is it matching with get key data.
@@ -601,11 +622,8 @@ public class TestOzoneClientMultipartUploadWithFSO {
         metadataMgr.getMultipartInfoTable().get(multipartKey);
     Assert.assertNotNull(omMultipartKeyInfo);
 
-    TreeMap<Integer, OzoneManagerProtocolProtos.PartKeyInfo> partKeyInfoMap =
-        omMultipartKeyInfo.getPartKeyInfoMap();
-    for (Map.Entry<Integer, OzoneManagerProtocolProtos.PartKeyInfo> entry :
-        partKeyInfoMap.entrySet()) {
-      OzoneManagerProtocolProtos.PartKeyInfo partKeyInfo = entry.getValue();
+    for (OzoneManagerProtocolProtos.PartKeyInfo partKeyInfo :
+        omMultipartKeyInfo.getPartKeyInfoMap()) {
       String partKeyName = partKeyInfo.getPartName();
 
       // reconstruct full part name with volume, bucket, partKeyName
@@ -844,11 +862,8 @@ public class TestOzoneClientMultipartUploadWithFSO {
         omKeyInfo.getKeyName());
     Assert.assertEquals(uploadID, omMultipartKeyInfo.getUploadID());
 
-    TreeMap<Integer, OzoneManagerProtocolProtos.PartKeyInfo> partKeyInfoMap =
-        omMultipartKeyInfo.getPartKeyInfoMap();
-    for (Map.Entry<Integer, OzoneManagerProtocolProtos.PartKeyInfo> entry :
-        partKeyInfoMap.entrySet()) {
-      OzoneManagerProtocolProtos.PartKeyInfo partKeyInfo = entry.getValue();
+    for (OzoneManagerProtocolProtos.PartKeyInfo partKeyInfo :
+        omMultipartKeyInfo.getPartKeyInfoMap()) {
       OmKeyInfo currentKeyPartInfo =
           OmKeyInfo.getFromProtobuf(partKeyInfo.getPartKeyInfo());
 

@@ -28,6 +28,9 @@ import org.apache.hadoop.ozone.om.helpers.OmKeyArgs;
 import org.apache.hadoop.ozone.om.helpers.OmKeyInfo;
 import org.apache.hadoop.ozone.om.helpers.OmKeyLocationInfoGroup;
 import org.apache.hadoop.ozone.om.helpers.OzoneFileStatus;
+import org.apache.hadoop.ozone.om.helpers.SnapshotInfo;
+import org.apache.hadoop.ozone.security.acl.IAccessAuthorizer;
+import org.apache.hadoop.ozone.security.acl.OzoneAuthorizerFactory;
 import org.apache.hadoop.ozone.security.acl.OzoneObj;
 import org.apache.hadoop.ozone.security.acl.OzoneObjInfo;
 import org.apache.hadoop.util.Time;
@@ -44,14 +47,14 @@ import java.util.stream.Collectors;
 
 /**
  * Metadata Reading class for OM Snapshots.
- *
+ * <p>
  * This abstraction manages all the metadata key/acl reading from a
  * rocksDb instance, for OM snapshots.  It's basically identical to
  * the ozoneManager OmMetadataReader with two exceptions: 
- *
+ * <p>
  * 1. Its keymanager and prefix manager contain an OmMetadataManager
  * that reads from a snapshot.  
- *
+ * <p>
  * 2. It normalizes/denormalizes each request as it comes in to
  * remove/replace the ".snapshot/snapshotName" prefix.
  */
@@ -67,7 +70,9 @@ public class OmSnapshot implements IOmMetadataReader, Closeable {
   private final String volumeName;
   private final String bucketName;
   private final String snapshotName;
+  // To access snapshot checkpoint DB metadata
   private final OMMetadataManager omMetadataManager;
+  private final KeyManager keyManager;
 
   public OmSnapshot(KeyManager keyManager,
                     PrefixManager prefixManager,
@@ -75,15 +80,18 @@ public class OmSnapshot implements IOmMetadataReader, Closeable {
                     String volumeName,
                     String bucketName,
                     String snapshotName) {
+    IAccessAuthorizer accessAuthorizer =
+        OzoneAuthorizerFactory.forSnapshot(ozoneManager,
+            keyManager, prefixManager);
     omMetadataReader = new OmMetadataReader(keyManager, prefixManager,
         ozoneManager, LOG, AUDIT,
-        OmSnapshotMetrics.getInstance());
+        OmSnapshotMetrics.getInstance(), accessAuthorizer);
     this.snapshotName = snapshotName;
     this.bucketName = bucketName;
     this.volumeName = volumeName;
+    this.keyManager = keyManager;
     this.omMetadataManager = keyManager.getMetadataManager();
   }
-
 
   @Override
   public OmKeyInfo lookupKey(OmKeyArgs args) throws IOException {
@@ -135,7 +143,7 @@ public class OmSnapshot implements IOmMetadataReader, Closeable {
 
   @Override
   public List<OzoneAcl> getAcl(OzoneObj obj) throws IOException {
-    // TODO: handle denormalization
+    // TODO: [SNAPSHOT] handle denormalization
     return omMetadataReader.getAcl(normalizeOzoneObj(obj));
   }
 
@@ -255,11 +263,36 @@ public class OmSnapshot implements IOmMetadataReader, Closeable {
 
   @Override
   public void close() throws IOException {
+    // Close DB
     omMetadataManager.getStore().close();
+  }
+
+  @Override
+  protected void finalize() throws Throwable {
+    // Verify that the DB handle has been closed, log warning otherwise
+    // https://softwareengineering.stackexchange.com/a/288724
+    if (!omMetadataManager.getStore().isClosed()) {
+      LOG.warn("{} is not closed properly. snapshotName: {}",
+          // Print hash code for debugging
+          omMetadataManager.getStore().toString(),
+          snapshotName);
+    }
+    super.finalize();
   }
 
   @VisibleForTesting
   public OMMetadataManager getMetadataManager() {
     return omMetadataManager;
+  }
+
+  public KeyManager getKeyManager() {
+    return keyManager;
+  }
+
+  /**
+   * @return DB snapshot table key for this OmSnapshot instance.
+   */
+  public String getSnapshotTableKey() {
+    return SnapshotInfo.getTableKey(volumeName, bucketName, snapshotName);
   }
 }

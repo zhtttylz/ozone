@@ -50,9 +50,12 @@ import static org.apache.hadoop.ozone.container.keyvalue
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.yaml.snakeyaml.DumperOptions;
+import org.yaml.snakeyaml.LoaderOptions;
 import org.yaml.snakeyaml.Yaml;
 import org.yaml.snakeyaml.constructor.AbstractConstruct;
 import org.yaml.snakeyaml.constructor.SafeConstructor;
+import org.yaml.snakeyaml.error.YAMLException;
 import org.yaml.snakeyaml.introspector.BeanAccess;
 import org.yaml.snakeyaml.introspector.Property;
 import org.yaml.snakeyaml.introspector.PropertyUtils;
@@ -165,8 +168,20 @@ public final class ContainerDataYaml {
     Yaml yaml = new Yaml(containerDataConstructor, representer);
     yaml.setBeanAccess(BeanAccess.FIELD);
 
-    containerData = (ContainerData)
-        yaml.load(input);
+    try {
+      containerData = yaml.load(input);
+    } catch (YAMLException ex) {
+      // Unchecked exception. Convert to IOException since an error with one
+      // container file is not fatal for the whole thread or datanode.
+      throw new IOException(ex);
+    }
+
+    if (containerData == null) {
+      // If Yaml#load returned null, then the file is empty. This is valid yaml
+      // but considered an error in this case since we have lost data about
+      // the container.
+      throw new IOException("Failed to load container file. File is empty.");
+    }
 
     return containerData;
   }
@@ -217,6 +232,7 @@ public final class ContainerDataYaml {
     private List<String> yamlFields;
 
     ContainerDataRepresenter(List<String> yamlFields) {
+      super(new DumperOptions());
       this.yamlFields = yamlFields;
     }
 
@@ -257,6 +273,7 @@ public final class ContainerDataYaml {
    */
   private static class ContainerDataConstructor extends SafeConstructor {
     ContainerDataConstructor() {
+      super(new LoaderOptions());
       //Adding our own specific constructors for tags.
       // When a new Container type is added, we need to add yamlConstructor
       // for that

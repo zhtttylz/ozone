@@ -18,7 +18,6 @@
 
 package org.apache.hadoop.ozone.om.response.file;
 
-import com.google.common.base.Optional;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.protocol.StorageType;
 import org.apache.hadoop.hdds.utils.db.BatchOperation;
@@ -63,7 +62,7 @@ public class TestOMDirectoryCreateResponseWithFSO {
     OzoneConfiguration ozoneConfiguration = new OzoneConfiguration();
     ozoneConfiguration.set(OMConfigKeys.OZONE_OM_DB_DIRS,
         folder.newFolder().getAbsolutePath());
-    omMetadataManager = new OmMetadataManagerImpl(ozoneConfiguration);
+    omMetadataManager = new OmMetadataManagerImpl(ozoneConfiguration, null);
     batchOperation = omMetadataManager.getStore().initBatchOperation();
   }
 
@@ -129,7 +128,7 @@ public class TestOMDirectoryCreateResponseWithFSO {
 
     omMetadataManager.getVolumeTable().addCacheEntry(
             new CacheKey<>(omMetadataManager.getVolumeKey(volumeName)),
-            new CacheValue<>(Optional.of(volumeArgs), 1));
+            CacheValue.get(1, volumeArgs));
   }
   private void addBucketToDB(String volumeName, String bucketName)
           throws IOException {
@@ -144,6 +143,6 @@ public class TestOMDirectoryCreateResponseWithFSO {
     omMetadataManager.getBucketTable().addCacheEntry(
             new CacheKey<>(omMetadataManager.getBucketKey(
                     volumeName, bucketName)),
-            new CacheValue<>(Optional.of(omBucketInfo), 1));
+            CacheValue.get(1, omBucketInfo));
   }
 }

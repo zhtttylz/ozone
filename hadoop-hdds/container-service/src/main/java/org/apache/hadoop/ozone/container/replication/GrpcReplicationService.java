@@ -27,6 +27,8 @@ import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.SendContai
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.SendContainerResponse;
 import org.apache.hadoop.hdds.protocol.datanode.proto.IntraDatanodeProtocolServiceGrpc;
 
+import org.apache.hadoop.hdds.utils.IOUtils;
+import org.apache.ratis.thirdparty.io.grpc.stub.CallStreamObserver;
 import org.apache.ratis.thirdparty.io.grpc.stub.StreamObserver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -60,13 +62,20 @@ public class GrpcReplicationService extends
     CopyContainerCompression compression = fromProto(request.getCompression());
     LOG.info("Streaming container data ({}) to other datanode " +
         "with compression {}", containerID, compression);
+    OutputStream outputStream = null;
     try {
-      OutputStream outputStream = new CopyContainerResponseStream(
-          responseObserver, containerID, BUFFER_SIZE);
+      outputStream = new CopyContainerResponseStream(
+          // gRPC runtime always provides implementation of CallStreamObserver
+          // that allows flow control.
+          (CallStreamObserver<CopyContainerResponseProto>) responseObserver,
+          containerID, BUFFER_SIZE);
       source.copyData(containerID, outputStream, compression);
     } catch (IOException e) {
-      LOG.error("Error streaming container {}", containerID, e);
+      LOG.warn("Error streaming container {}", containerID, e);
       responseObserver.onError(e);
+    } finally {
+      // output may have already been closed, ignore such errors
+      IOUtils.cleanupWithLogger(LOG, outputStream);
     }
   }
 

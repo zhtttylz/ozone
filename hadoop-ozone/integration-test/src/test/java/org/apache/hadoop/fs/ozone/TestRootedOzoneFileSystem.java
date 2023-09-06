@@ -18,7 +18,6 @@
 
 package org.apache.hadoop.fs.ozone;
 
-import org.apache.commons.io.IOUtils;
 import org.apache.commons.lang3.RandomStringUtils;
 import org.apache.commons.lang3.RandomUtils;
 import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
@@ -44,6 +43,8 @@ import org.apache.hadoop.hdds.client.StandaloneReplicationConfig;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.protocol.StorageType;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
+import org.apache.hadoop.hdds.utils.IOUtils;
+import org.apache.hadoop.hdfs.protocol.SnapshotDiffReport;
 import org.apache.hadoop.ozone.MiniOzoneCluster;
 import org.apache.hadoop.ozone.OFSPath;
 import org.apache.hadoop.ozone.OzoneAcl;
@@ -53,6 +54,7 @@ import org.apache.hadoop.ozone.TestDataUtil;
 import org.apache.hadoop.ozone.client.BucketArgs;
 import org.apache.hadoop.ozone.client.ObjectStore;
 import org.apache.hadoop.ozone.client.OzoneBucket;
+import org.apache.hadoop.ozone.client.OzoneClient;
 import org.apache.hadoop.ozone.client.OzoneKeyDetails;
 import org.apache.hadoop.ozone.client.OzoneVolume;
 import org.apache.hadoop.ozone.client.VolumeArgs;
@@ -68,8 +70,8 @@ import org.apache.hadoop.ozone.security.acl.IAccessAuthorizer.ACLIdentityType;
 import org.apache.hadoop.ozone.security.acl.IAccessAuthorizer.ACLType;
 import org.apache.hadoop.ozone.security.acl.OzoneAclConfig;
 import org.apache.hadoop.security.UserGroupInformation;
+import org.apache.hadoop.util.ToolRunner;
 import org.apache.ozone.test.GenericTestUtils;
-import org.apache.ozone.test.LambdaTestUtils;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Assume;
@@ -84,6 +86,8 @@ import org.slf4j.LoggerFactory;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Paths;
 import java.security.PrivilegedExceptionAction;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -104,7 +108,10 @@ import java.util.stream.Collectors;
 
 import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.FS_TRASH_CHECKPOINT_INTERVAL_KEY;
 import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.FS_TRASH_INTERVAL_KEY;
+import static org.apache.hadoop.fs.CommonPathCapabilities.FS_ACLS;
+import static org.apache.hadoop.fs.CommonPathCapabilities.FS_CHECKSUMS;
 import static org.apache.hadoop.fs.FileSystem.TRASH_PREFIX;
+import static org.apache.hadoop.fs.contract.ContractTestUtils.assertHasPathCapabilities;
 import static org.apache.hadoop.fs.ozone.Constants.LISTING_PAGE_SIZE;
 import static org.apache.hadoop.hdds.client.ECReplicationConfig.EcCodec.RS;
 import static org.apache.hadoop.ozone.OzoneAcl.AclScope.ACCESS;
@@ -112,15 +119,18 @@ import static org.apache.hadoop.ozone.OzoneConfigKeys.OZONE_FS_ITERATE_BATCH_SIZ
 import static org.apache.hadoop.ozone.OzoneConsts.OZONE_URI_DELIMITER;
 import static org.apache.hadoop.ozone.om.OMConfigKeys.OZONE_OM_ADDRESS_KEY;
 import static org.apache.hadoop.ozone.om.OMConfigKeys.OZONE_OM_ENABLE_OFS_SHARED_TMP_DIR;
+import static org.apache.hadoop.ozone.om.OMConfigKeys.OZONE_OM_SNAPSHOT_DIFF_REPORT_MAX_PAGE_SIZE;
 import static org.apache.hadoop.ozone.om.exceptions.OMException.ResultCodes.BUCKET_NOT_FOUND;
-import static org.apache.hadoop.ozone.om.exceptions.OMException.ResultCodes.VOLUME_NOT_FOUND;
+import static org.apache.hadoop.ozone.om.exceptions.OMException.ResultCodes.KEY_NOT_FOUND;
 import static org.apache.hadoop.ozone.om.exceptions.OMException.ResultCodes.PERMISSION_DENIED;
+import static org.apache.hadoop.ozone.om.exceptions.OMException.ResultCodes.VOLUME_NOT_FOUND;
 import static org.apache.hadoop.ozone.security.acl.IAccessAuthorizer.ACLType.READ;
 import static org.apache.hadoop.ozone.security.acl.IAccessAuthorizer.ACLType.WRITE;
 import static org.apache.hadoop.ozone.security.acl.IAccessAuthorizer.ACLType.DELETE;
 import static org.apache.hadoop.ozone.security.acl.IAccessAuthorizer.ACLType.LIST;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -135,6 +145,7 @@ public class TestRootedOzoneFileSystem {
       LoggerFactory.getLogger(TestRootedOzoneFileSystem.class);
 
   private static final float TRASH_INTERVAL = 0.05f; // 3 seconds
+  private static OzoneClient client;
 
   @Parameterized.Parameters
   public static Collection<Object[]> data() {
@@ -166,6 +177,7 @@ public class TestRootedOzoneFileSystem {
 
   @Parameterized.AfterParam
   public static void teardownParam() {
+    IOUtils.closeQuietly(client);
     // Tear down the cluster after EACH set of parameters
     if (cluster != null) {
       cluster.shutdown();
@@ -177,7 +189,7 @@ public class TestRootedOzoneFileSystem {
   public void createVolumeAndBucket() throws IOException {
     // create a volume and a bucket to be used by RootedOzoneFileSystem (OFS)
     OzoneBucket bucket =
-        TestDataUtil.createVolumeAndBucket(cluster, bucketLayout);
+        TestDataUtil.createVolumeAndBucket(client, bucketLayout);
     volumeName = bucket.getVolumeName();
     volumePath = new Path(OZONE_URI_DELIMITER, volumeName);
     bucketName = bucket.getName();
@@ -234,6 +246,7 @@ public class TestRootedOzoneFileSystem {
     conf.setFloat(FS_TRASH_INTERVAL_KEY, TRASH_INTERVAL);
     conf.setFloat(FS_TRASH_CHECKPOINT_INTERVAL_KEY, TRASH_INTERVAL / 2);
     conf.setBoolean(OMConfigKeys.OZONE_OM_RATIS_ENABLE_KEY, omRatisEnabled);
+    conf.setBoolean(OzoneConfigKeys.OZONE_FS_HSYNC_ENABLED, true);
     if (isBucketFSOptimized) {
       bucketLayout = BucketLayout.FILE_SYSTEM_OPTIMIZED;
       conf.set(OMConfigKeys.OZONE_DEFAULT_BUCKET_LAYOUT,
@@ -241,7 +254,7 @@ public class TestRootedOzoneFileSystem {
     } else {
       bucketLayout = BucketLayout.LEGACY;
       conf.set(OzoneConfigKeys.OZONE_CLIENT_FS_DEFAULT_BUCKET_LAYOUT,
-          OzoneConfigKeys.OZONE_CLIENT_FS_BUCKET_LAYOUT_LEGACY);
+          OzoneConfigKeys.OZONE_BUCKET_LAYOUT_LEGACY);
       conf.set(OMConfigKeys.OZONE_DEFAULT_BUCKET_LAYOUT,
           bucketLayout.name());
       conf.setBoolean(OMConfigKeys.OZONE_OM_ENABLE_FILESYSTEM_PATHS,
@@ -257,7 +270,8 @@ public class TestRootedOzoneFileSystem {
         .setNumDatanodes(5)
         .build();
     cluster.waitForClusterToBeReady();
-    objectStore = cluster.getClient().getObjectStore();
+    client = cluster.newClient();
+    objectStore = client.getObjectStore();
 
     rootPath = String.format("%s://%s/",
         OzoneConsts.OZONE_OFS_URI_SCHEME, conf.get(OZONE_OM_ADDRESS_KEY));
@@ -266,6 +280,7 @@ public class TestRootedOzoneFileSystem {
     conf.set(CommonConfigurationKeysPublic.FS_DEFAULT_NAME_KEY, rootPath);
     // Set the number of keys to be processed during batch operate.
     conf.setInt(OZONE_FS_ITERATE_BATCH_SIZE, 5);
+    conf.setInt(OZONE_OM_SNAPSHOT_DIFF_REPORT_MAX_PAGE_SIZE, 4);
     // fs.ofs.impl would be loaded from META-INF, no need to manually set it
     fs = FileSystem.get(conf);
     trash = new Trash(conf);
@@ -333,7 +348,7 @@ public class TestRootedOzoneFileSystem {
     // write some test data into bucket
     try (OzoneOutputStream outputStream = objectStore.getVolume(volumeName).
             getBucket(bucketName).createKey(key, 1,
-                    new ECReplicationConfig("RS-3-2-1024"),
+                    new ECReplicationConfig("RS-3-2-1024k"),
                     new HashMap<>())) {
       outputStream.write(RandomUtils.nextBytes(1));
     }
@@ -974,7 +989,7 @@ public class TestRootedOzoneFileSystem {
     }
     OFSPath ofsPath = new OFSPath(key, conf);
     String keyInBucket = ofsPath.getKeyName();
-    return cluster.getClient().getObjectStore().getVolume(volumeName)
+    return client.getObjectStore().getVolume(volumeName)
         .getBucket(bucketName).getKey(keyInBucket);
   }
 
@@ -1509,6 +1524,194 @@ public class TestRootedOzoneFileSystem {
     Assert.assertFalse(volumeExist(volumeStr3));
   }
 
+  private void createSymlinkSrcDestPaths(String srcVol,
+      String srcBucket, String destVol, String destBucket) throws IOException {
+    // src srcVol/srcBucket
+    Path volumeSrcPath = new Path(OZONE_URI_DELIMITER + srcVol);
+    Path bucketSrcPath = Path.mergePaths(volumeSrcPath,
+        new Path(OZONE_URI_DELIMITER + srcBucket));
+    fs.mkdirs(volumeSrcPath);
+    OzoneVolume volume = objectStore.getVolume(srcVol);
+    Assert.assertEquals(srcVol, volume.getName());
+    fs.mkdirs(bucketSrcPath);
+    OzoneBucket bucket = volume.getBucket(srcBucket);
+    Assert.assertEquals(srcBucket, bucket.getName());
+
+    // dest link destVol/destBucket -> srcVol/srcBucket
+    Path volumeLinkPath = new Path(OZONE_URI_DELIMITER + destVol);
+    fs.mkdirs(volumeLinkPath);
+    volume = objectStore.getVolume(destVol);
+    Assert.assertEquals(destVol, volume.getName());
+    createLinkBucket(destVol, destBucket, srcVol, srcBucket);
+  }
+
+  @Test
+  public void testSymlinkList() throws Exception {
+    OzoneFsShell shell = new OzoneFsShell(conf);
+    // setup symlink, destVol/destBucket -> srcVol/srcBucket
+    String srcVolume = getRandomNonExistVolumeName();
+    final String srcBucket = "bucket";
+    String destVolume = getRandomNonExistVolumeName();
+    createSymlinkSrcDestPaths(srcVolume, srcBucket, destVolume, srcBucket);
+
+    try {
+      // test symlink -ls -R destVol/destBucket -> srcVol/srcBucket
+      // srcBucket no keys
+      // run toolrunner ozone fs shell commands
+      try (GenericTestUtils.SystemOutCapturer capture =
+               new GenericTestUtils.SystemOutCapturer()) {
+        String linkPathStr = rootPath + destVolume;
+        ToolRunner.run(shell, new String[]{"-ls", "-R", linkPathStr});
+        Assert.assertTrue(capture.getOutput().contains("drwxrwxrwx"));
+        Assert.assertTrue(capture.getOutput().contains(linkPathStr +
+            OZONE_URI_DELIMITER + srcBucket));
+      } finally {
+        shell.close();
+      }
+
+      // add key in source bucket
+      final String key = "object-dir/object-name1";
+      try (OzoneOutputStream outputStream = objectStore.getVolume(srcVolume)
+          .getBucket(srcBucket)
+          .createKey(key, 1)) {
+        outputStream.write(RandomUtils.nextBytes(1));
+      }
+      Assert.assertEquals(objectStore.getVolume(srcVolume)
+          .getBucket(srcBucket).getKey(key).getName(), key);
+
+      // test ls -R /destVol/destBucket, srcBucket with key (non-empty)
+      try (GenericTestUtils.SystemOutCapturer capture =
+               new GenericTestUtils.SystemOutCapturer()) {
+        String linkPathStr = rootPath + destVolume;
+        ToolRunner.run(shell, new String[]{"-ls", "-R",
+            linkPathStr + OZONE_URI_DELIMITER + srcBucket});
+        Assert.assertTrue(capture.getOutput().contains("drwxrwxrwx"));
+        Assert.assertTrue(capture.getOutput().contains(linkPathStr +
+            OZONE_URI_DELIMITER + srcBucket));
+        Assert.assertTrue(capture.getOutput().contains("-rw-rw-rw-"));
+        Assert.assertTrue(capture.getOutput().contains(linkPathStr +
+            OZONE_URI_DELIMITER + srcBucket + OZONE_URI_DELIMITER + key));
+      } finally {
+        shell.close();
+      }
+    } finally {
+      // cleanup; note must delete link before link src bucket
+      // due to bug - HDDS-7884
+      fs.delete(new Path(OZONE_URI_DELIMITER + destVolume +
+          OZONE_URI_DELIMITER + srcBucket));
+      fs.delete(new Path(OZONE_URI_DELIMITER + srcVolume), true);
+      fs.delete(new Path(OZONE_URI_DELIMITER + destVolume), true);
+    }
+  }
+
+  @Test
+  public void testSymlinkPosixDelete() throws Exception {
+    OzoneFsShell shell = new OzoneFsShell(conf);
+    // setup symlink, destVol/destBucket -> srcVol/srcBucket
+    String srcVolume = getRandomNonExistVolumeName();
+    final String srcBucket = "bucket";
+    String destVolume = getRandomNonExistVolumeName();
+    createSymlinkSrcDestPaths(srcVolume, srcBucket, destVolume, srcBucket);
+
+    try {
+      // test symlink destVol/destBucket -> srcVol/srcBucket exists
+      Assert.assertTrue(fs.exists(new Path(OZONE_URI_DELIMITER +
+          destVolume + OZONE_URI_DELIMITER + srcBucket)));
+
+      // add key to srcBucket
+      final String key = "object-dir/object-name1";
+      try (OzoneOutputStream outputStream = objectStore.getVolume(srcVolume)
+          .getBucket(srcBucket)
+          .createKey(key, 1)) {
+        outputStream.write(RandomUtils.nextBytes(1));
+      }
+      Assert.assertEquals(objectStore.getVolume(srcVolume)
+          .getBucket(srcBucket).getKey(key).getName(), key);
+
+      // test symlink -rm destVol/destBucket -> srcVol/srcBucket
+      // should delete only link, srcBucket and key unaltered
+      // run toolrunner ozone fs shell commands
+      try {
+        String linkPathStr = rootPath + destVolume + OZONE_URI_DELIMITER +
+            srcBucket;
+        int res = ToolRunner.run(shell, new String[]{"-rm", "-skipTrash",
+            linkPathStr});
+        Assert.assertEquals(0, res);
+
+        try {
+          objectStore.getVolume(destVolume).getBucket(srcBucket);
+          Assert.fail("Bucket should not exist, should throw OMException");
+        } catch (OMException ex) {
+          Assert.assertEquals(BUCKET_NOT_FOUND, ex.getResult());
+        }
+
+        Assert.assertEquals(srcBucket, objectStore.getVolume(srcVolume)
+            .getBucket(srcBucket).getName());
+        Assert.assertEquals(key, objectStore.getVolume(srcVolume)
+            .getBucket(srcBucket).getKey(key).getName());
+
+        // re-create symlink
+        createLinkBucket(destVolume, srcBucket, srcVolume, srcBucket);
+        Assert.assertTrue(fs.exists(new Path(OZONE_URI_DELIMITER +
+            destVolume + OZONE_URI_DELIMITER + srcBucket)));
+
+        // test symlink -rm -R -f destVol/destBucket/ -> srcVol/srcBucket
+        // should delete only link contents (src bucket contents),
+        // link and srcBucket unaltered
+        // run toolrunner ozone fs shell commands
+        linkPathStr = rootPath + destVolume + OZONE_URI_DELIMITER + srcBucket;
+        res = ToolRunner.run(shell, new String[]{"-rm", "-skipTrash",
+            "-f", "-R", linkPathStr + OZONE_URI_DELIMITER});
+        Assert.assertEquals(0, res);
+
+        Assert.assertEquals(srcBucket, objectStore.getVolume(destVolume)
+            .getBucket(srcBucket).getName());
+        Assert.assertEquals(true, objectStore.getVolume(destVolume)
+            .getBucket(srcBucket).isLink());
+        Assert.assertEquals(srcBucket, objectStore.getVolume(srcVolume)
+            .getBucket(srcBucket).getName());
+        try {
+          objectStore.getVolume(srcVolume).getBucket(srcBucket).getKey(key);
+          Assert.fail("Key should be deleted under srcBucket, " +
+              "OMException expected");
+        } catch (OMException ex) {
+          Assert.assertEquals(KEY_NOT_FOUND, ex.getResult());
+        }
+
+        // test symlink -rm -R -f destVol/destBucket -> srcVol/srcBucket
+        // should delete only link
+        // run toolrunner ozone fs shell commands
+        linkPathStr = rootPath + destVolume + OZONE_URI_DELIMITER + srcBucket;
+        res = ToolRunner.run(shell, new String[]{"-rm", "-skipTrash",
+            "-f", "-R", linkPathStr});
+        Assert.assertEquals(0, res);
+
+        Assert.assertEquals(srcBucket, objectStore.getVolume(srcVolume)
+            .getBucket(srcBucket).getName());
+        // test link existence
+        try {
+          objectStore.getVolume(destVolume).getBucket(srcBucket);
+          Assert.fail("link should not exist, " +
+              "OMException expected");
+        } catch (OMException ex) {
+          Assert.assertEquals(BUCKET_NOT_FOUND, ex.getResult());
+        }
+        // test src bucket existence
+        Assert.assertEquals(objectStore.getVolume(srcVolume)
+            .getBucket(srcBucket).getName(), srcBucket);
+      } finally {
+        shell.close();
+      }
+    } finally {
+      // cleanup; note must delete link before link src bucket
+      // due to bug - HDDS-7884
+      fs.delete(new Path(OZONE_URI_DELIMITER + destVolume + OZONE_URI_DELIMITER
+          + srcBucket));
+      fs.delete(new Path(OZONE_URI_DELIMITER + srcVolume), true);
+      fs.delete(new Path(OZONE_URI_DELIMITER + destVolume), true);
+    }
+  }
+
   @Test
   public void testDeleteBucketLink() throws Exception {
     // Create test volume, bucket, directory
@@ -1545,9 +1748,9 @@ public class TestRootedOzoneFileSystem {
     Assert.assertTrue(dir1Status.equals(fs.getFileStatus(dirPath1)));
 
     // confirm link is gone
-    LambdaTestUtils.intercept(FileNotFoundException.class,
-        "File not found.",
+    FileNotFoundException exception = assertThrows(FileNotFoundException.class,
         () -> fs.getFileStatus(dirPathLink));
+    assertTrue(exception.getMessage().contains("File not found."));
 
     // Cleanup
     fs.delete(volumePath1, true);
@@ -1645,7 +1848,7 @@ public class TestRootedOzoneFileSystem {
 
     // Create a new volume and a new bucket
     OzoneBucket bucket3 =
-        TestDataUtil.createVolumeAndBucket(cluster, bucketLayout);
+        TestDataUtil.createVolumeAndBucket(client, bucketLayout);
     OzoneVolume volume3 = objectStore.getVolume(bucket3.getVolumeName());
     // Need to setOwner to current test user so it has permission to list vols
     volume3.setOwner(username);
@@ -1740,7 +1943,7 @@ public class TestRootedOzoneFileSystem {
     }
     // create second bucket and write a key in it.
     OzoneBucket bucket2 =
-        TestDataUtil.createVolumeAndBucket(cluster, bucketLayout);
+        TestDataUtil.createVolumeAndBucket(client, bucketLayout);
     String volumeName2 = bucket2.getVolumeName();
     Path volumePath2 = new Path(OZONE_URI_DELIMITER, volumeName2);
     String bucketName2 = bucket2.getName();
@@ -1861,9 +2064,10 @@ public class TestRootedOzoneFileSystem {
     checkInvalidPath(file1);
   }
 
-  private void checkInvalidPath(Path path) throws Exception {
-    LambdaTestUtils.intercept(InvalidPathException.class, "Invalid path Name",
+  private void checkInvalidPath(Path path) {
+    InvalidPathException exception = assertThrows(InvalidPathException.class,
         () -> fs.create(path, false));
+    assertTrue(exception.getMessage().contains("Invalid path Name"));
   }
 
 
@@ -2028,7 +2232,7 @@ public class TestRootedOzoneFileSystem {
     String vol = UUID.randomUUID().toString();
     String buck = UUID.randomUUID().toString();
     final OzoneBucket bucket100 = TestDataUtil
-        .createVolumeAndBucket(cluster, vol, buck, BucketLayout.LEGACY,
+        .createVolumeAndBucket(client, vol, buck,
             omBucketArgs);
     Assert.assertEquals(ReplicationType.STAND_ALONE.name(),
         bucket100.getReplicationConfig().getReplicationType().name());
@@ -2054,12 +2258,12 @@ public class TestRootedOzoneFileSystem {
     builder.setBucketLayout(BucketLayout.LEGACY);
     builder.setDefaultReplicationConfig(
         new DefaultReplicationConfig(
-            new ECReplicationConfig("RS-3-2-1024")));
+            new ECReplicationConfig("RS-3-2-1024k")));
     BucketArgs omBucketArgs = builder.build();
     String vol = UUID.randomUUID().toString();
     String buck = UUID.randomUUID().toString();
     final OzoneBucket bucket101 = TestDataUtil
-        .createVolumeAndBucket(cluster, vol, buck, BucketLayout.LEGACY,
+        .createVolumeAndBucket(client, vol, buck,
             omBucketArgs);
     Assert.assertEquals(ReplicationType.EC.name(),
         bucket101.getReplicationConfig().getReplicationType().name());
@@ -2082,7 +2286,7 @@ public class TestRootedOzoneFileSystem {
     String bucketNameLocal = RandomStringUtils.randomNumeric(5);
     Path volume = new Path("/" + volumeNameLocal);
     ofs.mkdirs(volume);
-    LambdaTestUtils.intercept(OMException.class,
+    assertThrows(OMException.class,
         () -> ofs.getFileStatus(new Path(volume, bucketNameLocal)));
     // Cleanup
     ofs.delete(volume, true);
@@ -2113,7 +2317,7 @@ public class TestRootedOzoneFileSystem {
     // write some test data into bucket
     try (OzoneOutputStream outputStream = objectStore.getVolume(volumeName).
             getBucket(bucketName).createKey(key, 1,
-                    new ECReplicationConfig("RS-3-2-1024"),
+                    new ECReplicationConfig("RS-3-2-1024k"),
                     new HashMap<>())) {
       outputStream.write(RandomUtils.nextBytes(1));
     }
@@ -2123,7 +2327,7 @@ public class TestRootedOzoneFileSystem {
     long length = contentSummary.getLength();
     long spaceConsumed = contentSummary.getSpaceConsumed();
     long expectDiskUsage = QuotaUtil.getReplicatedSize(length,
-            new ECReplicationConfig(3, 2, RS, 1024));
+        new ECReplicationConfig(3, 2, RS, (int) OzoneConsts.MB));
     Assert.assertEquals(expectDiskUsage, spaceConsumed);
     //clean up
     ofs.delete(filePath, true);
@@ -2209,4 +2413,146 @@ public class TestRootedOzoneFileSystem {
     OzoneVolume ozoneVolume = objectStore.getVolume(linkVolume);
     ozoneVolume.createBucket(linkBucket, builder.build());
   }
+
+  @Test
+  public void testSnapshotRead() throws Exception {
+    // Init data
+    OzoneBucket bucket1 =
+        TestDataUtil.createVolumeAndBucket(client, bucketLayout);
+    Path volume1Path = new Path(OZONE_URI_DELIMITER, bucket1.getVolumeName());
+    Path bucket1Path = new Path(volume1Path, bucket1.getName());
+    Path file1 = new Path(bucket1Path, "key1");
+    Path file2 = new Path(bucket1Path, "key2");
+
+    ContractTestUtils.touch(fs, file1);
+    ContractTestUtils.touch(fs, file2);
+
+    OzoneBucket bucket2 =
+        TestDataUtil.createVolumeAndBucket(client, bucketLayout);
+    Path volume2Path = new Path(OZONE_URI_DELIMITER, bucket2.getVolumeName());
+    Path bucket2Path = new Path(volume2Path, bucket2.getName());
+
+    fs.mkdirs(bucket2Path);
+    Path snapPath1 = fs.createSnapshot(bucket1Path, "snap1");
+    Path snapPath2 = fs.createSnapshot(bucket2Path, "snap1");
+
+    Path file3 = new Path(bucket1Path, "key3");
+    ContractTestUtils.touch(fs, file3);
+
+    Path snapPath3 = fs.createSnapshot(bucket1Path, "snap2");
+
+    try {
+      FileStatus[] f1 = fs.listStatus(snapPath1);
+      FileStatus[] f2 = fs.listStatus(snapPath2);
+      FileStatus[] f3 = fs.listStatus(snapPath3);
+      Assert.assertEquals(2, f1.length);
+      Assert.assertEquals(0, f2.length);
+      Assert.assertEquals(3, f3.length);
+    } catch (Exception e) {
+      Assert.fail("Failed to read/list on snapshotPath, exception: " + e);
+    }
+  }
+
+  @Test
+  public void testFileSystemDeclaresCapability() throws Throwable {
+    assertHasPathCapabilities(fs, getBucketPath(), FS_ACLS);
+    assertHasPathCapabilities(fs, getBucketPath(), FS_CHECKSUMS);
+  }
+
+
+  @Test
+  public void testSnapshotDiff() throws Exception {
+    OzoneBucket bucket1 =
+        TestDataUtil.createVolumeAndBucket(client, bucketLayout);
+    Path volumePath1 = new Path(OZONE_URI_DELIMITER, bucket1.getVolumeName());
+    Path bucketPath1 = new Path(volumePath1, bucket1.getName());
+    Path snap1 = fs.createSnapshot(bucketPath1);
+    Path file1 = new Path(bucketPath1, "key1");
+    Path file2 = new Path(bucketPath1, "key2");
+    ContractTestUtils.touch(fs, file1);
+    ContractTestUtils.touch(fs, file2);
+    Path snap2 = fs.createSnapshot(bucketPath1);
+    java.nio.file.Path fromSnapPath = Paths.get(snap1.toString()).getFileName();
+    java.nio.file.Path toSnapPath = Paths.get(snap2.toString()).getFileName();
+    String fromSnap = fromSnapPath != null ? fromSnapPath.toString() : null;
+    String toSnap = toSnapPath != null ? toSnapPath.toString() : null;
+    SnapshotDiffReport diff =
+        ofs.getSnapshotDiffReport(bucketPath1, fromSnap, toSnap);
+    Assert.assertEquals(2, diff.getDiffList().size());
+    Assert.assertEquals(SnapshotDiffReport.DiffType.CREATE,
+        diff.getDiffList().get(0).getType());
+    Assert.assertEquals(SnapshotDiffReport.DiffType.CREATE,
+        diff.getDiffList().get(1).getType());
+    Assert.assertArrayEquals(
+        "key1".getBytes(StandardCharsets.UTF_8),
+        diff.getDiffList().get(0).getSourcePath());
+    Assert.assertArrayEquals(
+        "key2".getBytes(StandardCharsets.UTF_8),
+        diff.getDiffList().get(1).getSourcePath());
+
+    // test whether snapdiff returns aggregated response as
+    // page size is 4.
+    for (int fileCount = 0; fileCount < 10; fileCount++) {
+      Path file =
+          new Path(bucketPath1, "key" + RandomStringUtils.randomAlphabetic(5));
+      ContractTestUtils.touch(fs, file);
+    }
+    Path snap3 = fs.createSnapshot(bucketPath1);
+    fromSnapPath = toSnapPath;
+    toSnapPath = Paths.get(snap3.toString()).getFileName();
+    fromSnap = fromSnapPath != null ? fromSnapPath.toString() : null;
+    toSnap = toSnapPath != null ? toSnapPath.toString() : null;
+    diff = ofs.getSnapshotDiffReport(bucketPath1, fromSnap, toSnap);
+    Assert.assertEquals(10, diff.getDiffList().size());
+
+    Path file =
+        new Path(bucketPath1, "key" + RandomStringUtils.randomAlphabetic(5));
+    ContractTestUtils.touch(fs, file);
+    diff = ofs.getSnapshotDiffReport(bucketPath1, toSnap, "");
+    Assert.assertEquals(1, diff.getDiffList().size());
+
+    diff = ofs.getSnapshotDiffReport(bucketPath1, "", toSnap);
+    Assert.assertEquals(1, diff.getDiffList().size());
+
+    diff = ofs.getSnapshotDiffReport(bucketPath1, "", "");
+    Assert.assertEquals(0, diff.getDiffList().size());
+
+    // try snapDiff between non-bucket paths
+    String errorMsg = "Path is not a bucket";
+    String finalFromSnap = fromSnap;
+    String finalToSnap = toSnap;
+    IllegalArgumentException exception = assertThrows(
+        IllegalArgumentException.class,
+        () -> ofs.getSnapshotDiffReport(volumePath1, finalFromSnap,
+            finalToSnap));
+    assertTrue(exception.getMessage().contains(errorMsg));
+  }
+
+  @Test
+  public void testSetTimes() throws Exception {
+    // Create a file
+    OzoneBucket bucket1 =
+        TestDataUtil.createVolumeAndBucket(client, bucketLayout);
+    Path volumePath1 = new Path(OZONE_URI_DELIMITER, bucket1.getVolumeName());
+    Path bucketPath1 = new Path(volumePath1, bucket1.getName());
+    Path path = new Path(bucketPath1, "key1");
+    try (FSDataOutputStream stream = fs.create(path)) {
+      stream.write(1);
+    }
+
+    long mtime = 1000;
+    fs.setTimes(path, mtime, 2000);
+
+    FileStatus fileStatus = fs.getFileStatus(path);
+    // verify that mtime is updated as expected.
+    Assert.assertEquals(mtime, fileStatus.getModificationTime());
+
+    long mtimeDontUpdate = -1;
+    fs.setTimes(path, mtimeDontUpdate, 2000);
+
+    fileStatus = fs.getFileStatus(path);
+    // verify that mtime is NOT updated as expected.
+    Assert.assertEquals(mtime, fileStatus.getModificationTime());
+  }
+
 }

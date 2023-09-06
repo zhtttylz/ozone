@@ -37,13 +37,20 @@ import org.apache.hadoop.hdds.StringUtils;
 import org.apache.hadoop.hdds.cli.GenericCli;
 import org.apache.hadoop.hdds.cli.HddsVersionProvider;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
+import org.apache.hadoop.hdds.conf.ReconfigurationHandler;
 import org.apache.hadoop.hdds.datanode.metadata.DatanodeCRLStore;
 import org.apache.hadoop.hdds.datanode.metadata.DatanodeCRLStoreImpl;
 import org.apache.hadoop.hdds.protocol.DatanodeDetails;
-import org.apache.hadoop.hdds.security.x509.SecurityConfig;
+import org.apache.hadoop.hdds.protocol.SecretKeyProtocol;
+import org.apache.hadoop.hdds.protocolPB.SCMSecurityProtocolClientSideTranslatorPB;
+import org.apache.hadoop.hdds.security.SecurityConfig;
+import org.apache.hadoop.hdds.security.symmetric.DefaultSecretKeyClient;
+import org.apache.hadoop.hdds.security.symmetric.SecretKeyClient;
 import org.apache.hadoop.hdds.security.x509.certificate.client.CertificateClient;
 import org.apache.hadoop.hdds.security.x509.certificate.client.DNCertificateClient;
 import org.apache.hadoop.hdds.security.x509.certificate.utils.CertificateSignRequest;
+import org.apache.hadoop.hdds.server.http.HttpConfig;
+import org.apache.hadoop.hdds.server.OzoneAdmins;
 import org.apache.hadoop.hdds.server.http.RatisDropwizardExports;
 import org.apache.hadoop.hdds.tracing.TracingUtil;
 import org.apache.hadoop.hdds.utils.HddsServerUtil;
@@ -67,9 +74,14 @@ import org.apache.hadoop.util.Time;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 
+import static org.apache.hadoop.hdds.protocol.DatanodeDetails.Port.Name.HTTP;
+import static org.apache.hadoop.hdds.protocol.DatanodeDetails.Port.Name.HTTPS;
+import static org.apache.hadoop.hdds.utils.HddsServerUtil.getRemoteUser;
+import static org.apache.hadoop.hdds.utils.HddsServerUtil.getScmSecurityClientWithMaxRetry;
 import static org.apache.hadoop.ozone.OzoneConfigKeys.HDDS_DATANODE_PLUGINS_KEY;
 import static org.apache.hadoop.ozone.conf.OzoneServiceConfig.DEFAULT_SHUTDOWN_HOOK_PRIORITY;
 import static org.apache.hadoop.ozone.common.Storage.StorageState.INITIALIZED;
+import static org.apache.hadoop.security.UserGroupInformation.getCurrentUser;
 import static org.apache.hadoop.util.ExitUtil.terminate;
 
 import org.slf4j.Logger;
@@ -95,6 +107,7 @@ public class HddsDatanodeService extends GenericCli implements ServicePlugin {
   private DatanodeStateMachine datanodeStateMachine;
   private List<ServicePlugin> plugins;
   private CertificateClient dnCertClient;
+  private SecretKeyClient secretKeyClient;
   private String component;
   private HddsDatanodeHttpServer httpServer;
   private boolean printBanner;
@@ -107,40 +120,35 @@ public class HddsDatanodeService extends GenericCli implements ServicePlugin {
       new DNMXBeanImpl(HddsVersionInfo.HDDS_VERSION_INFO) { };
   private ObjectName dnInfoBeanName;
   private DatanodeCRLStore dnCRLStore;
+  private HddsDatanodeClientProtocolServer clientProtocolServer;
+  private OzoneAdmins admins;
+  private ReconfigurationHandler reconfigurationHandler;
 
   //Constructor for DataNode PluginService
   public HddsDatanodeService() { }
 
-  public HddsDatanodeService(boolean printBanner, String[] args) {
-    this.printBanner = printBanner;
-    this.args = args != null ? Arrays.copyOf(args, args.length) : null;
-  }
-
   /**
-   * Create an Datanode instance based on the supplied command-line arguments.
+   * Create a Datanode instance based on the supplied command-line arguments.
    * <p>
    * This method is intended for unit tests only. It suppresses the
    * startup/shutdown message and skips registering Unix signal handlers.
    *
    * @param args      command line arguments.
-   * @return Datanode instance
    */
   @VisibleForTesting
-  public static HddsDatanodeService createHddsDatanodeService(
-      String[] args) {
-    return createHddsDatanodeService(args, false);
+  public HddsDatanodeService(String[] args) {
+    this(false, args);
   }
 
   /**
-   * Create an Datanode instance based on the supplied command-line arguments.
+   * Create a Datanode instance based on the supplied command-line arguments.
    *
    * @param args        command line arguments.
    * @param printBanner if true, then log a verbose startup message.
-   * @return Datanode instance
    */
-  private static HddsDatanodeService createHddsDatanodeService(
-      String[] args, boolean printBanner) {
-    return new HddsDatanodeService(printBanner, args);
+  private HddsDatanodeService(boolean printBanner, String[] args) {
+    this.printBanner = printBanner;
+    this.args = args != null ? Arrays.copyOf(args, args.length) : null;
   }
 
   public static void main(String[] args) {
@@ -148,7 +156,7 @@ public class HddsDatanodeService extends GenericCli implements ServicePlugin {
       OzoneNetUtils.disableJvmNetworkAddressCacheIfRequired(
               new OzoneConfiguration());
       HddsDatanodeService hddsDatanodeService =
-          createHddsDatanodeService(args, true);
+          new HddsDatanodeService(true, args);
       hddsDatanodeService.run(args);
     } catch (Throwable e) {
       LOG.error("Exception in HddsDatanodeService.", e);
@@ -162,11 +170,12 @@ public class HddsDatanodeService extends GenericCli implements ServicePlugin {
 
   @Override
   public Void call() throws Exception {
+    OzoneConfiguration configuration = createOzoneConfiguration();
     if (printBanner) {
       StringUtils.startupShutdownMessage(HddsVersionInfo.HDDS_VERSION_INFO,
-          HddsDatanodeService.class, args, LOG);
+          HddsDatanodeService.class, args, LOG, configuration);
     }
-    start(createOzoneConfiguration());
+    start(configuration);
     ShutdownHookManager.get().addShutdownHook(() -> {
       try {
         stop();
@@ -229,17 +238,13 @@ public class HddsDatanodeService extends GenericCli implements ServicePlugin {
       // Authenticate Hdds Datanode service if security is enabled
       if (OzoneSecurityUtil.isSecurityEnabled(conf)) {
         component = "dn-" + datanodeDetails.getUuidString();
-
         secConf = new SecurityConfig(conf);
-        dnCertClient = new DNCertificateClient(secConf, datanodeDetails,
-            datanodeDetails.getCertSerialId(), this::saveNewCertId,
-            this::terminateDatanode);
 
         if (SecurityUtil.getAuthenticationMethod(conf).equals(
             UserGroupInformation.AuthenticationMethod.KERBEROS)) {
           LOG.info("Ozone security is enabled. Attempting login for Hdds " +
                   "Datanode user. Principal: {},keytab: {}", conf.get(
-              DFSConfigKeysLegacy.DFS_DATANODE_KERBEROS_PRINCIPAL_KEY),
+                  DFSConfigKeysLegacy.DFS_DATANODE_KERBEROS_PRINCIPAL_KEY),
               conf.get(
                   DFSConfigKeysLegacy.DFS_DATANODE_KERBEROS_KEYTAB_FILE_KEY));
 
@@ -269,15 +274,47 @@ public class HddsDatanodeService extends GenericCli implements ServicePlugin {
 
       if (OzoneSecurityUtil.isSecurityEnabled(conf)) {
         dnCertClient = initializeCertificateClient(dnCertClient);
+
+        if (secConf.isTokenEnabled()) {
+          SecretKeyProtocol secretKeyProtocol =
+              HddsServerUtil.getSecretKeyClientForDatanode(conf);
+          secretKeyClient = DefaultSecretKeyClient.create(conf,
+              secretKeyProtocol);
+          secretKeyClient.start(conf);
+        }
       }
       datanodeStateMachine = new DatanodeStateMachine(datanodeDetails, conf,
-          dnCertClient, this::terminateDatanode, dnCRLStore);
+          dnCertClient, secretKeyClient, this::terminateDatanode, dnCRLStore);
       try {
         httpServer = new HddsDatanodeHttpServer(conf);
         httpServer.start();
+        HttpConfig.Policy policy = HttpConfig.getHttpPolicy(conf);
+        if (policy.isHttpEnabled()) {
+          datanodeDetails.setPort(DatanodeDetails.newPort(HTTP,
+                  httpServer.getHttpAddress().getPort()));
+        }
+        if (policy.isHttpsEnabled()) {
+          datanodeDetails.setPort(DatanodeDetails.newPort(HTTPS,
+                  httpServer.getHttpsAddress().getPort()));
+        }
       } catch (Exception ex) {
         LOG.error("HttpServer failed to start.", ex);
       }
+
+      reconfigurationHandler =
+          new ReconfigurationHandler("DN", conf, this::checkAdminPrivilege);
+
+      clientProtocolServer = new HddsDatanodeClientProtocolServer(
+          datanodeDetails, conf, HddsVersionInfo.HDDS_VERSION_INFO,
+          reconfigurationHandler);
+
+      // Get admin list
+      String starterUser =
+          UserGroupInformation.getCurrentUser().getShortUserName();
+      admins = OzoneAdmins.getOzoneAdmins(starterUser, conf);
+      LOG.info("Datanode start with admins: {}", admins.getAdminUsernames());
+
+      clientProtocolServer.start();
       startPlugins();
       // Starting HDDS Daemons
       datanodeStateMachine.startDaemon();
@@ -297,6 +334,12 @@ public class HddsDatanodeService extends GenericCli implements ServicePlugin {
       throw new RuntimeException("Fail to authentication when starting" +
           " HDDS datanode plugin", ex);
     }
+  }
+
+  @VisibleForTesting
+  SCMSecurityProtocolClientSideTranslatorPB createScmSecurityClient()
+      throws IOException {
+    return getScmSecurityClientWithMaxRetry(conf, getCurrentUser());
   }
 
   /**
@@ -332,13 +375,15 @@ public class HddsDatanodeService extends GenericCli implements ServicePlugin {
       CertificateClient certClient) throws IOException {
     LOG.info("Initializing secure Datanode.");
 
-    CertificateClient.InitResponse response = certClient.init();
-    if (response.equals(CertificateClient.InitResponse.REINIT)) {
-      LOG.info("Re-initialize certificate client.");
-      certClient = new DNCertificateClient(secConf, datanodeDetails, null,
-          this::saveNewCertId, this::terminateDatanode);
-      response = certClient.init();
+    if (certClient == null) {
+      dnCertClient = new DNCertificateClient(secConf,
+          createScmSecurityClient(),
+          datanodeDetails,
+          datanodeDetails.getCertSerialId(), this::saveNewCertId,
+          this::terminateDatanode);
+      certClient = dnCertClient;
     }
+    CertificateClient.InitResponse response = certClient.init();
     LOG.info("Init response: {}", response);
     switch (response) {
     case SUCCESS:
@@ -351,8 +396,6 @@ public class HddsDatanodeService extends GenericCli implements ServicePlugin {
       // persist cert ID to VERSION file
       datanodeDetails.setCertSerialId(dnCertSerialId);
       persistDatanodeDetails(datanodeDetails);
-      // set new certificate ID
-      certClient.setCertificateId(dnCertSerialId);
       LOG.info("Successfully stored SCM signed certificate, case:{}.",
           response);
       break;
@@ -421,7 +464,7 @@ public class HddsDatanodeService extends GenericCli implements ServicePlugin {
     String idFilePath = HddsServerUtil.getDatanodeIdFilePath(conf);
     Preconditions.checkNotNull(idFilePath);
     File idFile = new File(idFilePath);
-    ContainerUtils.writeDatanodeDetailsTo(dnDetails, idFile);
+    ContainerUtils.writeDatanodeDetailsTo(dnDetails, idFile, conf);
   }
 
   /**
@@ -473,6 +516,10 @@ public class HddsDatanodeService extends GenericCli implements ServicePlugin {
     return datanodeStateMachine;
   }
 
+  public HddsDatanodeClientProtocolServer getClientProtocolServer() {
+    return clientProtocolServer;
+  }
+
   @VisibleForTesting
   public DatanodeCRLStore getCRLStore() {
     return dnCRLStore;
@@ -485,6 +532,14 @@ public class HddsDatanodeService extends GenericCli implements ServicePlugin {
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
         LOG.info("Interrupted during StorageContainerManager join.");
+      }
+    }
+    if (getClientProtocolServer() != null) {
+      try {
+        getClientProtocolServer().join();
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        LOG.info("Interrupted during HddsDatanodeClientProtocolServer join.");
       }
     }
   }
@@ -517,6 +572,9 @@ public class HddsDatanodeService extends GenericCli implements ServicePlugin {
           LOG.error("Stopping HttpServer is failed.", e);
         }
       }
+      if (getClientProtocolServer() != null) {
+        getClientProtocolServer().stop();
+      }
       unregisterMXBean();
       // stop dn crl store
       try {
@@ -527,6 +585,10 @@ public class HddsDatanodeService extends GenericCli implements ServicePlugin {
         LOG.error("Datanode CRL store stop failed", ex);
       }
       RatisDropwizardExports.clear(ratisMetricsMap, ratisReporterList);
+
+      if (secretKeyClient != null) {
+        secretKeyClient.stop();
+      }
     }
   }
 
@@ -561,8 +623,17 @@ public class HddsDatanodeService extends GenericCli implements ServicePlugin {
   }
 
   @VisibleForTesting
-  public void setCertificateClient(CertificateClient client) {
+  public void setCertificateClient(CertificateClient client)
+      throws IOException {
+    if (dnCertClient != null) {
+      dnCertClient.close();
+    }
     dnCertClient = client;
+  }
+
+  @VisibleForTesting
+  public void setSecretKeyClient(SecretKeyClient client) {
+    this.secretKeyClient = client;
   }
 
   @Override
@@ -582,5 +653,19 @@ public class HddsDatanodeService extends GenericCli implements ServicePlugin {
       LOG.error(msg, ex);
       terminateDatanode();
     }
+  }
+
+  /**
+   * Check ozone admin privilege, throws exception if not admin.
+   */
+  private void checkAdminPrivilege(String operation)
+      throws IOException {
+    final UserGroupInformation ugi = getRemoteUser();
+    admins.checkAdminUserPrivilege(ugi);
+  }
+
+  @VisibleForTesting
+  public ReconfigurationHandler getReconfigurationHandler() {
+    return reconfigurationHandler;
   }
 }

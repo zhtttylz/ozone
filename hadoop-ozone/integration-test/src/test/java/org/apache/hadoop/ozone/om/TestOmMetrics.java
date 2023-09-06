@@ -22,8 +22,11 @@ import static org.apache.hadoop.ozone.security.acl.OzoneObj.ResourceType.VOLUME;
 import static org.apache.hadoop.ozone.security.acl.OzoneObj.StoreType.OZONE;
 import static org.apache.hadoop.test.MetricsAsserts.assertCounter;
 import static org.apache.hadoop.test.MetricsAsserts.getMetrics;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.eq;
 
 import java.io.IOException;
 import java.util.Collections;
@@ -31,6 +34,7 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
+import org.apache.hadoop.hdds.utils.IOUtils;
 import org.apache.hadoop.hdds.HddsConfigKeys;
 import org.apache.hadoop.hdds.client.BlockID;
 import org.apache.hadoop.hdds.client.ContainerBlockID;
@@ -48,6 +52,7 @@ import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.ozone.OzoneAcl;
 import org.apache.hadoop.ozone.TestDataUtil;
 import org.apache.hadoop.ozone.client.ObjectStore;
+import org.apache.hadoop.ozone.client.OzoneClient;
 import org.apache.hadoop.ozone.om.exceptions.OMException;
 import org.apache.hadoop.ozone.om.helpers.OmBucketArgs;
 import org.apache.hadoop.ozone.om.helpers.OmBucketInfo;
@@ -61,7 +66,6 @@ import org.apache.hadoop.ozone.security.acl.OzoneObj;
 import org.apache.hadoop.ozone.security.acl.OzoneObjInfo;
 import org.assertj.core.util.Lists;
 import org.junit.After;
-import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
@@ -89,6 +93,7 @@ public class TestOmMetrics {
    */
   private final OMException exception =
       new OMException("dummyException", OMException.ResultCodes.TIMEOUT);
+  private OzoneClient client;
 
   /**
    * Create a MiniDFSCluster for testing.
@@ -105,7 +110,8 @@ public class TestOmMetrics {
     cluster = clusterBuilder.build();
     cluster.waitForClusterToBeReady();
     ozoneManager = cluster.getOzoneManager();
-    writeClient = cluster.getRpcClient().getObjectStore()
+    client = cluster.newClient();
+    writeClient = client.getObjectStore()
         .getClientProxy().getOzoneManagerClient();
   }
 
@@ -114,6 +120,7 @@ public class TestOmMetrics {
    */
   @After
   public void shutdown() {
+    IOUtils.closeQuietly(client);
     if (cluster != null) {
       cluster.shutdown();
     }
@@ -232,7 +239,7 @@ public class TestOmMetrics {
     // inject exception to test for Failure Metrics on the read path
     Mockito.doThrow(exception).when(mockBm).getBucketInfo(any(), any());
     Mockito.doThrow(exception).when(mockBm).listBuckets(any(), any(),
-        any(), anyInt());
+        any(), anyInt(), eq(false));
 
     HddsWhiteboxTestUtils.setInternalState(
         ozoneManager, "bucketManager", mockBm);
@@ -281,7 +288,7 @@ public class TestOmMetrics {
     KeyManager keyManager = (KeyManager) HddsWhiteboxTestUtils
         .getInternalState(ozoneManager, "keyManager");
     KeyManager mockKm = Mockito.spy(keyManager);
-    TestDataUtil.createVolumeAndBucket(cluster, volumeName, bucketName);
+    TestDataUtil.createVolumeAndBucket(client, volumeName, bucketName);
     OmKeyArgs keyArgs = createKeyArgs(volumeName, bucketName,
         RatisReplicationConfig.getInstance(HddsProtos.ReplicationFactor.THREE));
     doKeyOps(keyArgs);
@@ -318,14 +325,14 @@ public class TestOmMetrics {
     writeClient.deleteKey(keyArgs);
 
     keyArgs = createKeyArgs(volumeName, bucketName,
-        new ECReplicationConfig("rs-6-4-1024K"));
+        new ECReplicationConfig("rs-6-3-1024K"));
     try {
       keySession = writeClient.openKey(keyArgs);
       writeClient.commitKey(keyArgs, keySession.getId());
     } catch (Exception e) {
       //Expected Failure in preExecute due to not enough datanode
       Assertions.assertTrue(e.getMessage()
-          .contains("No enough datanodes to choose"));
+          .contains("No enough datanodes to choose"), e::getMessage);
     }
 
     omMetrics = getMetrics("OMMetrics");
@@ -338,7 +345,8 @@ public class TestOmMetrics {
         any(), any(), any(), any(), anyInt());
     Mockito.doThrow(exception).when(mockKm).listTrash(
         any(), any(), any(), any(), anyInt());
-    OmMetadataReader omMetadataReader = ozoneManager.getOmMetadataReader();
+    OmMetadataReader omMetadataReader =
+        (OmMetadataReader) ozoneManager.getOmMetadataReader().get();
     HddsWhiteboxTestUtils.setInternalState(
         ozoneManager, "keyManager", mockKm);
 
@@ -386,8 +394,7 @@ public class TestOmMetrics {
 
   @Test
   public void testSnapshotOps() throws Exception {
-    // This tests needs enough datanodes to allocate the
-    // blocks for the keys.
+    // This tests needs enough dataNodes to allocate the blocks for the keys.
     clusterBuilder.setNumDatanodes(3);
     startCluster();
 
@@ -415,7 +422,6 @@ public class TestOmMetrics {
     assertCounter("NumSnapshotCreates", 1L, omMetrics);
     assertCounter("NumSnapshotListFails", 0L, omMetrics);
     assertCounter("NumSnapshotLists", 0L, omMetrics);
-
     assertCounter("NumSnapshotActive", 1L, omMetrics);
     assertCounter("NumSnapshotDeleted", 0L, omMetrics);
     assertCounter("NumSnapshotReclaimed", 0L, omMetrics);
@@ -430,12 +436,21 @@ public class TestOmMetrics {
     writeClient.createSnapshot(volumeName, bucketName, snapshot2);
 
     // List snapshots
-    writeClient.listSnapshot(volumeName, bucketName);
+    writeClient.listSnapshot(
+        volumeName, bucketName, null, null, Integer.MAX_VALUE);
 
     omMetrics = getMetrics("OMMetrics");
     assertCounter("NumSnapshotActive", 2L, omMetrics);
     assertCounter("NumSnapshotCreates", 2L, omMetrics);
     assertCounter("NumSnapshotLists", 1L, omMetrics);
+    assertCounter("NumSnapshotListFails", 0L, omMetrics);
+
+    // List snapshot: invalid bucket case.
+    assertThrows(OMException.class, () -> writeClient.listSnapshot(volumeName,
+        "invalidBucket", null, null, Integer.MAX_VALUE));
+    omMetrics = getMetrics("OMMetrics");
+    assertCounter("NumSnapshotLists", 2L, omMetrics);
+    assertCounter("NumSnapshotListFails", 1L, omMetrics);
 
     // restart OM
     cluster.restartOzoneManager();
@@ -474,7 +489,7 @@ public class TestOmMetrics {
     startCluster();
     try {
       // Create a volume.
-      cluster.getClient().getObjectStore().createVolume("volumeacl");
+      client.getObjectStore().createVolume("volumeacl");
 
       OzoneObj volObj = new OzoneObjInfo.Builder().setVolumeName("volumeacl")
           .setResType(VOLUME).setStoreType(OZONE).build();
@@ -502,7 +517,7 @@ public class TestOmMetrics {
       assertCounter("NumRemoveAcl", 1L, omMetrics);
 
     } finally {
-      cluster.getClient().getObjectStore().deleteVolume("volumeacl");
+      client.getObjectStore().deleteVolume("volumeacl");
     }
   }
 
@@ -513,7 +528,7 @@ public class TestOmMetrics {
     conf.setBoolean(HddsConfigKeys.HDDS_SCM_SAFEMODE_ENABLED, true);
     startCluster();
 
-    ObjectStore objectStore = cluster.getClient().getObjectStore();
+    ObjectStore objectStore = client.getObjectStore();
     // Create a volume.
     objectStore.createVolume("volumeacl");
     // Create a bucket.
@@ -555,18 +570,18 @@ public class TestOmMetrics {
         new OzoneAcl(IAccessAuthorizer.ACLIdentityType.USER, "ozoneuser",
             IAccessAuthorizer.ACLType.ALL, ACCESS));
 
-    Assert.assertEquals(initialValue + 1, metrics.getNumAddAcl());
+    assertEquals(initialValue + 1, metrics.getNumAddAcl());
 
     // Test setAcl
     initialValue = metrics.getNumSetAcl();
 
     objectStore.setAcl(volObj, acls);
-    Assert.assertEquals(initialValue + 1, metrics.getNumSetAcl());
+    assertEquals(initialValue + 1, metrics.getNumSetAcl());
 
     // Test removeAcl
     initialValue = metrics.getNumRemoveAcl();
     objectStore.removeAcl(volObj, acls.get(0));
-    Assert.assertEquals(initialValue + 1, metrics.getNumRemoveAcl());
+    assertEquals(initialValue + 1, metrics.getNumRemoveAcl());
   }
 
   /**
@@ -619,7 +634,7 @@ public class TestOmMetrics {
     }
 
     try {
-      ozoneManager.listBuckets(info.getVolumeName(), null, null, 0);
+      ozoneManager.listBuckets(info.getVolumeName(), null, null, 0, false);
     } catch (IOException ignored) {
     }
 

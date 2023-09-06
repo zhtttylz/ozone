@@ -20,9 +20,9 @@
 package org.apache.hadoop.hdds.security.x509.certificate.client;
 
 import org.apache.hadoop.hdds.protocol.DatanodeDetails;
-import org.apache.hadoop.hdds.protocol.proto.SCMSecurityProtocolProtos;
-import org.apache.hadoop.hdds.security.x509.SecurityConfig;
-import org.apache.hadoop.hdds.security.x509.certificate.utils.CertificateCodec;
+import org.apache.hadoop.hdds.protocol.proto.SCMSecurityProtocolProtos.SCMGetCertResponseProto;
+import org.apache.hadoop.hdds.protocolPB.SCMSecurityProtocolClientSideTranslatorPB;
+import org.apache.hadoop.hdds.security.SecurityConfig;
 import org.apache.hadoop.hdds.security.x509.certificate.utils.CertificateSignRequest;
 import org.apache.hadoop.hdds.security.x509.exception.CertificateException;
 import org.apache.hadoop.security.UserGroupInformation;
@@ -32,11 +32,9 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.net.InetAddress;
-import java.nio.file.Path;
 import java.security.KeyPair;
 import java.util.function.Consumer;
 
-import static org.apache.hadoop.hdds.security.x509.certificate.utils.CertificateCodec.getX509Certificate;
 import static org.apache.hadoop.hdds.security.x509.certificate.utils.CertificateSignRequest.getEncodedString;
 import static org.apache.hadoop.hdds.security.x509.exception.CertificateException.ErrorCode.CSR_ERROR;
 
@@ -51,10 +49,15 @@ public class DNCertificateClient extends DefaultCertificateClient {
   public static final String COMPONENT_NAME = "dn";
   private final DatanodeDetails dn;
 
-  public DNCertificateClient(SecurityConfig securityConfig,
-      DatanodeDetails datanodeDetails, String certSerialId,
-      Consumer<String> saveCertId, Runnable shutdown) {
-    super(securityConfig, LOG, certSerialId, COMPONENT_NAME,
+  public DNCertificateClient(
+      SecurityConfig securityConfig,
+      SCMSecurityProtocolClientSideTranslatorPB scmSecurityClient,
+      DatanodeDetails datanodeDetails,
+      String certSerialId,
+      Consumer<String> saveCertId,
+      Runnable shutdown
+  ) {
+    super(securityConfig, scmSecurityClient, LOG, certSerialId, COMPONENT_NAME,
         saveCertId, shutdown);
     this.dn = datanodeDetails;
   }
@@ -69,19 +72,6 @@ public class DNCertificateClient extends DefaultCertificateClient {
   @Override
   public CertificateSignRequest.Builder getCSRBuilder()
       throws CertificateException {
-    return getCSRBuilder(new KeyPair(getPublicKey(), getPrivateKey()));
-  }
-
-  /**
-   * Returns a CSR builder that can be used to creates a Certificate signing
-   * request.
-   * The default flag is added to allow basic SSL handshake.
-   *
-   * @return CertificateSignRequest.Builder
-   */
-  @Override
-  public CertificateSignRequest.Builder getCSRBuilder(KeyPair keyPair)
-      throws CertificateException {
     CertificateSignRequest.Builder builder = super.getCSRBuilder()
         .setDigitalEncryption(true)
         .setDigitalSignature(true);
@@ -91,8 +81,8 @@ public class DNCertificateClient extends DefaultCertificateClient {
       String subject = UserGroupInformation.getCurrentUser()
           .getShortUserName() + "@" + hostname;
       builder.setCA(false)
-          .setKey(keyPair)
-          .setConfiguration(getConfig())
+          .setKey(new KeyPair(getPublicKey(), getPrivateKey()))
+          .setConfiguration(getSecurityConfig())
           .setSubject(subject);
 
       LOG.info("Created csr for DN-> subject:{}", subject);
@@ -105,42 +95,10 @@ public class DNCertificateClient extends DefaultCertificateClient {
   }
 
   @Override
-  public String signAndStoreCertificate(PKCS10CertificationRequest csr,
-      Path certPath) throws CertificateException {
-    try {
-      // TODO: For SCM CA we should fetch certificate from multiple SCMs.
-      SCMSecurityProtocolProtos.SCMGetCertResponseProto response =
-          getScmSecureClient().getDataNodeCertificateChain(
-              dn.getProtoBufMessage(), getEncodedString(csr));
-
-      // Persist certificates.
-      if (response.hasX509CACertificate()) {
-        String pemEncodedCert = response.getX509Certificate();
-        CertificateCodec certCodec = new CertificateCodec(
-            getSecurityConfig(), certPath);
-        // Certs will be added to cert map after reloadAllCertificate called
-        storeCertificate(pemEncodedCert, true, false, false, certCodec, false);
-        storeCertificate(response.getX509CACertificate(), true, true,
-            false, certCodec, false);
-
-        // Store Root CA certificate.
-        if (response.hasX509RootCACertificate()) {
-          storeCertificate(response.getX509RootCACertificate(), true, false,
-              true, certCodec, false);
-        }
-        // Return the default certificate ID
-        String dnCertSerialId = getX509Certificate(pemEncodedCert).
-            getSerialNumber().toString();
-        return dnCertSerialId;
-      } else {
-        throw new CertificateException("Unable to retrieve datanode " +
-            "certificate chain.");
-      }
-    } catch (IOException | java.security.cert.CertificateException e) {
-      LOG.error("Error while signing and storing SCM signed certificate.", e);
-      throw new CertificateException(
-          "Error while signing and storing SCM signed certificate.", e);
-    }
+  public SCMGetCertResponseProto getCertificateSignResponse(
+      PKCS10CertificationRequest csr) throws IOException {
+    return getScmSecureClient().getDataNodeCertificateChain(
+        dn.getProtoBufMessage(), getEncodedString(csr));
   }
 
   @Override

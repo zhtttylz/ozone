@@ -18,7 +18,6 @@
 
 package org.apache.hadoop.ozone.om.request.key;
 
-import com.google.common.base.Optional;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
@@ -100,7 +99,7 @@ public class TestOMDirectoriesPurgeRequestAndResponse extends TestOMKeyRequest {
     omBucketInfo.incrUsedBytes(omKeyInfo.getDataSize());
     omBucketInfo.incrUsedNamespace(1L);
     omMetadataManager.getBucketTable().addCacheEntry(new CacheKey<>(bucketKey),
-        new CacheValue<>(Optional.of(omBucketInfo), 1L));
+        CacheValue.get(1L, omBucketInfo));
     omMetadataManager.getBucketTable().put(bucketKey, omBucketInfo);
   }
 
@@ -234,15 +233,18 @@ public class TestOMDirectoriesPurgeRequestAndResponse extends TestOMKeyRequest {
         omMetadataManager);
     omBucketInfo = omMetadataManager.getBucketTable().get(
         bucketKey);
-    omBucketInfo.incrUsedBytes(1000);
+    final long bucketInitialUsedBytes = omBucketInfo.getUsedBytes();
+
+    omBucketInfo.incrUsedBytes(1000L);
     omBucketInfo.incrUsedNamespace(100L);
     omMetadataManager.getBucketTable().addCacheEntry(new CacheKey<>(bucketKey),
-        new CacheValue<>(Optional.of(omBucketInfo), 1L));
+        CacheValue.get(1L, omBucketInfo));
     omMetadataManager.getBucketTable().put(bucketKey, omBucketInfo);
 
     // prevalidate bucket
     omBucketInfo = omMetadataManager.getBucketTable().get(bucketKey);
-    Assert.assertEquals(1000L, omBucketInfo.getUsedBytes());
+    final long bucketExpectedUsedBytes = bucketInitialUsedBytes + 1000L;
+    Assert.assertEquals(bucketExpectedUsedBytes, omBucketInfo.getUsedBytes());
     
     // perform delete
     OMDirectoriesPurgeResponseWithFSO omClientResponse
@@ -253,7 +255,7 @@ public class TestOMDirectoriesPurgeRequestAndResponse extends TestOMKeyRequest {
     // validate bucket info, no change expected
     omBucketInfo = omMetadataManager.getBucketTable().get(
         bucketKey);
-    Assert.assertEquals(1000L, omBucketInfo.getUsedBytes());
+    Assert.assertEquals(bucketExpectedUsedBytes, omBucketInfo.getUsedBytes());
 
     performBatchOperationCommit(omClientResponse);
 

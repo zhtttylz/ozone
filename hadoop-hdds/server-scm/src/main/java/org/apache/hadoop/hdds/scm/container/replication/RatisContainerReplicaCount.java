@@ -22,6 +22,8 @@ import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
 import org.apache.hadoop.hdds.protocol.proto.StorageContainerDatanodeProtocolProtos.ContainerReplicaProto;
 import org.apache.hadoop.hdds.scm.container.ContainerInfo;
 import org.apache.hadoop.hdds.scm.container.ContainerReplica;
+import org.apache.hadoop.hdds.scm.container.replication.ContainerHealthResult.OverReplicatedHealthResult;
+import org.apache.hadoop.hdds.scm.container.replication.ContainerHealthResult.UnderReplicatedHealthResult;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -34,6 +36,7 @@ import static org.apache.hadoop.hdds.protocol.proto.HddsProtos.NodeOperationalSt
 import static org.apache.hadoop.hdds.protocol.proto.HddsProtos.NodeOperationalState.DECOMMISSIONING;
 import static org.apache.hadoop.hdds.protocol.proto.HddsProtos.NodeOperationalState.ENTERING_MAINTENANCE;
 import static org.apache.hadoop.hdds.protocol.proto.HddsProtos.NodeOperationalState.IN_MAINTENANCE;
+import static org.apache.hadoop.hdds.scm.container.replication.ReplicationManager.compareState;
 
 /**
  * Immutable object that is created with a set of ContainerReplica objects and
@@ -47,25 +50,24 @@ public class RatisContainerReplicaCount implements ContainerReplicaCount {
   private int healthyReplicaCount;
   private int unhealthyReplicaCount;
   private int misMatchedReplicaCount;
+  private int matchingReplicaCount;
   private int decommissionCount;
   private int maintenanceCount;
+  private int unhealthyDecommissionCount;
+  private int unhealthyMaintenanceCount;
   private int inFlightAdd;
   private int inFlightDel;
   private final int repFactor;
   private final int minHealthyForMaintenance;
   private final ContainerInfo container;
   private final List<ContainerReplica> replicas;
+  private boolean considerUnhealthy = false;
 
   public RatisContainerReplicaCount(ContainerInfo container,
                                Set<ContainerReplica> replicas,
                                     int inFlightAdd,
                                int inFlightDelete, int replicationFactor,
                                int minHealthyForMaintenance) {
-    this.unhealthyReplicaCount = 0;
-    this.healthyReplicaCount = 0;
-    this.misMatchedReplicaCount = 0;
-    this.decommissionCount = 0;
-    this.maintenanceCount = 0;
     this.inFlightAdd = inFlightAdd;
     this.inFlightDel = inFlightDelete;
     this.repFactor = replicationFactor;
@@ -80,31 +82,13 @@ public class RatisContainerReplicaCount implements ContainerReplicaCount {
         = Math.min(this.repFactor, minHealthyForMaintenance);
     this.container = container;
 
-    for (ContainerReplica cr : this.replicas) {
-      HddsProtos.NodeOperationalState state =
-          cr.getDatanodeDetails().getPersistedOpState();
-      if (state == DECOMMISSIONED || state == DECOMMISSIONING) {
-        decommissionCount++;
-      } else if (state == IN_MAINTENANCE || state == ENTERING_MAINTENANCE) {
-        maintenanceCount++;
-      } else {
-        if (cr.getState() == ContainerReplicaProto.State.UNHEALTHY) {
-          unhealthyReplicaCount++;
-        } else if (!LegacyReplicationManager.compareState(container.getState(),
-            cr.getState())) {
-          healthyReplicaCount++;
-          misMatchedReplicaCount++;
-        } else {
-          healthyReplicaCount++;
-        }
-      }
-    }
+    countReplicas();
   }
 
   public RatisContainerReplicaCount(ContainerInfo containerInfo,
       Set<ContainerReplica> replicas,
       List<ContainerReplicaOp> replicaPendingOps,
-      int minHealthyForMaintenance) {
+      int minHealthyForMaintenance, boolean considerUnhealthy) {
     // Iterate replicas in deterministic order to avoid potential data loss
     // on delete.
     // See https://issues.apache.org/jira/browse/HDDS-4589.
@@ -117,14 +101,7 @@ public class RatisContainerReplicaCount implements ContainerReplicaCount {
     this.repFactor = containerInfo.getReplicationFactor().getNumber();
     this.minHealthyForMaintenance
         = Math.min(this.repFactor, minHealthyForMaintenance);
-
-    this.unhealthyReplicaCount = 0;
-    this.healthyReplicaCount = 0;
-    this.misMatchedReplicaCount = 0;
-    this.decommissionCount = 0;
-    this.maintenanceCount = 0;
-    this.inFlightAdd = 0;
-    this.inFlightDel = 0;
+    this.considerUnhealthy = considerUnhealthy;
 
     // collect DNs that have UNHEALTHY replicas
     Set<DatanodeDetails> unhealthyReplicaDNs = new HashSet<>();
@@ -139,7 +116,8 @@ public class RatisContainerReplicaCount implements ContainerReplicaCount {
       if (op.getOpType() == ContainerReplicaOp.PendingOpType.ADD) {
         inFlightAdd++;
       } else if (op.getOpType() == ContainerReplicaOp.PendingOpType.DELETE) {
-        if (!unhealthyReplicaDNs.contains(op.getTarget())) {
+        if (!unhealthyReplicaDNs.contains(op.getTarget()) ||
+            considerUnhealthy) {
           /*
           We don't count UNHEALTHY replicas when considering sufficient
           replication, so we also need to ignore pending deletes on
@@ -152,37 +130,89 @@ public class RatisContainerReplicaCount implements ContainerReplicaCount {
       }
     }
 
-    for (ContainerReplica cr : this.replicas) {
+    countReplicas();
+  }
+
+  private void countReplicas() {
+    for (ContainerReplica cr : replicas) {
       HddsProtos.NodeOperationalState state =
           cr.getDatanodeDetails().getPersistedOpState();
+
+      /*
+       * When there is Quasi Closed Replica with incorrect sequence id
+       * for a Closed container, it's treated as unhealthy.
+       */
+      boolean unhealthy =
+          cr.getState() == ContainerReplicaProto.State.UNHEALTHY ||
+              (cr.getState() == ContainerReplicaProto.State.QUASI_CLOSED &&
+                  container.getState() == HddsProtos.LifeCycleState.CLOSED &&
+                  container.getSequenceId() != cr.getSequenceId());
+
       if (state == DECOMMISSIONED || state == DECOMMISSIONING) {
-        decommissionCount++;
-      } else if (state == IN_MAINTENANCE || state == ENTERING_MAINTENANCE) {
-        maintenanceCount++;
-      } else {
-        if (cr.getState() == ContainerReplicaProto.State.UNHEALTHY) {
-          unhealthyReplicaCount++;
-        } else if (!LegacyReplicationManager.compareState(container.getState(),
-            cr.getState())) {
-          healthyReplicaCount++;
-          misMatchedReplicaCount++;
+        if (unhealthy) {
+          unhealthyDecommissionCount++;
         } else {
-          healthyReplicaCount++;
+          decommissionCount++;
+        }
+      } else if (state == IN_MAINTENANCE || state == ENTERING_MAINTENANCE) {
+        if (unhealthy) {
+          unhealthyMaintenanceCount++;
+        } else {
+          maintenanceCount++;
+        }
+      } else if (unhealthy) {
+        unhealthyReplicaCount++;
+      } else {
+        healthyReplicaCount++;
+        if (compareState(container.getState(), cr.getState())) {
+          matchingReplicaCount++;
+        } else {
+          misMatchedReplicaCount++;
         }
       }
     }
   }
 
+  /**
+   * Healthy replica count = Number of replicas that match the container's
+   * state + Number of replicas that don't match the container's state but
+   * their state is not UNHEALTHY (also called mismatched replicas).
+   * For example, consider a CLOSED container with the following replicas:
+   * {CLOSED, CLOSING, OPEN, UNHEALTHY}
+   * In this case, healthy replica count equals 3. Calculation:
+   * 1 CLOSED -> 1 matching replica.
+   * 1 OPEN, 1 CLOSING -> 2 mismatched replicas.
+   * 1 UNHEALTHY -> 1 unhealthy replica. Not counted as healthy.
+   * Total healthy replicas = 3 = 1 matching + 2 mismatched replicas
+   */
   public int getHealthyReplicaCount() {
-    return healthyReplicaCount + healthyReplicaCountAdapter();
+    return healthyReplicaCount + healthyReplicaCountAdapter()
+        + decommissionCount + maintenanceCount;
   }
 
   public int getUnhealthyReplicaCount() {
-    return unhealthyReplicaCount;
+    return unhealthyReplicaCount + getUnhealthyReplicaCountAdapter()
+        + unhealthyDecommissionCount + unhealthyMaintenanceCount;
+  }
+
+  protected int getUnhealthyReplicaCountAdapter() {
+    return 0;
   }
 
   public int getMisMatchedReplicaCount() {
     return misMatchedReplicaCount;
+  }
+
+  public int getMatchingReplicaCount() {
+    return matchingReplicaCount;
+  }
+
+  private int getAvailableReplicas() {
+    int available = healthyReplicaCount + healthyReplicaCountAdapter();
+    if (considerUnhealthy) {
+      available += unhealthyReplicaCount + getUnhealthyReplicaCountAdapter();
+    }
+    return available;
   }
 
   /**
@@ -199,12 +229,16 @@ public class RatisContainerReplicaCount implements ContainerReplicaCount {
 
   @Override
   public int getDecommissionCount() {
-    return decommissionCount;
+    return considerUnhealthy
+        ? decommissionCount + unhealthyDecommissionCount
+        : decommissionCount;
   }
 
   @Override
   public int getMaintenanceCount() {
-    return maintenanceCount;
+    return considerUnhealthy
+        ? maintenanceCount + unhealthyMaintenanceCount
+        : maintenanceCount;
   }
 
   public int getReplicationFactor() {
@@ -223,16 +257,20 @@ public class RatisContainerReplicaCount implements ContainerReplicaCount {
 
   @Override
   public String toString() {
-    return "Container State: " + container.getState() +
+    String result = "Container State: " + container.getState() +
         " Replica Count: " + replicas.size() +
-        " Healthy Count: " + healthyReplicaCount +
-        " Unhealthy Count: " + unhealthyReplicaCount +
-        " Decommission Count: " + decommissionCount +
-        " Maintenance Count: " + maintenanceCount +
-        " inFlightAdd Count: " + inFlightAdd +
-        " inFightDel Count: " + inFlightDel +
+        " Healthy (I/D/M): " + healthyReplicaCount +
+            "/" + decommissionCount + "/" + maintenanceCount +
+        " Unhealthy (I/D/M): " + unhealthyReplicaCount +
+            "/" + unhealthyDecommissionCount + "/" + unhealthyMaintenanceCount +
+        " inFlightAdd: " + inFlightAdd +
+        " inFightDel: " + inFlightDel +
         " ReplicationFactor: " + repFactor +
-        " minMaintenance Count: " + minHealthyForMaintenance;
+        " minMaintenance: " + minHealthyForMaintenance;
+    if (considerUnhealthy) {
+      result += " +considerUnhealthy";
+    }
+    return result;
   }
 
   /**
@@ -329,16 +367,17 @@ public class RatisContainerReplicaCount implements ContainerReplicaCount {
    *         for under replicated and a negative value for over replicated.
    */
   private int missingReplicas() {
-    int delta = repFactor - getHealthyReplicaCount();
+    int availableReplicas = getAvailableReplicas();
+    int delta = repFactor - availableReplicas;
 
     if (delta < 0) {
       // Over replicated, so may need to remove a container.
       return delta;
     } else if (delta > 0) {
       // May be under-replicated, depending on maintenance.
-      delta = Math.max(0, delta - maintenanceCount);
+      delta = Math.max(0, delta - getMaintenanceCount());
       int neededHealthy =
-          Math.max(0, minHealthyForMaintenance - getHealthyReplicaCount());
+          Math.max(0, minHealthyForMaintenance - availableReplicas);
       delta = Math.max(neededHealthy, delta);
       return delta;
     } else { // delta == 0
@@ -394,6 +433,13 @@ public class RatisContainerReplicaCount implements ContainerReplicaCount {
   }
 
   /**
+   * @return true if the container is under replicated, false otherwise
+   */
+  public boolean isUnderReplicated() {
+    return !isSufficientlyReplicated();
+  }
+
+  /**
    * Return true if the container is over replicated. Decommission and
    * maintenance containers are ignored for this check.
    * The check ignores inflight additions, as they may fail, but it does
@@ -420,6 +466,21 @@ public class RatisContainerReplicaCount implements ContainerReplicaCount {
   }
 
   /**
+   * A container is safely over replicated if:
+   * 1. It is over replicated.
+   * 2. Has at least replication factor number of matching replicas.
+   * 3. # matching replicas - replication factor >= pending deletes.
+   */
+  public boolean isSafelyOverReplicated() {
+    if (!isOverReplicated(true)) {
+      return false;
+    }
+
+    return getMatchingReplicaCount() >= repFactor &&
+        getMatchingReplicaCount() - repFactor >= inFlightDel;
+  }
+
+  /**
    * @return Return Excess Redundancy replica nums.
    */
   public int getExcessRedundancy(boolean includePendingDelete) {
@@ -434,8 +495,6 @@ public class RatisContainerReplicaCount implements ContainerReplicaCount {
   /**
    * Return the delta from the expected number of replicas, optionally
    * considering inflight add and deletes.
-   * @param includePendingDelete
-   * @param includePendingAdd
    * @return zero if perfectly replicated, a negative value for over replication
    *         and a positive value for under replication. The magnitude of the
    *         return value indicates how many replias the container is over or
@@ -455,17 +514,14 @@ public class RatisContainerReplicaCount implements ContainerReplicaCount {
 
   /**
    * Checks whether insufficient replication is because of some replicas
-   * being on datanodes that were decommissioned.
-   * @param includePendingAdd if pending adds should be considered
+   * being on datanodes that were decommissioned or are in maintenance.
+   *
    * @return true if there is insufficient replication and it's because of
    * decommissioning.
    */
-  public boolean inSufficientDueToDecommission(boolean includePendingAdd) {
-    if (isSufficientlyReplicated(includePendingAdd)) {
-      return false;
-    }
-    int delta = redundancyDelta(true, includePendingAdd);
-    return decommissionCount >= delta;
+  boolean insufficientDueToOutOfService() {
+    int delta = redundancyDelta(true, false);
+    return 0 < delta && delta <= getDecommissionCount() + getMaintenanceCount();
   }
 
   /**
@@ -478,9 +534,10 @@ public class RatisContainerReplicaCount implements ContainerReplicaCount {
    * @return Count of remaining redundant replicas.
    */
   public int getRemainingRedundancy() {
-    return Math.max(0,
-        getHealthyReplicaCount() + decommissionCount + maintenanceCount
-            - inFlightDel - 1);
+    int availableReplicas = getAvailableReplicas()
+        + getDecommissionCount() + getMaintenanceCount();
+
+    return Math.max(0, availableReplicas - inFlightDel - 1);
   }
 
   /**
@@ -493,4 +550,28 @@ public class RatisContainerReplicaCount implements ContainerReplicaCount {
   public boolean isUnrecoverable() {
     return getReplicas().isEmpty();
   }
+
+  public UnderReplicatedHealthResult toUnderHealthResult() {
+    UnderReplicatedHealthResult result = new UnderReplicatedHealthResult(
+        getContainer(),
+        getRemainingRedundancy(),
+        insufficientDueToOutOfService(),
+        isSufficientlyReplicated(true),
+        isUnrecoverable());
+    result.setHasHealthyReplicas(getHealthyReplicaCount() > 0);
+    return result;
+  }
+
+  public OverReplicatedHealthResult toOverHealthResult() {
+    OverReplicatedHealthResult result = new OverReplicatedHealthResult(
+        getContainer(),
+        getExcessRedundancy(false),
+        !isOverReplicated(true));
+    result.setHasMismatchedReplicas(getMisMatchedReplicaCount() > 0);
+    // FIXME not used in RatisReplicationCheckHandler: OK?
+    result.setIsSafelyOverReplicated(isSafelyOverReplicated());
+    return result;
+
+  }
+
 }

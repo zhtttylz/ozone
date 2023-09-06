@@ -20,24 +20,20 @@
 package org.apache.hadoop.ozone.security;
 
 import org.apache.commons.lang3.StringUtils;
-import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
 import org.apache.hadoop.hdds.protocol.proto.SCMSecurityProtocolProtos.SCMGetCertResponseProto;
-import org.apache.hadoop.hdds.security.x509.SecurityConfig;
+import org.apache.hadoop.hdds.protocolPB.SCMSecurityProtocolClientSideTranslatorPB;
+import org.apache.hadoop.hdds.security.SecurityConfig;
 import org.apache.hadoop.hdds.security.x509.certificate.client.CommonCertificateClient;
-import org.apache.hadoop.hdds.security.x509.certificate.utils.CertificateCodec;
 import org.apache.hadoop.hdds.security.x509.certificate.utils.CertificateSignRequest;
 import org.apache.hadoop.hdds.security.x509.exception.CertificateException;
 import org.apache.hadoop.ozone.om.OMStorage;
-import org.apache.hadoop.ozone.om.OzoneManager;
-import org.apache.hadoop.ozone.om.ha.OMHANodeDetails;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.bouncycastle.pkcs.PKCS10CertificationRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.nio.file.Path;
 import java.security.KeyPair;
 import java.util.function.Consumer;
 
@@ -52,63 +48,28 @@ public class OMCertificateClient extends CommonCertificateClient {
       LoggerFactory.getLogger(OMCertificateClient.class);
 
   public static final String COMPONENT_NAME = "om";
+  private String serviceId;
   private String scmID;
   private final String clusterID;
   private final HddsProtos.OzoneManagerDetailsProto omInfo;
 
-  @SuppressWarnings("parameternumber")
-  public OMCertificateClient(SecurityConfig secConfig, String scmId,
-      String clusterId, HddsProtos.OzoneManagerDetailsProto omDetails,
-      String certSerialId, String localCrlId,
-      Consumer<String> persistCertIdCallback, Runnable shutdownCallback) {
-    super(secConfig, LOG, certSerialId, COMPONENT_NAME, persistCertIdCallback,
-        shutdownCallback);
-    this.setLocalCrlId(localCrlId != null ?
-        Long.parseLong(localCrlId) : 0);
-    this.scmID = scmId;
-    this.clusterID = clusterId;
-    this.omInfo = omDetails;
-  }
-
-  public OMCertificateClient(SecurityConfig secConfig,
-      OMStorage omStorage, String scmID, Consumer<String> saveCertIdCallback,
-      Runnable shutdownCallback) {
-    this(secConfig, scmID, omStorage.getClusterID(),
-        OzoneManager.getOmDetailsProto(
-            (OzoneConfiguration) secConfig.getConfiguration(),
-            omStorage.getOmId()),
-        omStorage.getOmCertSerialId(), null,
-        saveCertIdCallback, shutdownCallback);
-  }
-
-  public OMCertificateClient(SecurityConfig secConfig, OMStorage omStorage,
-      String scmID) {
-    this(secConfig, scmID, omStorage.getClusterID(),
-        OzoneManager.getOmDetailsProto(
-            (OzoneConfiguration) secConfig.getConfiguration(),
-            omStorage.getOmId()),
-        omStorage.getOmCertSerialId(), null, null, null);
-  }
-
-  public OMCertificateClient(SecurityConfig secConfig) {
-    this(secConfig, null, null, null, null, null, null, null);
-  }
-
-  public OMCertificateClient(SecurityConfig secConfig, String certSerialId) {
-    this(secConfig, null, null, null, certSerialId, null, null, null);
-  }
-
-  /**
-   * Returns a CSR builder that can be used to create a Certificate signing
-   * request.
-   * The default flag is added to allow basic SSL handshake.
-   *
-   * @return CertificateSignRequest.Builder
-   */
-  @Override
-  public CertificateSignRequest.Builder getCSRBuilder()
-      throws CertificateException {
-    return getCSRBuilder(new KeyPair(getPublicKey(), getPrivateKey()));
+  @SuppressWarnings("checkstyle:ParameterNumber")
+  public OMCertificateClient(
+      SecurityConfig secConfig,
+      SCMSecurityProtocolClientSideTranslatorPB scmSecurityClient,
+      OMStorage omStorage,
+      HddsProtos.OzoneManagerDetailsProto omInfo,
+      String serviceId,
+      String scmID,
+      Consumer<String> saveCertIdCallback,
+      Runnable shutdownCallback
+  ) {
+    super(secConfig, scmSecurityClient, LOG, omStorage.getOmCertSerialId(),
+        COMPONENT_NAME, saveCertIdCallback, shutdownCallback);
+    this.serviceId = serviceId;
+    this.scmID = scmID;
+    this.clusterID = omStorage.getClusterID();
+    this.omInfo = omInfo;
   }
 
   /**
@@ -118,7 +79,7 @@ public class OMCertificateClient extends CommonCertificateClient {
    * @return CertificateSignRequest.Builder
    */
   @Override
-  public CertificateSignRequest.Builder getCSRBuilder(KeyPair keyPair)
+  public CertificateSignRequest.Builder getCSRBuilder()
       throws CertificateException {
     CertificateSignRequest.Builder builder = super.getCSRBuilder()
         .setDigitalEncryption(true)
@@ -140,18 +101,14 @@ public class OMCertificateClient extends CommonCertificateClient {
     }
 
     builder.setCA(false)
-        .setKey(keyPair)
-        .setConfiguration(getConfig())
+        .setKey(new KeyPair(getPublicKey(), getPrivateKey()))
+        .setConfiguration(getSecurityConfig())
         .setScmID(scmID)
         .setClusterID(clusterID)
         .setSubject(subject);
 
-    OMHANodeDetails haOMHANodeDetails =
-        OMHANodeDetails.loadOMHAConfig(getConfig());
-    String serviceName =
-        haOMHANodeDetails.getLocalNodeDetails().getServiceId();
-    if (!StringUtils.isEmpty(serviceName)) {
-      builder.addServiceName(serviceName);
+    if (!StringUtils.isEmpty(serviceId)) {
+      builder.addServiceName(serviceId);
     }
 
     LOG.info("Creating csr for OM->dns:{},ip:{},scmId:{},clusterId:{}," +
@@ -161,39 +118,10 @@ public class OMCertificateClient extends CommonCertificateClient {
   }
 
   @Override
-  public String signAndStoreCertificate(PKCS10CertificationRequest request,
-      Path certPath) throws CertificateException {
-    try {
-      SCMGetCertResponseProto response = getScmSecureClient()
-          .getOMCertChain(omInfo, getEncodedString(request));
-
-      String pemEncodedCert = response.getX509Certificate();
-      CertificateCodec certCodec = new CertificateCodec(
-          getSecurityConfig(), certPath);
-
-      // Store SCM CA certificate.
-      if (response.hasX509CACertificate()) {
-        String pemEncodedRootCert = response.getX509CACertificate();
-        storeCertificate(pemEncodedRootCert,
-            true, true, false, certCodec, false);
-        storeCertificate(pemEncodedCert, true, false, false, certCodec, false);
-
-        // Store Root CA certificate if available.
-        if (response.hasX509RootCACertificate()) {
-          storeCertificate(response.getX509RootCACertificate(),
-              true, false, true, certCodec, false);
-        }
-        return CertificateCodec.getX509Certificate(pemEncodedCert)
-            .getSerialNumber().toString();
-      } else {
-        throw new CertificateException("Unable to retrieve OM certificate " +
-            "chain.");
-      }
-    } catch (IOException | java.security.cert.CertificateException e) {
-      LOG.error("Error while signing and storing SCM signed certificate.", e);
-      throw new CertificateException(
-          "Error while signing and storing SCM signed certificate.", e);
-    }
+  protected SCMGetCertResponseProto getCertificateSignResponse(
+      PKCS10CertificationRequest request) throws IOException {
+    return getScmSecureClient().getOMCertChain(
+        omInfo, getEncodedString(request));
   }
 
   @Override
