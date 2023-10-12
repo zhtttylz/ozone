@@ -16,8 +16,7 @@
  * limitations under the License.
  */
 
-package org.apache.hadoop.ozone.om.hashcodegenerator;
-
 /**
- * This package contains classes and interfaces for OM Hash Code Generation.
+ * Contains all of the container related scm commands.
  */
+package org.apache.hadoop.hdds.scm.cli.container.upgrade;

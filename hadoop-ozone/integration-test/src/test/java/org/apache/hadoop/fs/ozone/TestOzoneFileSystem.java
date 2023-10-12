@@ -32,6 +32,7 @@ import org.apache.hadoop.fs.PathIsNotEmptyDirectoryException;
 import org.apache.hadoop.fs.RemoteIterator;
 import org.apache.hadoop.fs.Trash;
 import org.apache.hadoop.fs.TrashPolicy;
+import org.apache.hadoop.fs.TrashPolicyDefault;
 import org.apache.hadoop.fs.contract.ContractTestUtils;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.hdds.client.ECReplicationConfig;
@@ -60,13 +61,14 @@ import org.apache.hadoop.ozone.om.protocol.OzoneManagerProtocol;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.ozone.test.GenericTestUtils;
 import org.apache.ozone.test.TestClock;
-import org.apache.ozone.test.tag.Flaky;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Assert;
 import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TestRule;
 import org.junit.rules.Timeout;
+import org.apache.ozone.test.JUnit5AwareTimeout;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 import org.slf4j.Logger;
@@ -155,7 +157,7 @@ public class TestOzoneFileSystem {
    * Set a timeout for each test.
    */
   @Rule
-  public Timeout timeout = Timeout.seconds(600);
+  public TestRule timeout = new JUnit5AwareTimeout(Timeout.seconds(600));
 
   private static final Logger LOG =
       LoggerFactory.getLogger(TestOzoneFileSystem.class);
@@ -802,20 +804,12 @@ public class TestOzoneFileSystem {
       return;
     }
     deleteRootRecursively(fileStatuses);
-
-    // Waiting for double buffer flush before calling listStatus() again
-    // seem to have mitigated the flakiness in cleanup(), but at the cost of
-    // almost doubling the test run time. M1 154s->283s (all 4 sets of params)
-    cluster.getOzoneManager().awaitDoubleBufferFlush();
-    // TODO: Investigate whether listStatus() is correctly iterating cache.
-
     fileStatuses = fs.listStatus(ROOT);
     if (fileStatuses != null) {
       for (FileStatus fileStatus : fileStatuses) {
         LOG.error("Unexpected file, should have been deleted: {}", fileStatus);
       }
-      Assert.assertEquals(
-          "Delete root failed!", 0, fileStatuses.length);
+      Assert.assertEquals("Delete root failed!", 0, fileStatuses.length);
     }
   }
 
@@ -1523,7 +1517,7 @@ public class TestOzoneFileSystem {
     Path inPath1 = new Path("o3fs://bucket2.volume1/path/to/key");
     // Test with current user
     Path outPath1 = o3fs.getTrashRoot(inPath1);
-    Path expectedOutPath1 = new Path(TRASH_ROOT, username);
+    Path expectedOutPath1 = o3fs.makeQualified(new Path(TRASH_ROOT, username));
     Assert.assertEquals(expectedOutPath1, outPath1);
   }
 
@@ -1623,33 +1617,18 @@ public class TestOzoneFileSystem {
     Assert.assertEquals(6, res.size());
   }
 
-  /**
-   * Check that files are moved to trash.
-   * since fs.rename(src,dst,options) is enabled.
-   */
   @Test
-  @Flaky("HDDS-6646")
-  public void testRenameToTrashEnabled() throws Exception {
-    // Create a file
-    String testKeyName = "testKey1";
-    Path path = new Path(OZONE_URI_DELIMITER, testKeyName);
-    try (FSDataOutputStream stream = fs.create(path)) {
-      stream.write(1);
-    }
-
-    // Call moveToTrash. We can't call protected fs.rename() directly
-    trash.moveToTrash(path);
-
-    // Construct paths
-    String username = UserGroupInformation.getCurrentUser().getShortUserName();
-    Path userTrash = new Path(TRASH_ROOT, username);
-    Path userTrashCurrent = new Path(userTrash, "Current");
-    Path trashPath = new Path(userTrashCurrent, testKeyName);
-
-    // Trash Current directory should still have been created.
-    Assert.assertTrue(o3fs.exists(userTrashCurrent));
-    // Check under trash, the key should be present
-    Assert.assertTrue(o3fs.exists(trashPath));
+  public void testDeleteRootWithTrash() throws IOException {
+    // Try to delete root
+    Path root = new Path(OZONE_URI_DELIMITER);
+    Assert.assertThrows(IOException.class, () -> trash.moveToTrash(root));
+    // Also try with TrashPolicyDefault
+    OzoneConfiguration conf2 = new OzoneConfiguration(cluster.getConf());
+    conf2.setClass("fs.trash.classname", TrashPolicyDefault.class,
+        TrashPolicy.class);
+    Trash trashPolicyDefault = new Trash(conf2);
+    Assert.assertThrows(IOException.class,
+        () -> trashPolicyDefault.moveToTrash(root));
   }
 
   /**
@@ -1657,7 +1636,6 @@ public class TestOzoneFileSystem {
    * 2.Verify that the key gets deleted by the trash emptier.
    */
   @Test
-  @Flaky("HDDS-6645")
   public void testTrash() throws Exception {
     String testKeyName = "testKey2";
     Path path = new Path(OZONE_URI_DELIMITER, testKeyName);
@@ -1667,14 +1645,20 @@ public class TestOzoneFileSystem {
         isAssignableFrom(TrashPolicyOzone.class));
     assertEquals(TRASH_INTERVAL, trash.getConf().
         getFloat(OMConfigKeys.OZONE_FS_TRASH_INTERVAL_KEY, 0), 0);
-    // Call moveToTrash. We can't call protected fs.rename() directly
-    trash.moveToTrash(path);
 
     // Construct paths
     String username = UserGroupInformation.getCurrentUser().getShortUserName();
     Path userTrash = new Path(TRASH_ROOT, username);
     Path userTrashCurrent = new Path(userTrash, "Current");
     Path trashPath = new Path(userTrashCurrent, testKeyName);
+    Assert.assertFalse(o3fs.exists(userTrash));
+
+    // Call moveToTrash. We can't call protected fs.rename() directly
+    trash.moveToTrash(path);
+
+    Assert.assertTrue(o3fs.exists(userTrash));
+    Assert.assertTrue(o3fs.exists(trashPath) || o3fs.listStatus(
+        o3fs.listStatus(userTrash)[0].getPath()).length > 0);
 
     // Wait until the TrashEmptier purges the key
     GenericTestUtils.waitFor(() -> {
@@ -1685,11 +1669,7 @@ public class TestOzoneFileSystem {
         Assert.fail("Delete from Trash Failed");
         return false;
       }
-    }, 1000, 120000);
-
-    // userTrash path will contain the checkpoint folder
-    FileStatus[] statusList = fs.listStatus(userTrash);
-    Assert.assertNotEquals(Arrays.toString(statusList), 0, statusList.length);
+    }, 100, 120000);
 
     // wait for deletion of checkpoint dir
     GenericTestUtils.waitFor(() -> {
