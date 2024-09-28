@@ -20,6 +20,8 @@
 
 package org.apache.hadoop.ozone.client;
 
+import org.apache.hadoop.ozone.OzoneConsts;
+import org.apache.hadoop.ozone.client.io.KeyMetadataAware;
 import org.apache.hadoop.ozone.client.io.OzoneOutputStream;
 import org.apache.hadoop.ozone.om.helpers.OmMultipartCommitUploadPartInfo;
 
@@ -71,7 +73,7 @@ public class OzoneOutputStreamStub extends OzoneOutputStream {
 
   @Override
   public OmMultipartCommitUploadPartInfo getCommitUploadPartInfo() {
-    return closed ? new OmMultipartCommitUploadPartInfo(partName) : null;
+    return closed ? new OmMultipartCommitUploadPartInfo(partName,
+        ((KeyMetadataAware)getOutputStream()).getMetadata().get(OzoneConsts.ETAG)) : null;
   }
-
 }

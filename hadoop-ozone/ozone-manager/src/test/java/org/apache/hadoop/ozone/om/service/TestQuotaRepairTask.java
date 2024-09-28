@@ -19,7 +19,19 @@
 
 package org.apache.hadoop.ozone.om.service;
 
-import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
+import static org.apache.hadoop.hdds.protocol.proto.HddsProtos.ReplicationFactor.ONE;
+import static org.apache.hadoop.hdds.protocol.proto.HddsProtos.ReplicationFactor.THREE;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicReference;
+import org.apache.hadoop.hdds.client.RatisReplicationConfig;
+import org.apache.hadoop.hdds.utils.db.BatchOperation;
 import org.apache.hadoop.hdds.utils.db.cache.CacheKey;
 import org.apache.hadoop.hdds.utils.db.cache.CacheValue;
 import org.apache.hadoop.ozone.om.helpers.BucketLayout;
@@ -28,9 +40,13 @@ import org.apache.hadoop.ozone.om.helpers.OmKeyInfo;
 import org.apache.hadoop.ozone.om.helpers.OmVolumeArgs;
 import org.apache.hadoop.ozone.om.request.OMRequestTestUtils;
 import org.apache.hadoop.ozone.om.request.key.TestOMKeyRequest;
+import org.apache.hadoop.ozone.om.request.volume.OMQuotaRepairRequest;
+import org.apache.hadoop.ozone.om.response.OMClientResponse;
+import org.apache.hadoop.ozone.om.response.volume.OMQuotaRepairResponse;
+import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos;
+import org.apache.hadoop.ozone.protocolPB.OzoneManagerProtocolServerSideTranslatorPB;
 import org.apache.hadoop.util.Time;
-import org.junit.Assert;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 
@@ -41,6 +57,16 @@ public class TestQuotaRepairTask extends TestOMKeyRequest {
 
   @Test
   public void testQuotaRepair() throws Exception {
+    when(ozoneManager.isRatisEnabled()).thenReturn(false);
+    OzoneManagerProtocolProtos.OMResponse respMock = mock(OzoneManagerProtocolProtos.OMResponse.class);
+    when(respMock.getSuccess()).thenReturn(true);
+    OzoneManagerProtocolServerSideTranslatorPB serverMock = mock(OzoneManagerProtocolServerSideTranslatorPB.class);
+    AtomicReference<OzoneManagerProtocolProtos.OMRequest> ref = new AtomicReference<>();
+    doAnswer(invocation -> {
+      ref.set(invocation.getArgument(1, OzoneManagerProtocolProtos.OMRequest.class));
+      return respMock;
+    }).when(serverMock).submitRequest(any(), any());
+    when(ozoneManager.getOmServerProtocol()).thenReturn(serverMock);
     OMRequestTestUtils.addVolumeAndBucketToDB(volumeName, bucketName,
         omMetadataManager, BucketLayout.OBJECT_STORE);
 
@@ -48,8 +74,7 @@ public class TestQuotaRepairTask extends TestOMKeyRequest {
     String parentDir = "/user";
     for (int i = 0; i < count; i++) {
       OMRequestTestUtils.addKeyToTableAndCache(volumeName, bucketName,
-          parentDir.concat("/key" + i), -1, HddsProtos.ReplicationType.RATIS,
-          HddsProtos.ReplicationFactor.THREE, 150 + i, omMetadataManager);
+          parentDir.concat("/key" + i), -1, RatisReplicationConfig.getInstance(THREE), 150 + i, omMetadataManager);
     }
 
     String fsoBucketName = "fso" + bucketName;
@@ -59,12 +84,13 @@ public class TestQuotaRepairTask extends TestOMKeyRequest {
         fsoBucketName, "c/d/e", omMetadataManager);
     for (int i = 0; i < count; i++) {
       String fileName = "file1" + i;
-      OmKeyInfo omKeyInfo = OMRequestTestUtils.createOmKeyInfo(
-          volumeName, fsoBucketName, fileName,
-          HddsProtos.ReplicationType.RATIS,
-          HddsProtos.ReplicationFactor.ONE,
-          parentId + 1 + i,
-          parentId, 100 + i, Time.now());
+      OmKeyInfo omKeyInfo =
+          OMRequestTestUtils.createOmKeyInfo(volumeName, fsoBucketName, fileName,
+                  RatisReplicationConfig.getInstance(ONE))
+              .setObjectID(parentId + 1 + i)
+              .setParentObjectID(parentId)
+              .setUpdateID(100L + i)
+              .build();
       omKeyInfo.setKeyName(fileName);
       OMRequestTestUtils.addFileToKeyTable(false, false,
           fileName, omKeyInfo, -1, 50 + i, omMetadataManager);
@@ -78,30 +104,47 @@ public class TestQuotaRepairTask extends TestOMKeyRequest {
     // and directory table
     OmBucketInfo obsBucketInfo = omMetadataManager.getBucketTable().get(
         omMetadataManager.getBucketKey(volumeName, bucketName));
-    Assert.assertTrue(obsBucketInfo.getUsedNamespace() == 0);
-    Assert.assertTrue(obsBucketInfo.getUsedBytes() == 0);
+    assertEquals(0, obsBucketInfo.getUsedNamespace());
+    assertEquals(0, obsBucketInfo.getUsedBytes());
     OmBucketInfo fsoBucketInfo = omMetadataManager.getBucketTable().get(
         omMetadataManager.getBucketKey(volumeName, fsoBucketName));
-    Assert.assertTrue(fsoBucketInfo.getUsedNamespace() == 0);
-    Assert.assertTrue(fsoBucketInfo.getUsedBytes() == 0);
+    assertEquals(0, fsoBucketInfo.getUsedNamespace());
+    assertEquals(0, fsoBucketInfo.getUsedBytes());
     
-    QuotaRepairTask quotaRepairTask = new QuotaRepairTask(omMetadataManager);
-    quotaRepairTask.repair();
+    QuotaRepairTask quotaRepairTask = new QuotaRepairTask(ozoneManager);
+    CompletableFuture<Boolean> repair = quotaRepairTask.repair();
+    Boolean repairStatus = repair.get();
+    assertTrue(repairStatus);
 
+    OMQuotaRepairRequest omQuotaRepairRequest = new OMQuotaRepairRequest(ref.get());
+    OMClientResponse omClientResponse = omQuotaRepairRequest.validateAndUpdateCache(ozoneManager, 1);
+    BatchOperation batchOperation = omMetadataManager.getStore().initBatchOperation();
+    ((OMQuotaRepairResponse)omClientResponse).addToDBBatch(omMetadataManager, batchOperation);
+    omMetadataManager.getStore().commitBatchOperation(batchOperation);
     // 10 files of each type, obs have replication of three and
     // fso have replication of one
     OmBucketInfo obsUpdateBucketInfo = omMetadataManager.getBucketTable().get(
         omMetadataManager.getBucketKey(volumeName, bucketName));
     OmBucketInfo fsoUpdateBucketInfo = omMetadataManager.getBucketTable().get(
         omMetadataManager.getBucketKey(volumeName, fsoBucketName));
-    Assert.assertTrue(obsUpdateBucketInfo.getUsedNamespace() == 10);
-    Assert.assertTrue(obsUpdateBucketInfo.getUsedBytes() == 30000);
-    Assert.assertTrue(fsoUpdateBucketInfo.getUsedNamespace() == 13);
-    Assert.assertTrue(fsoUpdateBucketInfo.getUsedBytes() == 10000);
+    assertEquals(10, obsUpdateBucketInfo.getUsedNamespace());
+    assertEquals(30000, obsUpdateBucketInfo.getUsedBytes());
+    assertEquals(13, fsoUpdateBucketInfo.getUsedNamespace());
+    assertEquals(10000, fsoUpdateBucketInfo.getUsedBytes());
   }
 
   @Test
   public void testQuotaRepairForOldVersionVolumeBucket() throws Exception {
+    when(ozoneManager.isRatisEnabled()).thenReturn(false);
+    OzoneManagerProtocolProtos.OMResponse respMock = mock(OzoneManagerProtocolProtos.OMResponse.class);
+    when(respMock.getSuccess()).thenReturn(true);
+    OzoneManagerProtocolServerSideTranslatorPB serverMock = mock(OzoneManagerProtocolServerSideTranslatorPB.class);
+    AtomicReference<OzoneManagerProtocolProtos.OMRequest> ref = new AtomicReference<>();
+    doAnswer(invocation -> {
+      ref.set(invocation.getArgument(1, OzoneManagerProtocolProtos.OMRequest.class));
+      return respMock;
+    }).when(serverMock).submitRequest(any(), any());
+    when(ozoneManager.getOmServerProtocol()).thenReturn(serverMock);
     // add volume with -2 value
     OmVolumeArgs omVolumeArgs =
         OmVolumeArgs.newBuilder().setCreationTime(Time.now())
@@ -114,30 +157,38 @@ public class TestQuotaRepairTask extends TestOMKeyRequest {
         new CacheKey<>(omMetadataManager.getVolumeKey(volumeName)),
         CacheValue.get(1L, omVolumeArgs));
     
-    // add bucket with -2 value
+    // add bucket with -2 value and add to db
     OMRequestTestUtils.addBucketToDB(volumeName, bucketName,
         omMetadataManager, -2);
+    String bucketKey = omMetadataManager.getBucketKey(volumeName, bucketName);
+    omMetadataManager.getBucketTable().put(bucketKey, omMetadataManager.getBucketTable().get(bucketKey));
 
     // pre check for quota flag
-    OmBucketInfo bucketInfo = omMetadataManager.getBucketTable().get(
-        omMetadataManager.getBucketKey(volumeName, bucketName));
-    Assert.assertTrue(bucketInfo.getQuotaInBytes() == -2);
+    OmBucketInfo bucketInfo = omMetadataManager.getBucketTable().get(bucketKey);
+    assertEquals(-2, bucketInfo.getQuotaInBytes());
     
     omVolumeArgs = omMetadataManager.getVolumeTable().get(
         omMetadataManager.getVolumeKey(volumeName));
-    Assert.assertTrue(omVolumeArgs.getQuotaInBytes() == -2);
-    Assert.assertTrue(omVolumeArgs.getQuotaInNamespace() == -2);
+    assertEquals(-2, omVolumeArgs.getQuotaInBytes());
+    assertEquals(-2, omVolumeArgs.getQuotaInNamespace());
 
-    QuotaRepairTask quotaRepairTask = new QuotaRepairTask(omMetadataManager);
-    quotaRepairTask.repair();
+    QuotaRepairTask quotaRepairTask = new QuotaRepairTask(ozoneManager);
+    CompletableFuture<Boolean> repair = quotaRepairTask.repair();
+    Boolean repairStatus = repair.get();
+    assertTrue(repairStatus);
 
+    OMQuotaRepairRequest omQuotaRepairRequest = new OMQuotaRepairRequest(ref.get());
+    OMClientResponse omClientResponse = omQuotaRepairRequest.validateAndUpdateCache(ozoneManager, 1);
+    BatchOperation batchOperation = omMetadataManager.getStore().initBatchOperation();
+    ((OMQuotaRepairResponse)omClientResponse).addToDBBatch(omMetadataManager, batchOperation);
+    omMetadataManager.getStore().commitBatchOperation(batchOperation);
     bucketInfo = omMetadataManager.getBucketTable().get(
-        omMetadataManager.getBucketKey(volumeName, bucketName));
-    Assert.assertTrue(bucketInfo.getQuotaInBytes() == -1);
+        bucketKey);
+    assertEquals(-1, bucketInfo.getQuotaInBytes());
     OmVolumeArgs volArgsVerify = omMetadataManager.getVolumeTable()
         .get(omMetadataManager.getVolumeKey(volumeName));
-    Assert.assertTrue(volArgsVerify.getQuotaInBytes() == -1);
-    Assert.assertTrue(volArgsVerify.getQuotaInNamespace() == -1);
+    assertEquals(-1, volArgsVerify.getQuotaInBytes());
+    assertEquals(-1, volArgsVerify.getQuotaInNamespace());
   }
 
   private void zeroOutBucketUsedBytes(String volumeName, String bucketName,

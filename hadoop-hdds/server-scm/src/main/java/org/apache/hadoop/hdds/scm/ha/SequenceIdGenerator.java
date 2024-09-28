@@ -25,7 +25,6 @@ import org.apache.hadoop.hdds.scm.container.ContainerID;
 import org.apache.hadoop.hdds.scm.container.ContainerInfo;
 import org.apache.hadoop.hdds.scm.metadata.Replicate;
 import org.apache.hadoop.hdds.scm.metadata.SCMMetadataStore;
-import org.apache.hadoop.hdds.security.x509.certificate.CertInfo;
 import org.apache.hadoop.hdds.utils.UniqueId;
 import org.apache.hadoop.hdds.utils.db.Table;
 import org.apache.hadoop.hdds.utils.db.Table.KeyValue;
@@ -69,6 +68,11 @@ public class SequenceIdGenerator {
   public static final String LOCAL_ID = "localId";
   public static final String DEL_TXN_ID = "delTxnId";
   public static final String CONTAINER_ID = "containerId";
+
+  // Certificate ID for all services, including root certificates, whose ID
+  // were using "rootCertificateId" before.
+  public static final String CERTIFICATE_ID = "CertificateId";
+  @Deprecated
   public static final String ROOT_CERTIFICATE_ID = "rootCertificateId";
 
   private static final long INVALID_SEQUENCE_ID = 0;
@@ -132,7 +136,7 @@ public class SequenceIdGenerator {
 
         Preconditions.checkArgument(Long.MAX_VALUE - batch.lastId >= batchSize);
         long nextLastId = batch.lastId +
-            (sequenceIdName.equals(ROOT_CERTIFICATE_ID) ? 1 : batchSize);
+            ((sequenceIdName.equals(CERTIFICATE_ID)) ? 1 : batchSize);
 
         if (stateManager.allocateBatch(sequenceIdName,
             prevLastId, nextLastId)) {
@@ -393,40 +397,47 @@ public class SequenceIdGenerator {
           CONTAINER_ID, sequenceIdTable.get(CONTAINER_ID));
     }
 
-    // upgrade root certificate ID
-    if (sequenceIdTable.get(ROOT_CERTIFICATE_ID) == null) {
-      long largestRootCertId = BigInteger.ONE.longValueExact();
+    upgradeToCertificateSequenceId(scmMetadataStore, false);
+  }
+
+  public static void upgradeToCertificateSequenceId(
+      SCMMetadataStore scmMetadataStore, boolean force) throws IOException {
+    Table<String, Long> sequenceIdTable = scmMetadataStore.getSequenceIdTable();
+
+    // upgrade certificate ID table
+    if (sequenceIdTable.get(CERTIFICATE_ID) == null || force) {
+      // Start from ID 2.
+      // ID 1 - root certificate, ID 2 - first SCM certificate.
+      long largestCertId = BigInteger.ONE.add(BigInteger.ONE).longValueExact();
       try (TableIterator<BigInteger,
           ? extends KeyValue<BigInteger, X509Certificate>> iterator =
                scmMetadataStore.getValidSCMCertsTable().iterator()) {
         while (iterator.hasNext()) {
           X509Certificate cert = iterator.next().getValue();
-          if (HASecurityUtils.isSelfSignedCertificate(cert) &&
-              HASecurityUtils.isCACertificate(cert)) {
-            largestRootCertId =
-                Long.max(cert.getSerialNumber().longValueExact(),
-                    largestRootCertId);
-          }
+          largestCertId = Long.max(cert.getSerialNumber().longValueExact(),
+              largestCertId);
         }
       }
 
       try (TableIterator<BigInteger,
-          ? extends KeyValue<BigInteger, CertInfo>> iterator =
-               scmMetadataStore.getRevokedCertsV2Table().iterator()) {
+          ? extends KeyValue<BigInteger, X509Certificate>> iterator =
+               scmMetadataStore.getValidCertsTable().iterator()) {
         while (iterator.hasNext()) {
-          X509Certificate cert =
-              iterator.next().getValue().getX509Certificate();
-          if (HASecurityUtils.isSelfSignedCertificate(cert) &&
-              HASecurityUtils.isCACertificate(cert)) {
-            largestRootCertId =
-                Long.max(cert.getSerialNumber().longValueExact(),
-                    largestRootCertId);
-          }
+          X509Certificate cert = iterator.next().getValue();
+          largestCertId = Long.max(
+              cert.getSerialNumber().longValueExact(), largestCertId);
         }
       }
-      sequenceIdTable.put(ROOT_CERTIFICATE_ID, largestRootCertId);
-      LOG.info("upgrade {} to {}",
-          ROOT_CERTIFICATE_ID, sequenceIdTable.get(ROOT_CERTIFICATE_ID));
+
+      sequenceIdTable.put(CERTIFICATE_ID, largestCertId);
+      LOG.info("upgrade {} to {}", CERTIFICATE_ID,
+          sequenceIdTable.get(CERTIFICATE_ID));
+    }
+
+    // delete the ROOT_CERTIFICATE_ID record if exists
+    // ROOT_CERTIFICATE_ID is replaced with CERTIFICATE_ID now
+    if (sequenceIdTable.get(ROOT_CERTIFICATE_ID) != null) {
+      sequenceIdTable.delete(ROOT_CERTIFICATE_ID);
     }
   }
 }

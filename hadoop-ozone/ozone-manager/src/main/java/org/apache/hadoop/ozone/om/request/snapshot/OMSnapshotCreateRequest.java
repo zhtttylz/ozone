@@ -21,6 +21,8 @@ package org.apache.hadoop.ozone.om.request.snapshot;
 import org.apache.hadoop.hdds.client.DefaultReplicationConfig;
 import org.apache.hadoop.hdds.client.ReplicationConfig;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
+import org.apache.hadoop.hdds.utils.TransactionInfo;
+import org.apache.ratis.server.protocol.TermIndex;
 import org.apache.hadoop.hdds.utils.db.RDBStore;
 import org.apache.hadoop.hdds.utils.db.cache.CacheKey;
 import org.apache.hadoop.hdds.utils.db.cache.CacheValue;
@@ -36,7 +38,6 @@ import org.apache.hadoop.ozone.om.exceptions.OMException;
 import org.apache.hadoop.ozone.om.helpers.OmBucketInfo;
 import org.apache.hadoop.ozone.om.helpers.QuotaUtil;
 import org.apache.hadoop.ozone.om.helpers.SnapshotInfo;
-import org.apache.hadoop.ozone.om.ratis.utils.OzoneManagerDoubleBufferHelper;
 import org.apache.hadoop.ozone.om.request.OMClientRequest;
 import org.apache.hadoop.ozone.om.request.util.OmResponseUtil;
 import org.apache.hadoop.ozone.om.response.OMClientResponse;
@@ -56,6 +57,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.file.InvalidPathException;
 import java.util.UUID;
 
 import static org.apache.hadoop.hdds.HddsUtils.fromProtobuf;
@@ -123,15 +125,13 @@ public class OMSnapshotCreateRequest extends OMClientRequest {
   }
   
   @Override
-  public OMClientResponse validateAndUpdateCache(OzoneManager ozoneManager,
-      long transactionLogIndex,
-      OzoneManagerDoubleBufferHelper ozoneManagerDoubleBufferHelper) {
+  public OMClientResponse validateAndUpdateCache(OzoneManager ozoneManager, TermIndex termIndex) {
 
     OMMetrics omMetrics = ozoneManager.getMetrics();
     omMetrics.incNumSnapshotCreates();
 
     boolean acquiredBucketLock = false, acquiredSnapshotLock = false;
-    IOException exception = null;
+    Exception exception = null;
     OmMetadataManagerImpl omMetadataManager = (OmMetadataManagerImpl)
         ozoneManager.getMetadataManager();
 
@@ -145,13 +145,15 @@ public class OMSnapshotCreateRequest extends OMClientRequest {
     try {
       // Lock bucket so it doesn't
       //  get deleted while creating snapshot
-      acquiredBucketLock =
+      mergeOmLockDetails(
           omMetadataManager.getLock().acquireReadLock(BUCKET_LOCK,
-              volumeName, bucketName);
+              volumeName, bucketName));
+      acquiredBucketLock = getOmLockDetails().isLockAcquired();
 
-      acquiredSnapshotLock =
+      mergeOmLockDetails(
           omMetadataManager.getLock().acquireWriteLock(SNAPSHOT_LOCK,
-              volumeName, bucketName, snapshotName);
+              volumeName, bucketName, snapshotName));
+      acquiredSnapshotLock = getOmLockDetails().isLockAcquired();
 
       // Check if snapshot already exists
       if (omMetadataManager.getSnapshotInfoTable().isExist(key)) {
@@ -165,7 +167,7 @@ public class OMSnapshotCreateRequest extends OMClientRequest {
           ((RDBStore) omMetadataManager.getStore()).getDb()
               .getLatestSequenceNumber();
       snapshotInfo.setDbTxSequenceNumber(dbLatestSequenceNumber);
-
+      snapshotInfo.setLastTransactionInfo(TransactionInfo.valueOf(termIndex).toByteString());
       // Snapshot referenced size should be bucket's used bytes
       OmBucketInfo omBucketInfo =
           getBucketInfo(omMetadataManager, volumeName, bucketName);
@@ -182,33 +184,35 @@ public class OMSnapshotCreateRequest extends OMClientRequest {
       //  pre-replicated key size counter in OmBucketInfo.
       snapshotInfo.setReferencedSize(estimateBucketDataSize(omBucketInfo));
 
-      addSnapshotInfoToSnapshotChainAndCache(omMetadataManager,
-          transactionLogIndex);
+      addSnapshotInfoToSnapshotChainAndCache(omMetadataManager, termIndex.getIndex());
 
       omResponse.setCreateSnapshotResponse(
           CreateSnapshotResponse.newBuilder()
           .setSnapshotInfo(snapshotInfo.getProtobuf()));
       omClientResponse = new OMSnapshotCreateResponse(
           omResponse.build(), snapshotInfo);
-    } catch (IOException ex) {
+    } catch (IOException | InvalidPathException ex) {
       exception = ex;
       omClientResponse = new OMSnapshotCreateResponse(
           createErrorOMResponse(omResponse, exception));
     } finally {
-      addResponseToDoubleBuffer(transactionLogIndex, omClientResponse,
-          ozoneManagerDoubleBufferHelper);
       if (acquiredSnapshotLock) {
-        omMetadataManager.getLock().releaseWriteLock(SNAPSHOT_LOCK, volumeName,
-            bucketName, snapshotName);
+        mergeOmLockDetails(
+            omMetadataManager.getLock().releaseWriteLock(SNAPSHOT_LOCK,
+                volumeName, bucketName, snapshotName));
       }
       if (acquiredBucketLock) {
-        omMetadataManager.getLock().releaseReadLock(BUCKET_LOCK, volumeName,
-            bucketName);
+        mergeOmLockDetails(
+            omMetadataManager.getLock().releaseReadLock(BUCKET_LOCK, volumeName,
+                bucketName));
+      }
+      if (omClientResponse != null) {
+        omClientResponse.setOmLockDetails(getOmLockDetails());
       }
     }
 
     // Performing audit logging outside the lock.
-    auditLog(auditLogger, buildAuditMessage(OMAction.CREATE_SNAPSHOT,
+    markForAudit(auditLogger, buildAuditMessage(OMAction.CREATE_SNAPSHOT,
         snapshotInfo.toAuditMap(), exception, userInfo));
 
     if (exception == null) {
@@ -242,7 +246,9 @@ public class OMSnapshotCreateRequest extends OMClientRequest {
    * it was removed at T-5.
    */
   private void addSnapshotInfoToSnapshotChainAndCache(
-      OmMetadataManagerImpl omMetadataManager, long transactionLogIndex)  {
+      OmMetadataManagerImpl omMetadataManager,
+      long transactionLogIndex
+  ) throws IOException {
     // It is synchronized on SnapshotChainManager object so that this block is
     // synchronized with OMSnapshotPurgeResponse#cleanupSnapshotChain and only
     // one of these two operation gets executed at a time otherwise we could be
@@ -251,21 +257,20 @@ public class OMSnapshotCreateRequest extends OMClientRequest {
       SnapshotChainManager snapshotChainManager =
           omMetadataManager.getSnapshotChainManager();
 
+      UUID latestPathSnapshot =
+          snapshotChainManager.getLatestPathSnapshotId(snapshotPath);
+      UUID latestGlobalSnapshot =
+          snapshotChainManager.getLatestGlobalSnapshotId();
+
+      snapshotInfo.setPathPreviousSnapshotId(latestPathSnapshot);
+      snapshotInfo.setGlobalPreviousSnapshotId(latestGlobalSnapshot);
+
       try {
-        UUID latestPathSnapshot =
-            snapshotChainManager.getLatestPathSnapshotId(snapshotPath);
-        UUID latestGlobalSnapshot =
-            snapshotChainManager.getLatestGlobalSnapshotId();
-
-        snapshotInfo.setPathPreviousSnapshotId(latestPathSnapshot);
-        snapshotInfo.setGlobalPreviousSnapshotId(latestGlobalSnapshot);
-
         snapshotChainManager.addSnapshot(snapshotInfo);
-
         omMetadataManager.getSnapshotInfoTable()
             .addCacheEntry(new CacheKey<>(snapshotInfo.getTableKey()),
                 CacheValue.get(transactionLogIndex, snapshotInfo));
-      } catch (IllegalStateException illegalStateException) {
+      } catch (IOException exception) {
         // Remove snapshot from the SnapshotChainManager in case of any failure.
         // It is possible that createSnapshot request fails after snapshot gets
         // added to snapshot chain manager because couldn't add it to cache/DB.
@@ -278,7 +283,7 @@ public class OMSnapshotCreateRequest extends OMClientRequest {
         // added to the SnapshotInfo table.
         removeSnapshotInfoFromSnapshotChainManager(snapshotChainManager,
             snapshotInfo);
-        throw illegalStateException;
+        throw new IOException(exception.getMessage(), exception);
       }
     }
   }
@@ -298,7 +303,7 @@ public class OMSnapshotCreateRequest extends OMClientRequest {
   ) {
     try {
       snapshotChainManager.deleteSnapshot(info);
-    } catch (IllegalStateException exception) {
+    } catch (IOException exception) {
       LOG.error("Failed to remove snapshot: {} from SnapshotChainManager.",
           info, exception);
     }

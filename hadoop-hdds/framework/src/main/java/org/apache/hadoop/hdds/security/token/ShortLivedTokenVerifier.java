@@ -23,11 +23,8 @@ import org.apache.hadoop.hdds.security.SecurityConfig;
 import org.apache.hadoop.hdds.security.exception.SCMSecurityException;
 import org.apache.hadoop.hdds.security.symmetric.ManagedSecretKey;
 import org.apache.hadoop.hdds.security.symmetric.SecretKeyVerifierClient;
-import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.token.Token;
 
-import java.io.ByteArrayInputStream;
-import java.io.DataInputStream;
 import java.io.IOException;
 import java.time.Instant;
 import java.util.Objects;
@@ -66,7 +63,7 @@ public abstract class
   }
 
   @Override
-  public void verify(String user, Token<?> token,
+  public void verify(Token<?> token,
       ContainerCommandRequestProtoOrBuilder cmd) throws SCMSecurityException {
 
     if (!isTokenRequired(cmd.getCmdType())) {
@@ -75,18 +72,16 @@ public abstract class
 
     T tokenId = createTokenIdentifier();
     try {
-      tokenId.readFields(new DataInputStream(new ByteArrayInputStream(
-          token.getIdentifier())));
+      tokenId.readFromByteArray(token.getIdentifier());
     } catch (IOException ex) {
       throw new BlockTokenException("Failed to decode token : " + token);
     }
 
     verifyTokenPassword(tokenId, token.getPassword());
 
-    UserGroupInformation tokenUser = tokenId.getUser();
     // check expiration
     if (tokenId.isExpired(Instant.now())) {
-      throw new BlockTokenException("Expired token for user: " + tokenUser);
+      throw new BlockTokenException("Expired token for user: " + tokenId.getUser());
     }
 
     // check token service (blockID or containerID)
@@ -94,7 +89,7 @@ public abstract class
     if (!Objects.equals(service, tokenId.getService())) {
       throw new BlockTokenException("ID mismatch. Token for ID: " +
           tokenId.getService() + " can't be used to access: " + service +
-          " by user: " + tokenUser);
+          " by user: " + tokenId.getUser());
     }
 
     verify(tokenId, cmd);

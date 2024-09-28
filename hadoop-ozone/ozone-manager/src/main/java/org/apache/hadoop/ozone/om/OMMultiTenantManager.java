@@ -20,8 +20,8 @@ import java.io.File;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Optional;
 
-import com.google.common.base.Optional;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.hdds.annotation.InterfaceAudience;
 import org.apache.hadoop.hdds.annotation.InterfaceStability;
@@ -129,7 +129,7 @@ public interface OMMultiTenantManager {
       boolean delegated);
 
   /**
-   * List all the user & accessIDs of all users that belong to this Tenant.
+   * List all the user and accessIDs of all users that belong to this Tenant.
    * Note this read is unprotected. See OzoneManager#listUserInTenant
    * @param tenantID
    * @return List of users

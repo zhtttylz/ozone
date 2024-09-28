@@ -28,6 +28,10 @@ import org.apache.hadoop.fs.FileChecksum;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.SafeModeAction;
 import org.apache.hadoop.hdfs.protocol.SnapshotDiffReport;
+import org.apache.hadoop.ozone.OzoneFsServerDefaults;
+import org.apache.hadoop.ozone.om.helpers.LeaseKeyInfo;
+import org.apache.hadoop.ozone.om.helpers.OmKeyArgs;
+import org.apache.hadoop.ozone.om.helpers.OmKeyLocationInfo;
 import org.apache.hadoop.ozone.security.OzoneTokenIdentifier;
 import org.apache.hadoop.security.token.Token;
 
@@ -71,6 +75,8 @@ public interface OzoneClientAdapter {
 
   Token<OzoneTokenIdentifier> getDelegationToken(String renewer)
       throws IOException;
+  
+  OzoneFsServerDefaults getServerDefaults() throws IOException;
 
   KeyProvider getKeyProvider() throws IOException;
 
@@ -89,13 +95,19 @@ public interface OzoneClientAdapter {
 
   String createSnapshot(String pathStr, String snapshotName) throws IOException;
 
+  void renameSnapshot(String pathStr, String snapshotOldName, String snapshotNewName) throws IOException;
+
   void deleteSnapshot(String pathStr, String snapshotName) throws IOException;
 
   SnapshotDiffReport getSnapshotDiffReport(Path snapshotDir,
       String fromSnapshot, String toSnapshot)
       throws IOException, InterruptedException;
 
-  boolean recoverLease(String pathStr) throws IOException;
+  LeaseKeyInfo recoverFilePrepare(String pathStr, boolean force) throws IOException;
+
+  void recoverFile(OmKeyArgs keyArgs) throws IOException;
+
+  long finalizeBlock(OmKeyLocationInfo block) throws IOException;
 
   void setTimes(String key, long mtime, long atime) throws IOException;
 

@@ -17,6 +17,12 @@
  */
 package org.apache.hadoop.ozone.recon.api.filters;
 
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 import com.google.common.collect.Sets;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.recon.ReconConfigKeys;
@@ -27,12 +33,9 @@ import org.apache.hadoop.ozone.recon.api.MetricsProxyEndpoint;
 import org.apache.hadoop.ozone.recon.api.NodeEndpoint;
 import org.apache.hadoop.ozone.recon.api.PipelineEndpoint;
 import org.apache.hadoop.ozone.recon.api.TaskStatusService;
-import org.apache.hadoop.ozone.recon.api.TriggerDBSyncEndpoint;
 import org.apache.hadoop.ozone.recon.api.UtilizationEndpoint;
 import org.apache.hadoop.security.UserGroupInformation;
-import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
-import org.mockito.Mockito;
 import org.reflections.Reflections;
 import org.reflections.scanners.SubTypesScanner;
 import org.reflections.scanners.TypeAnnotationsScanner;
@@ -64,10 +67,16 @@ public class TestAdminFilter {
     Set<Class<?>> allEndpoints =
         reflections.getTypesAnnotatedWith(Path.class);
 
-    Assertions.assertFalse(allEndpoints.isEmpty());
+    assertThat(allEndpoints).isNotEmpty();
 
-    // If an endpoint is added, it must be explicitly added to this set or be
-    // marked with @AdminOnly for this test to pass.
+    // If an endpoint is added, it must either require admin privileges by being
+    // marked with the `@AdminOnly` annotation, or be added to this set to exclude it.
+    // - Any endpoint that displays information related to the filesystem namespace
+    //   (including aggregate counts), user information, or allows modification to the
+    //   cluster's state should be marked as `@AdminOnly`.
+    // - Read-only endpoints that only return information about node status or
+    //   cluster state do not require the `@AdminOnly` annotation and can be excluded
+    //   from admin requirements by adding them to this set.
     Set<Class<?>> nonAdminEndpoints = new HashSet<>();
     nonAdminEndpoints.add(UtilizationEndpoint.class);
     nonAdminEndpoints.add(ClusterStateEndpoint.class);
@@ -75,21 +84,20 @@ public class TestAdminFilter {
     nonAdminEndpoints.add(NodeEndpoint.class);
     nonAdminEndpoints.add(PipelineEndpoint.class);
     nonAdminEndpoints.add(TaskStatusService.class);
-    nonAdminEndpoints.add(TriggerDBSyncEndpoint.class);
 
-    Assertions.assertTrue(allEndpoints.containsAll(nonAdminEndpoints));
+    assertThat(allEndpoints).containsAll(nonAdminEndpoints);
 
     Set<Class<?>> adminEndpoints = Sets.difference(allEndpoints,
         nonAdminEndpoints);
 
     for (Class<?> endpoint: nonAdminEndpoints) {
-      Assertions.assertFalse(endpoint.isAnnotationPresent(AdminOnly.class),
+      assertFalse(endpoint.isAnnotationPresent(AdminOnly.class),
           String.format("Endpoint class %s has been declared as non admin " +
               "in this test, but is marked as @AdminOnly.", endpoint));
     }
 
     for (Class<?> endpoint: adminEndpoints) {
-      Assertions.assertTrue(endpoint.isAnnotationPresent(AdminOnly.class),
+      assertTrue(endpoint.isAnnotationPresent(AdminOnly.class),
           String.format("Endpoint class %s must be marked as @AdminOnly " +
               "or explicitly declared as non admin in this test.", endpoint));
     }
@@ -164,21 +172,21 @@ public class TestAdminFilter {
 
   private void testAdminFilterWithPrincipal(OzoneConfiguration conf,
       String principalToUse, boolean shouldPass) throws Exception {
-    Principal mockPrincipal = Mockito.mock(Principal.class);
-    Mockito.when(mockPrincipal.getName()).thenReturn(principalToUse);
-    HttpServletRequest mockRequest = Mockito.mock(HttpServletRequest.class);
-    Mockito.when(mockRequest.getUserPrincipal()).thenReturn(mockPrincipal);
+    Principal mockPrincipal = mock(Principal.class);
+    when(mockPrincipal.getName()).thenReturn(principalToUse);
+    HttpServletRequest mockRequest = mock(HttpServletRequest.class);
+    when(mockRequest.getUserPrincipal()).thenReturn(mockPrincipal);
 
-    HttpServletResponse mockResponse = Mockito.mock(HttpServletResponse.class);
-    FilterChain mockFilterChain = Mockito.mock(FilterChain.class);
+    HttpServletResponse mockResponse = mock(HttpServletResponse.class);
+    FilterChain mockFilterChain = mock(FilterChain.class);
 
     new ReconAdminFilter(conf).doFilter(mockRequest, mockResponse,
         mockFilterChain);
 
     if (shouldPass) {
-      Mockito.verify(mockFilterChain).doFilter(mockRequest, mockResponse);
+      verify(mockFilterChain).doFilter(mockRequest, mockResponse);
     } else {
-      Mockito.verify(mockResponse).setStatus(HttpServletResponse.SC_FORBIDDEN);
+      verify(mockResponse).setStatus(HttpServletResponse.SC_FORBIDDEN);
     }
   }
 }

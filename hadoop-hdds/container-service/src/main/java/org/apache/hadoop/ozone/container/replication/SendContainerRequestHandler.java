@@ -17,16 +17,20 @@
  */
 package org.apache.hadoop.ozone.container.replication;
 
+import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.SendContainerRequest;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.SendContainerResponse;
+import org.apache.hadoop.hdds.scm.container.common.helpers.StorageContainerException;
 import org.apache.hadoop.hdds.utils.IOUtils;
 import org.apache.hadoop.ozone.container.common.helpers.ContainerUtils;
 import org.apache.hadoop.ozone.container.common.volume.HddsVolume;
+import org.apache.ratis.grpc.util.ZeroCopyMessageMarshaller;
 import org.apache.ratis.thirdparty.io.grpc.stub.StreamObserver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -51,12 +55,15 @@ class SendContainerRequestHandler
   private HddsVolume volume;
   private Path path;
   private CopyContainerCompression compression;
+  private final ZeroCopyMessageMarshaller<SendContainerRequest> marshaller;
 
   SendContainerRequestHandler(
       ContainerImporter importer,
-      StreamObserver<SendContainerResponse> responseObserver) {
+      StreamObserver<SendContainerResponse> responseObserver,
+      ZeroCopyMessageMarshaller<SendContainerRequest> marshaller) {
     this.importer = importer;
     this.responseObserver = responseObserver;
+    this.marshaller = marshaller;
   }
 
   @Override
@@ -67,6 +74,15 @@ class SendContainerRequestHandler
           req.getContainerID(), req.getOffset(), length);
 
       assertSame(nextOffset, req.getOffset(), "offset");
+
+      // check and avoid download of container file if target already have
+      // container data and import in progress
+      if (!importer.isAllowedContainerImport(req.getContainerID())) {
+        containerId = req.getContainerID();
+        throw new StorageContainerException("Container exists or " +
+            "import in progress with container Id " + req.getContainerID(),
+            ContainerProtos.Result.CONTAINER_EXISTS);
+      }
 
       if (containerId == -1) {
         containerId = req.getContainerID();
@@ -87,6 +103,13 @@ class SendContainerRequestHandler
       nextOffset += length;
     } catch (Throwable t) {
       onError(t);
+    } finally {
+      if (marshaller != null) {
+        InputStream popStream = marshaller.popStream(req);
+        if (popStream != null) {
+          IOUtils.cleanupWithLogger(LOG, popStream);
+        }
+      }
     }
   }
 

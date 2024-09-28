@@ -20,12 +20,13 @@ package org.apache.hadoop.ozone;
 
 import com.google.protobuf.BlockingService;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.CommonConfigurationKeys;
 import org.apache.hadoop.hdds.HddsUtils;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.conf.ReconfigurationHandler;
 import org.apache.hadoop.hdds.protocol.DatanodeDetails;
 import org.apache.hadoop.hdds.protocol.proto.ReconfigureProtocolProtos;
-import org.apache.hadoop.hdds.protocolPB.ReconfigureProtocolPB;
+import org.apache.hadoop.hdds.protocolPB.ReconfigureProtocolDatanodePB;
 import org.apache.hadoop.hdds.protocolPB.ReconfigureProtocolServerSideTranslatorPB;
 import org.apache.hadoop.hdds.server.ServerUtils;
 import org.apache.hadoop.hdds.server.ServiceRuntimeInfoImpl;
@@ -41,6 +42,8 @@ import java.net.InetSocketAddress;
 import static org.apache.hadoop.hdds.HddsConfigKeys.HDDS_DATANODE_CLIENT_ADDRESS_KEY;
 import static org.apache.hadoop.hdds.HddsConfigKeys.HDDS_DATANODE_HANDLER_COUNT_DEFAULT;
 import static org.apache.hadoop.hdds.HddsConfigKeys.HDDS_DATANODE_HANDLER_COUNT_KEY;
+import static org.apache.hadoop.hdds.HddsConfigKeys.HDDS_DATANODE_READ_THREADPOOL_KEY;
+import static org.apache.hadoop.hdds.HddsConfigKeys.HDDS_DATANODE_READ_THREADPOOL_DEFAULT;
 import static org.apache.hadoop.hdds.HddsUtils.preserveThreadName;
 import static org.apache.hadoop.hdds.protocol.DatanodeDetails.Port.Name.CLIENT_RPC;
 
@@ -66,6 +69,10 @@ public class HddsDatanodeClientProtocolServer extends ServiceRuntimeInfoImpl {
         HDDS_DATANODE_CLIENT_ADDRESS_KEY,
         HddsUtils.getDatanodeRpcAddress(conf), rpcServer);
     datanodeDetails.setPort(CLIENT_RPC, clientRpcAddress.getPort());
+    if (conf.getBoolean(CommonConfigurationKeys.HADOOP_SECURITY_AUTHORIZATION,
+        false)) {
+      rpcServer.refreshServiceAcl(conf, HddsPolicyProvider.getInstance());
+    }
   }
 
   public void start() {
@@ -97,10 +104,12 @@ public class HddsDatanodeClientProtocolServer extends ServiceRuntimeInfoImpl {
     InetSocketAddress rpcAddress = HddsUtils.getDatanodeRpcAddress(conf);
     // Add reconfigureProtocolService.
     RPC.setProtocolEngine(
-        configuration, ReconfigureProtocolPB.class, ProtobufRpcEngine.class);
+        configuration, ReconfigureProtocolDatanodePB.class, ProtobufRpcEngine.class);
 
     final int handlerCount = conf.getInt(HDDS_DATANODE_HANDLER_COUNT_KEY,
         HDDS_DATANODE_HANDLER_COUNT_DEFAULT);
+    final int readThreads = conf.getInt(HDDS_DATANODE_READ_THREADPOOL_KEY,
+        HDDS_DATANODE_READ_THREADPOOL_DEFAULT);
     ReconfigureProtocolServerSideTranslatorPB reconfigureServerProtocol
         = new ReconfigureProtocolServerSideTranslatorPB(reconfigurationHandler);
     BlockingService reconfigureService = ReconfigureProtocolProtos
@@ -108,7 +117,7 @@ public class HddsDatanodeClientProtocolServer extends ServiceRuntimeInfoImpl {
             reconfigureServerProtocol);
 
     return preserveThreadName(() -> startRpcServer(configuration, rpcAddress,
-        ReconfigureProtocolPB.class, reconfigureService, handlerCount));
+        ReconfigureProtocolDatanodePB.class, reconfigureService, handlerCount, readThreads));
   }
 
   /**
@@ -125,7 +134,7 @@ public class HddsDatanodeClientProtocolServer extends ServiceRuntimeInfoImpl {
   private RPC.Server startRpcServer(
       Configuration configuration, InetSocketAddress addr,
       Class<?> protocol, BlockingService instance,
-      int handlerCount)
+      int handlerCount, int readThreads)
       throws IOException {
     return new RPC.Builder(configuration)
         .setProtocol(protocol)
@@ -133,6 +142,7 @@ public class HddsDatanodeClientProtocolServer extends ServiceRuntimeInfoImpl {
         .setBindAddress(addr.getHostString())
         .setPort(addr.getPort())
         .setNumHandlers(handlerCount)
+        .setNumReaders(readThreads)
         .setVerbose(false)
         .setSecretManager(null)
         .build();

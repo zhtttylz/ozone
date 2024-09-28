@@ -39,6 +39,9 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 
+import static org.apache.hadoop.ozone.recon.ReconConstants.DISK_USAGE_TOP_RECORDS_LIMIT;
+import static org.apache.hadoop.ozone.recon.ReconUtils.sortDiskUsageDescendingWithLimit;
+
 /**
  * Class for handling root entity type.
  */
@@ -55,8 +58,9 @@ public class RootEntityHandler extends EntityHandler {
   public NamespaceSummaryResponse getSummaryResponse()
           throws IOException {
 
-    List<OmVolumeArgs> volumes = listVolumes();
-    List<OmBucketInfo> allBuckets = listBucketsUnderVolume(null);
+    List<OmVolumeArgs> volumes = getOmMetadataManager().listVolumes();
+    List<OmBucketInfo> allBuckets = getOmMetadataManager().
+        listBucketsUnderVolume(null);
     int totalNumDir = 0;
     long totalNumKey = 0L;
     for (OmBucketInfo bucket : allBuckets) {
@@ -87,12 +91,12 @@ public class RootEntityHandler extends EntityHandler {
 
   @Override
   public DUResponse getDuResponse(
-          boolean listFile, boolean withReplica)
+      boolean listFile, boolean withReplica, boolean sortSubPaths)
           throws IOException {
     DUResponse duResponse = new DUResponse();
     duResponse.setPath(getNormalizedPath());
     ReconOMMetadataManager omMetadataManager = getOmMetadataManager();
-    List<OmVolumeArgs> volumes = listVolumes();
+    List<OmVolumeArgs> volumes = getOmMetadataManager().listVolumes();
     duResponse.setCount(volumes.size());
 
     List<DUResponse.DiskUsage> volumeDuData = new ArrayList<>();
@@ -107,7 +111,8 @@ public class RootEntityHandler extends EntityHandler {
       BucketHandler bucketHandler;
       long volumeDU = 0;
       // iterate all buckets per volume to get total data size
-      for (OmBucketInfo bucket: listBucketsUnderVolume(volumeName)) {
+      for (OmBucketInfo bucket: getOmMetadataManager().
+          listBucketsUnderVolume(volumeName)) {
         long bucketObjectID = bucket.getObjectID();
         dataSize += getTotalSize(bucketObjectID);
         // count replicas
@@ -135,6 +140,13 @@ public class RootEntityHandler extends EntityHandler {
       duResponse.setSizeWithReplica(totalDataSizeWithReplica);
     }
     duResponse.setSize(totalDataSize);
+
+    if (sortSubPaths) {
+      // Parallel sort volumeDuData in descending order of size and returns the top N elements.
+      volumeDuData = sortDiskUsageDescendingWithLimit(volumeDuData,
+          DISK_USAGE_TOP_RECORDS_LIMIT);
+    }
+
     duResponse.setDuData(volumeDuData);
 
     return duResponse;
@@ -146,7 +158,8 @@ public class RootEntityHandler extends EntityHandler {
     QuotaUsageResponse quotaUsageResponse = new QuotaUsageResponse();
     SCMNodeStat stats = getReconSCM().getScmNodeManager().getStats();
     long quotaInBytes = stats.getCapacity().get();
-    long quotaUsedInBytes = getDuResponse(true, true).getSizeWithReplica();
+    long quotaUsedInBytes =
+        getDuResponse(true, true, false).getSizeWithReplica();
     quotaUsageResponse.setQuota(quotaInBytes);
     quotaUsageResponse.setQuotaUsed(quotaUsedInBytes);
     return quotaUsageResponse;
@@ -157,7 +170,8 @@ public class RootEntityHandler extends EntityHandler {
           throws IOException {
     FileSizeDistributionResponse distResponse =
         new FileSizeDistributionResponse();
-    List<OmBucketInfo> allBuckets = listBucketsUnderVolume(null);
+    List<OmBucketInfo> allBuckets = getOmMetadataManager()
+        .listBucketsUnderVolume(null);
     int[] fileSizeDist = new int[ReconConstants.NUM_OF_FILE_SIZE_BINS];
 
     // accumulate file size distribution arrays from all buckets

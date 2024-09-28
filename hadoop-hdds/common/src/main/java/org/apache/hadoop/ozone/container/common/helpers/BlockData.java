@@ -23,6 +23,7 @@ import com.google.common.base.Preconditions;
 import org.apache.hadoop.hdds.utils.db.Codec;
 import org.apache.hadoop.hdds.utils.db.DelegatedCodec;
 import org.apache.hadoop.hdds.utils.db.Proto3Codec;
+import org.apache.hadoop.ozone.OzoneConsts;
 
 import java.io.IOException;
 import java.util.Collections;
@@ -36,7 +37,7 @@ import java.util.ArrayList;
  */
 public class BlockData {
   private static final Codec<BlockData> CODEC = new DelegatedCodec<>(
-      Proto3Codec.get(ContainerProtos.BlockData.class),
+      Proto3Codec.get(ContainerProtos.BlockData.getDefaultInstance()),
       BlockData::getFromProtoBuf,
       BlockData::getProtoBufMessage);
 
@@ -144,22 +145,6 @@ public class BlockData {
 
   public synchronized Map<String, String> getMetadata() {
     return Collections.unmodifiableMap(this.metadata);
-  }
-
-  /**
-   * Returns value of a key.
-   */
-  public synchronized String getValue(String key) {
-    return metadata.get(key);
-  }
-
-  /**
-   * Deletes a metadata entry from the map.
-   *
-   * @param key - Key
-   */
-  public synchronized void deleteKey(String key) {
-    metadata.remove(key);
   }
 
   @SuppressWarnings("unchecked")
@@ -295,5 +280,15 @@ public class BlockData {
     blockID.appendTo(sb);
     sb.append(", size=").append(size);
     sb.append("]");
+  }
+
+  public long getBlockGroupLength() {
+    String lenStr = getMetadata()
+        .get(OzoneConsts.BLOCK_GROUP_LEN_KEY_IN_PUT_BLOCK);
+    // If we don't have the length, then it indicates a problem with the stripe.
+    // All replica should carry the length, so if it is not there, we return 0,
+    // which will cause us to set the length of the block to zero and not
+    // attempt to reconstruct it.
+    return (lenStr == null) ? 0 : Long.parseLong(lenStr);
   }
 }

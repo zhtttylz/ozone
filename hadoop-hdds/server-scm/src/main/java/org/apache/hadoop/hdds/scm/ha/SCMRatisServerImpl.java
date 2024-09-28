@@ -56,6 +56,7 @@ import org.apache.ratis.protocol.SnapshotManagementRequest;
 import org.apache.ratis.protocol.exceptions.NotLeaderException;
 import org.apache.ratis.protocol.SetConfigurationRequest;
 import org.apache.ratis.server.RaftServer;
+import org.apache.ratis.server.storage.RaftStorage;
 import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -112,6 +113,7 @@ public class SCMRatisServerImpl implements SCMRatisServer {
 
     this.server = newRaftServer(scm.getScmId(), conf)
         .setStateMachineRegistry((gId) -> new SCMStateMachine(scm, buffer))
+        .setOption(RaftStorage.StartupOption.RECOVER)
         .setGroup(RaftGroup.valueOf(groupId))
         .setParameters(parameters).build();
 
@@ -129,6 +131,7 @@ public class SCMRatisServerImpl implements SCMRatisServer {
     try {
       server = newRaftServer(scmId, conf).setGroup(group)
               .setStateMachineRegistry((groupId -> new SCMStateMachine()))
+              .setOption(RaftStorage.StartupOption.RECOVER)
               .build();
       server.start();
       waitForLeaderToBeReady(server, conf, group);
@@ -227,9 +230,7 @@ public class SCMRatisServerImpl implements SCMRatisServer {
     final RaftClientReply raftClientReply =
         server.submitClientRequestAsync(raftClientRequest)
             .get(requestTimeout, TimeUnit.MILLISECONDS);
-    if (LOG.isDebugEnabled()) {
-      LOG.info("request {} Reply {}", raftClientRequest, raftClientReply);
-    }
+    LOG.debug("request {} Reply {}", raftClientRequest, raftClientReply);
     return SCMRatisResponse.decode(raftClientReply);
   }
 
@@ -332,8 +333,9 @@ public class SCMRatisServerImpl implements SCMRatisServer {
       }
       return raftClientReply.isSuccess();
     } catch (IOException e) {
-      LOG.error("Failed to update Ratis configuration and add new peer. " +
-          "Cannot add new SCM: {}.", scm.getScmId(), e);
+      LOG.warn("Failed to update Ratis configuration and add new peer. " +
+          "Cannot add new SCM: {}. {}", scm.getScmId(), e.getMessage());
+      LOG.debug("addSCM call failed due to: ", e);
       throw e;
     }
   }

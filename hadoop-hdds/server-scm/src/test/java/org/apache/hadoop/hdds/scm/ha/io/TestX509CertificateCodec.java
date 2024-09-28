@@ -19,19 +19,29 @@ package org.apache.hadoop.hdds.scm.ha.io;
 
 import com.google.protobuf.ByteString;
 import com.google.protobuf.InvalidProtocolBufferException;
+import com.google.protobuf.Proto2Utils;
+import org.apache.hadoop.hdds.conf.OzoneConfiguration;
+import org.apache.hadoop.hdds.security.SecurityConfig;
 import org.apache.hadoop.security.ssl.KeyStoreTestUtil;
-import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import java.security.KeyPair;
 import java.security.cert.X509Certificate;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * Class to test X509CertificateCodec serialize and deserialize.
  */
 public class TestX509CertificateCodec {
+
+  @BeforeAll
+  public static void initSecurityProvider() {
+    SecurityConfig.initSecurityProvider(new OzoneConfiguration());
+  }
 
   @Test
   public void codec() throws Exception {
@@ -46,7 +56,7 @@ public class TestX509CertificateCodec {
     X509Certificate actual = (X509Certificate)
         x509CertificateCodec.deserialize(X509Certificate.class, byteString);
 
-    Assertions.assertEquals(x509Certificate, actual);
+    assertEquals(x509Certificate, actual);
 
   }
 
@@ -54,9 +64,9 @@ public class TestX509CertificateCodec {
   public void testCodecError() {
 
     X509CertificateCodec x509CertificateCodec = new X509CertificateCodec();
-    ByteString byteString = ByteString.copyFrom("dummy".getBytes(UTF_8));
+    final ByteString byteString = Proto2Utils.unsafeByteString("dummy".getBytes(UTF_8));
 
-    Assertions.assertThrows(InvalidProtocolBufferException.class, () ->
+    assertThrows(InvalidProtocolBufferException.class, () ->
         x509CertificateCodec.deserialize(X509Certificate.class, byteString));
   }
 }

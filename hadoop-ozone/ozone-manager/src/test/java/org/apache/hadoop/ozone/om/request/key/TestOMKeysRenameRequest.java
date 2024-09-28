@@ -18,7 +18,14 @@
 
 package org.apache.hadoop.ozone.om.request.key;
 
-import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
+import static org.apache.hadoop.hdds.protocol.proto.HddsProtos.ReplicationFactor.THREE;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import org.apache.hadoop.hdds.client.RatisReplicationConfig;
 import org.apache.hadoop.ozone.om.helpers.OmKeyInfo;
 import org.apache.hadoop.ozone.om.request.OMRequestTestUtils;
 import org.apache.hadoop.ozone.om.response.OMClientResponse;
@@ -27,8 +34,7 @@ import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos.OMReque
 import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos.RenameKeysArgs;
 import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos.RenameKeysMap;
 import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos.RenameKeysRequest;
-import org.junit.Assert;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -51,11 +57,10 @@ public class TestOMKeysRenameRequest extends TestOMKeyRequest {
         new OMKeysRenameRequest(modifiedOmRequest, getBucketLayout());
 
     OMClientResponse omKeysRenameResponse =
-        omKeysRenameRequest.validateAndUpdateCache(ozoneManager, 100L,
-            ozoneManagerDoubleBufferHelper);
+        omKeysRenameRequest.validateAndUpdateCache(ozoneManager, 100L);
 
-    Assert.assertTrue(omKeysRenameResponse.getOMResponse().getSuccess());
-    Assert.assertEquals(OzoneManagerProtocolProtos.Status.OK,
+    assertTrue(omKeysRenameResponse.getOMResponse().getSuccess());
+    assertEquals(OzoneManagerProtocolProtos.Status.OK,
         omKeysRenameResponse.getOMResponse().getStatus());
 
     for (int i = 0; i < count; i++) {
@@ -63,12 +68,12 @@ public class TestOMKeysRenameRequest extends TestOMKeyRequest {
       OmKeyInfo omKeyInfo = omMetadataManager.getKeyTable(getBucketLayout())
           .get(omMetadataManager.getOzoneKey(volumeName, bucketName,
               parentDir.concat("/key" + i)));
-      Assert.assertNull(omKeyInfo);
+      assertNull(omKeyInfo);
 
       omKeyInfo = omMetadataManager.getKeyTable(getBucketLayout()).get(
           omMetadataManager.getOzoneKey(volumeName, bucketName,
               parentDir.concat("/newKey" + i)));
-      Assert.assertNotNull(omKeyInfo);
+      assertNotNull(omKeyInfo);
     }
 
   }
@@ -81,11 +86,10 @@ public class TestOMKeysRenameRequest extends TestOMKeyRequest {
         new OMKeysRenameRequest(modifiedOmRequest, getBucketLayout());
 
     OMClientResponse omKeysRenameResponse =
-        omKeysRenameRequest.validateAndUpdateCache(ozoneManager, 100L,
-            ozoneManagerDoubleBufferHelper);
+        omKeysRenameRequest.validateAndUpdateCache(ozoneManager, 100L);
 
-    Assert.assertFalse(omKeysRenameResponse.getOMResponse().getSuccess());
-    Assert.assertEquals(OzoneManagerProtocolProtos.Status.PARTIAL_RENAME,
+    assertFalse(omKeysRenameResponse.getOMResponse().getSuccess());
+    assertEquals(OzoneManagerProtocolProtos.Status.PARTIAL_RENAME,
         omKeysRenameResponse.getOMResponse().getStatus());
 
     // The keys（key0 to key9）can be renamed success.
@@ -94,18 +98,18 @@ public class TestOMKeysRenameRequest extends TestOMKeyRequest {
       OmKeyInfo omKeyInfo = omMetadataManager.getKeyTable(getBucketLayout())
           .get(omMetadataManager.getOzoneKey(volumeName, bucketName,
               parentDir.concat("/key" + i)));
-      Assert.assertNull(omKeyInfo);
+      assertNull(omKeyInfo);
 
       omKeyInfo = omMetadataManager.getKeyTable(getBucketLayout()).get(
           omMetadataManager.getOzoneKey(volumeName, bucketName,
               parentDir.concat("/newKey" + i)));
-      Assert.assertNotNull(omKeyInfo);
+      assertNotNull(omKeyInfo);
     }
 
     // The key not rename should be in unRenamedKeys.
     RenameKeysMap unRenamedKeys = omKeysRenameResponse.getOMResponse()
         .getRenameKeysResponse().getUnRenamedKeys(0);
-    Assert.assertEquals("testKey", unRenamedKeys.getFromKeyName());
+    assertEquals("testKey", unRenamedKeys.getFromKeyName());
   }
 
   /**
@@ -125,8 +129,7 @@ public class TestOMKeysRenameRequest extends TestOMKeyRequest {
       String key = parentDir.concat("/key" + i);
       String toKey = parentDir.concat("/newKey" + i);
       OMRequestTestUtils.addKeyToTableCache(volumeName, bucketName,
-          parentDir.concat("/key" + i), HddsProtos.ReplicationType.RATIS,
-          HddsProtos.ReplicationFactor.THREE, omMetadataManager);
+          parentDir.concat("/key" + i), RatisReplicationConfig.getInstance(THREE), omMetadataManager);
 
       RenameKeysMap.Builder renameKey = RenameKeysMap.newBuilder()
           .setFromKeyName(key)

@@ -121,6 +121,11 @@ public class DeleteVolumeHandler extends VolumeHandler {
       totalBucketCount++;
     }
     doCleanBuckets();
+    // Reset counters and bucket list
+    numberOfBucketsCleaned.set(0);
+    totalBucketCount = 0;
+    cleanedBucketCounter.set(0);
+    bucketIdList.clear();
   }
 
   /**
@@ -201,6 +206,7 @@ public class DeleteVolumeHandler extends VolumeHandler {
             if (!cleanOBSBucket(bucket)) {
               throw new RuntimeException("Failed to clean bucket");
             }
+            break;
           default:
             throw new RuntimeException("Invalid bucket layout");
           }
@@ -221,11 +227,7 @@ public class DeleteVolumeHandler extends VolumeHandler {
       // wait until all Buckets are cleaned or exception occurred.
       while (numberOfBucketsCleaned.get() != totalBucketCount
           && exception == null) {
-        try {
-          Thread.sleep(100);
-        } catch (InterruptedException e) {
-          throw e;
-        }
+        Thread.sleep(100);
       }
     } catch (InterruptedException e) {
       LOG.error("Failed to wait until all Buckets are cleaned", e);

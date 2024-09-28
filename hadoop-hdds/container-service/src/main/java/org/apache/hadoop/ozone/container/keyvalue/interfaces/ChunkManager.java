@@ -106,6 +106,11 @@ public interface ChunkManager {
     // no-op
   }
 
+  default void finalizeWriteChunk(KeyValueContainer container,
+      BlockID blockId) throws IOException {
+    // no-op
+  }
+
   default String streamInit(Container container, BlockID blockID)
       throws StorageContainerException {
     return null;
@@ -117,8 +122,8 @@ public interface ChunkManager {
     return null;
   }
 
-  static long getBufferCapacityForChunkRead(ChunkInfo chunkInfo,
-      long defaultReadBufferCapacity) {
+  static int getBufferCapacityForChunkRead(ChunkInfo chunkInfo,
+      int defaultReadBufferCapacity) {
     long bufferCapacity = 0;
     if (chunkInfo.isReadDataIntoSingleBuffer()) {
       // Older client - read all chunk data into one single buffer.
@@ -126,7 +131,7 @@ public interface ChunkManager {
     } else {
       // Set buffer capacity to checksum boundary size so that each buffer
       // corresponds to one checksum. If checksum is NONE, then set buffer
-      // capacity to default (OZONE_CHUNK_READ_BUFFER_DEFAULT_SIZE_KEY = 64KB).
+      // capacity to default (OZONE_CHUNK_READ_BUFFER_DEFAULT_SIZE_KEY = 1MB).
       ChecksumData checksumData = chunkInfo.getChecksumData();
 
       if (checksumData != null) {
@@ -143,6 +148,13 @@ public interface ChunkManager {
       bufferCapacity = chunkInfo.getLen();
     }
 
-    return bufferCapacity;
+    if (bufferCapacity > Integer.MAX_VALUE) {
+      throw new IllegalStateException("Integer overflow:"
+          + " bufferCapacity = " + bufferCapacity
+          + " > Integer.MAX_VALUE = " + Integer.MAX_VALUE
+          + ", defaultReadBufferCapacity=" + defaultReadBufferCapacity
+          + ", chunkInfo=" + chunkInfo);
+    }
+    return Math.toIntExact(bufferCapacity);
   }
 }

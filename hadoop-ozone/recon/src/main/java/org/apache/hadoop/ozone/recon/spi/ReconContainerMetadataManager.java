@@ -25,6 +25,7 @@ import java.util.UUID;
 import org.apache.hadoop.hdds.annotation.InterfaceStability;
 import org.apache.hadoop.hdds.utils.db.BatchOperation;
 import org.apache.hadoop.hdds.utils.db.RDBBatchOperation;
+import org.apache.hadoop.hdds.utils.db.Table;
 import org.apache.hadoop.ozone.recon.api.types.ContainerKeyPrefix;
 import org.apache.hadoop.ozone.recon.api.types.ContainerMetadata;
 import org.apache.hadoop.hdds.utils.db.TableIterator;
@@ -176,7 +177,7 @@ public interface ReconContainerMetadataManager {
 
   /**
    * Get a Map of containerID, containerMetadata of Containers only for the
-   * given limit. If the limit is -1 or any integer <0, then return all
+   * given limit. If the limit is -1 or any integer &lt; 0, then return all
    * the containers without any limit.
    *
    * @param limit the no. of containers to fetch.
@@ -242,6 +243,12 @@ public interface ReconContainerMetadataManager {
    * @return TableIterator
    */
   TableIterator getKeyContainerTableIterator() throws IOException;
+
+  /**
+   * Get the entire keyContainerTable.
+   * @return keyContainerTable
+   */
+  Table<KeyPrefixContainer, Integer> getKeyContainerTable();
 
   /**
    * Get the stored key prefixes for the given containerId starting

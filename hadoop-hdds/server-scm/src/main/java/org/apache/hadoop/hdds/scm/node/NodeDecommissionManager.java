@@ -18,17 +18,23 @@ package org.apache.hadoop.hdds.scm.node;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
+import org.apache.commons.lang3.tuple.Pair;
+import org.apache.hadoop.hdds.DFSConfigKeysLegacy;
+import org.apache.hadoop.hdds.client.ECReplicationConfig;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.protocol.DatanodeDetails;
+import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos.NodeOperationalState;
 import org.apache.hadoop.hdds.scm.DatanodeAdminError;
 import org.apache.hadoop.hdds.scm.ScmConfigKeys;
+import org.apache.hadoop.hdds.scm.container.ContainerID;
+import org.apache.hadoop.hdds.scm.container.ContainerInfo;
 import org.apache.hadoop.hdds.scm.container.ContainerManager;
+import org.apache.hadoop.hdds.scm.container.ContainerNotFoundException;
 import org.apache.hadoop.hdds.scm.container.replication.ReplicationManager;
 import org.apache.hadoop.hdds.scm.ha.SCMContext;
 import org.apache.hadoop.hdds.scm.node.states.NodeNotFoundException;
 import org.apache.hadoop.hdds.server.events.EventPublisher;
-import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -37,36 +43,39 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.UnknownHostException;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 /**
  * Class used to manage datanodes scheduled for maintenance or decommission.
  */
 public class NodeDecommissionManager {
 
-  private ScheduledExecutorService executor;
-  private DatanodeAdminMonitor monitor;
+  private final ScheduledExecutorService executor;
+  private final DatanodeAdminMonitor monitor;
 
-  private NodeManager nodeManager;
-  //private ContainerManager containerManager;
-  private SCMContext scmContext;
-  private EventPublisher eventQueue;
-  private ReplicationManager replicationManager;
-  private OzoneConfiguration conf;
-  private boolean useHostnames;
-  private long monitorInterval;
+  private final NodeManager nodeManager;
+  private ContainerManager containerManager;
+  private final SCMContext scmContext;
+  private final boolean useHostnames;
+  private Integer maintenanceReplicaMinimum;
+  private Integer maintenanceRemainingRedundancy;
 
   // Decommissioning and Maintenance mode progress related metrics.
-  private NodeDecommissionMetrics metrics;
+  private final NodeDecommissionMetrics metrics;
 
   private static final Logger LOG =
       LoggerFactory.getLogger(NodeDecommissionManager.class);
 
-  static class HostDefinition {
+  static final class HostDefinition {
     private String rawHostname;
     private String hostname;
     private int port;
@@ -106,17 +115,21 @@ public class NodeDecommissionManager {
     }
   }
 
-  private List<DatanodeDetails> mapHostnamesToDatanodes(List<String> hosts)
-      throws InvalidHostStringException {
+  private List<DatanodeDetails> mapHostnamesToDatanodes(List<String> hosts,
+      List<DatanodeAdminError> errors) {
     List<DatanodeDetails> results = new LinkedList<>();
+    HostDefinition host;
+    InetAddress addr;
+    String msg;
     for (String hostString : hosts) {
-      HostDefinition host = new HostDefinition(hostString);
-      InetAddress addr;
       try {
+        host = new HostDefinition(hostString);
         addr = InetAddress.getByName(host.getHostname());
-      } catch (UnknownHostException e) {
-        throw new InvalidHostStringException("Unable to resolve host "
-            + host.getRawHostname(), e);
+      } catch (InvalidHostStringException | UnknownHostException e) {
+        LOG.warn("Unable to resolve host {} ", hostString, e);
+        errors.add(new DatanodeAdminError(hostString,
+            e.getMessage()));
+        continue;
       }
       String dnsName;
       if (useHostnames) {
@@ -125,38 +138,112 @@ public class NodeDecommissionManager {
         dnsName = addr.getHostAddress();
       }
       List<DatanodeDetails> found = nodeManager.getNodesByAddress(dnsName);
-      if (found.size() == 0) {
-        throw new InvalidHostStringException("Host " + host.getRawHostname()
+      if (found.isEmpty()) {
+        msg = "Host " + host.getRawHostname()
             + " (" + dnsName + ") is not running any datanodes registered"
-            + " with SCM."
-            + " Please check the host name.");
+            + " with SCM. Please check the host name.";
+        LOG.warn(msg);
+        errors.add(new DatanodeAdminError(host.getRawHostname(), msg));
       } else if (found.size() == 1) {
         if (host.getPort() != -1 &&
             !validateDNPortMatch(host.getPort(), found.get(0))) {
-          throw new InvalidHostStringException("Host " + host.getRawHostname()
+          msg = "Host " + host.getRawHostname()
               + " is running a datanode registered with SCM,"
               + " but the port number doesn't match."
-              + " Please check the port number.");
+              + " Please check the port number.";
+          LOG.warn(msg);
+          errors.add(new DatanodeAdminError(host.getRawHostname(), msg));
+          continue;
         }
         results.add(found.get(0));
-      } else if (found.size() > 1) {
-        DatanodeDetails match = null;
-        for (DatanodeDetails dn : found) {
-          if (validateDNPortMatch(host.getPort(), dn)) {
-            match = dn;
-            break;
-          }
+      } else {
+        // Here we either have multiple DNs on the same host / IP, and they
+        // should have different ports. Or, we have a case where a DN was
+        // registered from a host, then stopped and formatted, changing its
+        // UUID and registered again. In that case, the ports of all hosts
+        // should be the same, and we should just use the one with the most
+        // recent heartbeat.
+        if (host.getPort() != -1) {
+          HostDefinition finalHost = host;
+          found.removeIf(dn -> !validateDNPortMatch(finalHost.getPort(), dn));
         }
-        if (match == null) {
-          throw new InvalidHostStringException("Host " + host.getRawHostname()
+        if (found.isEmpty()) {
+          msg = "Host " + host.getRawHostname()
               + " is running multiple datanodes registered with SCM,"
               + " but no port numbers match."
-              + " Please check the port number.");
+              + " Please check the port number.";
+          LOG.warn(msg);
+          errors.add(new DatanodeAdminError(host.getRawHostname(), msg));
+          continue;
+        } else if (found.size() == 1) {
+          results.add(found.get(0));
+          continue;
         }
-        results.add(match);
+        // Here we have at least 2 DNs matching the passed in port, or no port
+        // was passed so we may have all the same ports in SCM or a mix of
+        // ports.
+        if (allPortsMatch(found)) {
+          // All ports match, so just use the most recent heartbeat as it is
+          // not possible for a host to have 2 DNs coming from the same port.
+          DatanodeDetails mostRecent = findDnWithMostRecentHeartbeat(found);
+          if (mostRecent == null) {
+            msg = "Host " + host.getRawHostname()
+                + " has multiple datanodes registered with SCM."
+                + " All have identical ports, but none have a newest"
+                + " heartbeat.";
+            LOG.warn(msg);
+            errors.add(new DatanodeAdminError(host.getRawHostname(), msg));
+            continue;
+          }
+          results.add(mostRecent);
+        } else {
+          // We have no passed in port or the ports in SCM do not all match, so
+          // we cannot decide which DN to use.
+          msg = "Host " + host.getRawHostname()
+              + " is running multiple datanodes registered with SCM,"
+              + " but no port numbers match."
+              + " Please check the port number.";
+          LOG.warn(msg);
+          errors.add(new DatanodeAdminError(host.getRawHostname(), msg));
+        }
       }
     }
     return results;
+  }
+
+  private boolean allPortsMatch(List<DatanodeDetails> dns) {
+    if (dns.size() < 2) {
+      return true;
+    }
+    int port = dns.get(0).getPort(DatanodeDetails.Port.Name.RATIS).getValue();
+    for (int i = 1; i < dns.size(); i++) {
+      if (dns.get(i).getPort(DatanodeDetails.Port.Name.RATIS).getValue()
+          != port) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private DatanodeDetails findDnWithMostRecentHeartbeat(
+      List<DatanodeDetails> dns) {
+    if (dns.size() < 2) {
+      return dns.isEmpty() ? null : dns.get(0);
+    }
+    List<Pair<DatanodeDetails, Long>> dnsWithHeartbeat = dns.stream()
+        .map(dn -> Pair.of(dn, nodeManager.getLastHeartbeat(dn)))
+        .sorted(Comparator.comparingLong(Pair::getRight))
+        .collect(Collectors.toList());
+    // The last element should have the largest (newest) heartbeat. But also
+    // check it is not identical to the last but 1 element, as then we cannot
+    // determine which node to decommission.
+    Pair<DatanodeDetails, Long> last = dnsWithHeartbeat.get(
+        dnsWithHeartbeat.size() - 1);
+    if (last.getRight() > dnsWithHeartbeat.get(
+        dnsWithHeartbeat.size() - 2).getRight()) {
+      return last.getLeft();
+    }
+    return null;
   }
 
   /**
@@ -167,34 +254,29 @@ public class NodeDecommissionManager {
    * @return True if port is used by the datanode. False otherwise.
    */
   private boolean validateDNPortMatch(int port, DatanodeDetails dn) {
-    for (DatanodeDetails.Port p : dn.getPorts()) {
-      if (p.getValue() == port) {
-        return true;
-      }
-    }
-    return false;
+    return dn.hasPort(port);
   }
 
-  public NodeDecommissionManager(OzoneConfiguration config, NodeManager nm,
-             ContainerManager containerManager, SCMContext scmContext,
+  public NodeDecommissionManager(OzoneConfiguration config, NodeManager nm, ContainerManager cm,
+             SCMContext scmContext,
              EventPublisher eventQueue, ReplicationManager rm) {
     this.nodeManager = nm;
-    conf = config;
-    //this.containerManager = containerManager;
+    this.containerManager = cm;
     this.scmContext = scmContext;
-    this.eventQueue = eventQueue;
-    this.replicationManager = rm;
-    this.metrics = null;
 
     executor = Executors.newScheduledThreadPool(1,
-        new ThreadFactoryBuilder().setNameFormat("DatanodeAdminManager-%d")
-            .setDaemon(true).build());
+        new ThreadFactoryBuilder()
+            .setNameFormat(
+                scmContext.threadNamePrefix() + "DatanodeAdminManager-%d")
+            .setDaemon(true)
+            .build()
+    );
 
-    useHostnames = conf.getBoolean(
-        DFSConfigKeys.DFS_DATANODE_USE_DN_HOSTNAME,
-        DFSConfigKeys.DFS_DATANODE_USE_DN_HOSTNAME_DEFAULT);
+    useHostnames = config.getBoolean(
+        DFSConfigKeysLegacy.DFS_DATANODE_USE_DN_HOSTNAME,
+        DFSConfigKeysLegacy.DFS_DATANODE_USE_DN_HOSTNAME_DEFAULT);
 
-    monitorInterval = conf.getTimeDuration(
+    long monitorInterval = config.getTimeDuration(
         ScmConfigKeys.OZONE_SCM_DATANODE_ADMIN_MONITOR_INTERVAL,
         ScmConfigKeys.OZONE_SCM_DATANODE_ADMIN_MONITOR_INTERVAL_DEFAULT,
         TimeUnit.SECONDS);
@@ -202,20 +284,27 @@ public class NodeDecommissionManager {
       LOG.warn("{} must be greater than zero, defaulting to {}",
           ScmConfigKeys.OZONE_SCM_DATANODE_ADMIN_MONITOR_INTERVAL,
           ScmConfigKeys.OZONE_SCM_DATANODE_ADMIN_MONITOR_INTERVAL_DEFAULT);
-      conf.set(ScmConfigKeys.OZONE_SCM_DATANODE_ADMIN_MONITOR_INTERVAL,
+      config.set(ScmConfigKeys.OZONE_SCM_DATANODE_ADMIN_MONITOR_INTERVAL,
           ScmConfigKeys.OZONE_SCM_DATANODE_ADMIN_MONITOR_INTERVAL_DEFAULT);
-      monitorInterval = conf.getTimeDuration(
+      monitorInterval = config.getTimeDuration(
           ScmConfigKeys.OZONE_SCM_DATANODE_ADMIN_MONITOR_INTERVAL,
           ScmConfigKeys.OZONE_SCM_DATANODE_ADMIN_MONITOR_INTERVAL_DEFAULT,
           TimeUnit.SECONDS);
     }
+    setMaintenanceConfigs(config.getInt("hdds.scm.replication.maintenance.replica.minimum", 2),
+        config.getInt("hdds.scm.replication.maintenance.remaining.redundancy", 1));
 
-    monitor = new DatanodeAdminMonitorImpl(conf, eventQueue, nodeManager,
-        replicationManager);
+    monitor = new DatanodeAdminMonitorImpl(config, eventQueue, nodeManager,
+        rm);
     this.metrics = NodeDecommissionMetrics.create();
     monitor.setMetrics(this.metrics);
     executor.scheduleAtFixedRate(monitor, monitorInterval, monitorInterval,
         TimeUnit.SECONDS);
+  }
+
+  public Map<String, List<ContainerID>> getContainersPendingReplication(DatanodeDetails dn)
+      throws NodeNotFoundException {
+    return getMonitor().getContainersPendingReplication(dn);
   }
 
   @VisibleForTesting
@@ -224,9 +313,20 @@ public class NodeDecommissionManager {
   }
 
   public synchronized List<DatanodeAdminError> decommissionNodes(
-      List<String> nodes) throws InvalidHostStringException {
-    List<DatanodeDetails> dns = mapHostnamesToDatanodes(nodes);
+      List<String> nodes, boolean force) {
     List<DatanodeAdminError> errors = new ArrayList<>();
+    List<DatanodeDetails> dns = mapHostnamesToDatanodes(nodes, errors);
+    // add check for fail-early if force flag is not set
+    if (!force) {
+      LOG.info("Force flag = {}. Checking if decommission is possible for dns: {}", force, dns);
+      boolean decommissionPossible = checkIfDecommissionPossible(dns, errors);
+      if (!decommissionPossible) {
+        LOG.error("Cannot decommission nodes as sufficient node are not available.");
+        return errors;
+      }
+    } else {
+      LOG.info("Force flag = {}. Skip checking if decommission is possible for dns: {}", force, dns);
+    }
     for (DatanodeDetails dn : dns) {
       try {
         startDecommission(dn);
@@ -252,7 +352,6 @@ public class NodeDecommissionManager {
    * be in DECOMMISSIONING or ENTERING_MAINTENANCE state. In that case, it
    * needs to be added back into the monitor to track its progress.
    * @param dn Datanode to add back to tracking.
-   * @throws NodeNotFoundException
    */
   public synchronized void continueAdminForNode(DatanodeDetails dn)
       throws NodeNotFoundException {
@@ -288,10 +387,66 @@ public class NodeDecommissionManager {
     }
   }
 
+  private synchronized boolean checkIfDecommissionPossible(List<DatanodeDetails> dns, List<DatanodeAdminError> errors) {
+    int numDecom = dns.size();
+    List<DatanodeDetails> validDns = new ArrayList<>(dns);
+    int inServiceTotal = nodeManager.getNodeCount(NodeStatus.inServiceHealthy());
+    for (DatanodeDetails dn : dns) {
+      try {
+        NodeStatus nodeStatus = getNodeStatus(dn);
+        NodeOperationalState opState = nodeStatus.getOperationalState();
+        if (opState != NodeOperationalState.IN_SERVICE) {
+          numDecom--;
+          validDns.remove(dn);
+        }
+      } catch (NodeNotFoundException ex) {
+        numDecom--;
+        validDns.remove(dn);
+      }
+    }
+
+    for (DatanodeDetails dn : validDns) {
+      Set<ContainerID> containers;
+      try {
+        containers = nodeManager.getContainers(dn);
+      } catch (NodeNotFoundException ex) {
+        LOG.warn("The host {} was not found in SCM. Ignoring the request to " +
+            "decommission it", dn.getHostName());
+        continue; // ignore the DN and continue to next one
+      }
+
+      for (ContainerID cid : containers) {
+        ContainerInfo cif;
+        try {
+          cif = containerManager.getContainer(cid);
+        } catch (ContainerNotFoundException ex) {
+          LOG.warn("Could not find container info for container {}.", cid);
+          continue; // ignore the container and continue to next one
+        }
+        synchronized (cif) {
+          if (cif.getState().equals(HddsProtos.LifeCycleState.DELETED) ||
+              cif.getState().equals(HddsProtos.LifeCycleState.DELETING)) {
+            continue;
+          }
+          int reqNodes = cif.getReplicationConfig().getRequiredNodes();
+          if ((inServiceTotal - numDecom) < reqNodes) {
+            String errorMsg = "Insufficient nodes. Tried to decommission " + dns.size() +
+                " nodes of which " + numDecom + " nodes were valid. Cluster has " + inServiceTotal +
+                " IN-SERVICE nodes, " + reqNodes + " of which are required for minimum replication. ";
+            LOG.info(errorMsg + "Failing due to datanode : {}, container : {}", dn, cid);
+            errors.add(new DatanodeAdminError("AllHosts", errorMsg));
+            return false;
+          }
+        }
+      }
+    }
+    return true;
+  }
+
   public synchronized List<DatanodeAdminError> recommissionNodes(
-      List<String> nodes) throws InvalidHostStringException {
-    List<DatanodeDetails> dns = mapHostnamesToDatanodes(nodes);
+      List<String> nodes) {
     List<DatanodeAdminError> errors = new ArrayList<>();
+    List<DatanodeDetails> dns = mapHostnamesToDatanodes(nodes, errors);
     for (DatanodeDetails dn : dns) {
       try {
         recommission(dn);
@@ -326,9 +481,20 @@ public class NodeDecommissionManager {
   }
 
   public synchronized List<DatanodeAdminError> startMaintenanceNodes(
-      List<String> nodes, int endInHours) throws InvalidHostStringException {
-    List<DatanodeDetails> dns = mapHostnamesToDatanodes(nodes);
+      List<String> nodes, int endInHours, boolean force) {
     List<DatanodeAdminError> errors = new ArrayList<>();
+    List<DatanodeDetails> dns = mapHostnamesToDatanodes(nodes, errors);
+    // add check for fail-early if force flag is not set
+    if (!force) {
+      LOG.info("Force flag = {}. Checking if maintenance is possible for dns: {}", force, dns);
+      boolean maintenancePossible = checkIfMaintenancePossible(dns, errors);
+      if (!maintenancePossible) {
+        LOG.error("Cannot put nodes to maintenance as sufficient node are not available.");
+        return errors;
+      }
+    } else {
+      LOG.info("Force flag = {}. Skip checking if maintenance is possible for dns: {}", force, dns);
+    }
     for (DatanodeDetails dn : dns) {
       try {
         startMaintenance(dn, endInHours);
@@ -374,6 +540,73 @@ public class NodeDecommissionManager {
     }
   }
 
+  private synchronized boolean checkIfMaintenancePossible(List<DatanodeDetails> dns, List<DatanodeAdminError> errors) {
+    int numMaintenance = dns.size();
+    List<DatanodeDetails> validDns = dns.stream().collect(Collectors.toList());
+    Collections.copy(validDns, dns);
+    int inServiceTotal = nodeManager.getNodeCount(NodeStatus.inServiceHealthy());
+    for (DatanodeDetails dn : dns) {
+      try {
+        NodeStatus nodeStatus = getNodeStatus(dn);
+        NodeOperationalState opState = nodeStatus.getOperationalState();
+        if (opState != NodeOperationalState.IN_SERVICE) {
+          numMaintenance--;
+          validDns.remove(dn);
+        }
+      } catch (NodeNotFoundException ex) {
+        numMaintenance--;
+        validDns.remove(dn);
+      }
+    }
+
+    for (DatanodeDetails dn : validDns) {
+      Set<ContainerID> containers;
+      try {
+        containers = nodeManager.getContainers(dn);
+      } catch (NodeNotFoundException ex) {
+        LOG.warn("The host {} was not found in SCM. Ignoring the request to " +
+            "enter maintenance", dn.getHostName());
+        errors.add(new DatanodeAdminError(dn.getHostName(),
+            "The host was not found in SCM"));
+        continue; // ignore the DN and continue to next one
+      }
+
+      for (ContainerID cid : containers) {
+        ContainerInfo cif;
+        try {
+          cif = containerManager.getContainer(cid);
+        } catch (ContainerNotFoundException ex) {
+          continue; // ignore the container and continue to next one
+        }
+        synchronized (cif) {
+          if (cif.getState().equals(HddsProtos.LifeCycleState.DELETED) ||
+              cif.getState().equals(HddsProtos.LifeCycleState.DELETING)) {
+            continue;
+          }
+
+          int minInService;
+          HddsProtos.ReplicationType replicationType = cif.getReplicationType();
+          if (replicationType.equals(HddsProtos.ReplicationType.EC)) {
+            int reqNodes = cif.getReplicationConfig().getRequiredNodes();
+            int data = ((ECReplicationConfig)cif.getReplicationConfig()).getData();
+            minInService = Math.min((data + maintenanceRemainingRedundancy), reqNodes);
+          } else {
+            minInService = maintenanceReplicaMinimum;
+          }
+          if ((inServiceTotal - numMaintenance) < minInService) {
+            String errorMsg = "Insufficient nodes. Tried to start maintenance for " + dns.size() +
+                " nodes of which " + numMaintenance + " nodes were valid. Cluster has " + inServiceTotal +
+                " IN-SERVICE nodes, " + minInService + " of which are required for minimum replication. ";
+            LOG.info(errorMsg + "Failing due to datanode : {}, container : {}", dn, cid);
+            errors.add(new DatanodeAdminError("AllHosts", errorMsg));
+            return false;
+          }
+        }
+      }
+    }
+    return true;
+  }
+
   /**
    *  Stops the decommission monitor from running when SCM is shutdown.
    */
@@ -404,5 +637,13 @@ public class NodeDecommissionManager {
             e);
       }
     });
+  }
+
+  @VisibleForTesting
+  public void setMaintenanceConfigs(int replicaMinimum, int remainingRedundancy) {
+    synchronized (this) {
+      maintenanceRemainingRedundancy = remainingRedundancy;
+      maintenanceReplicaMinimum = replicaMinimum;
+    }
   }
 }

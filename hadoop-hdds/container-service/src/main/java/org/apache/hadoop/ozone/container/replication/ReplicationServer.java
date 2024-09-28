@@ -19,9 +19,11 @@ package org.apache.hadoop.ozone.container.replication;
 
 import java.io.IOException;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.apache.hadoop.hdds.conf.Config;
 import org.apache.hadoop.hdds.conf.ConfigGroup;
@@ -69,7 +71,8 @@ public class ReplicationServer {
 
   public ReplicationServer(ContainerController controller,
       ReplicationConfig replicationConfig, SecurityConfig secConf,
-      CertificateClient caClient, ContainerImporter importer) {
+      CertificateClient caClient, ContainerImporter importer,
+      String threadNamePrefix) {
     this.secConf = secConf;
     this.caClient = caClient;
     this.controller = controller;
@@ -81,41 +84,44 @@ public class ReplicationServer {
     int replicationQueueLimit =
         replicationConfig.getReplicationQueueLimit();
     LOG.info("Initializing replication server with thread count = {}"
-        + " queue length = {}",
+            + " queue length = {}",
         replicationConfig.getReplicationMaxStreams(),
         replicationConfig.getReplicationQueueLimit());
-    this.executor =
-        new ThreadPoolExecutor(replicationServerWorkers,
-            replicationServerWorkers,
-            60, TimeUnit.SECONDS,
-            new LinkedBlockingQueue<>(replicationQueueLimit),
-            new ThreadFactoryBuilder().setDaemon(true)
-                .setNameFormat("ReplicationContainerReader-%d")
-                .build());
+    ThreadFactory threadFactory = new ThreadFactoryBuilder()
+        .setDaemon(true)
+        .setNameFormat(threadNamePrefix + "ReplicationContainerReader-%d")
+        .build();
+    this.executor = new ThreadPoolExecutor(
+        replicationServerWorkers,
+        replicationServerWorkers,
+        60,
+        TimeUnit.SECONDS,
+        new LinkedBlockingQueue<>(replicationQueueLimit),
+        threadFactory);
 
-    init();
+    init(replicationConfig.isZeroCopyEnable());
   }
 
-  public void init() {
+  public void init(boolean enableZeroCopy) {
+    GrpcReplicationService grpcReplicationService = new GrpcReplicationService(
+        new OnDemandContainerReplicationSource(controller), importer,
+        enableZeroCopy);
     NettyServerBuilder nettyServerBuilder = NettyServerBuilder.forPort(port)
         .maxInboundMessageSize(OzoneConsts.OZONE_SCM_CHUNK_MAX_SIZE)
-        .addService(ServerInterceptors.intercept(new GrpcReplicationService(
-            new OnDemandContainerReplicationSource(controller),
-            importer
-        ), new GrpcServerInterceptor()))
+        .addService(ServerInterceptors.intercept(
+            grpcReplicationService.bindServiceWithZeroCopy(),
+            new GrpcServerInterceptor()))
         .executor(executor);
 
     if (secConf.isSecurityEnabled() && secConf.isGrpcTlsEnabled()) {
       try {
-        SslContextBuilder sslContextBuilder = SslContextBuilder.forServer(
-            caClient.getServerKeyStoresFactory().getKeyManagers()[0]);
+        SslContextBuilder sslContextBuilder = SslContextBuilder.forServer(caClient.getKeyManager());
 
         sslContextBuilder = GrpcSslContexts.configure(
             sslContextBuilder, secConf.getGrpcSslProvider());
 
         sslContextBuilder.clientAuth(ClientAuth.REQUIRE);
-        sslContextBuilder.trustManager(
-            caClient.getServerKeyStoresFactory().getTrustManagers()[0]);
+        sslContextBuilder.trustManager(caClient.getTrustManager());
 
         nettyServerBuilder.sslContext(sslContextBuilder.build());
       } catch (IOException ex) {
@@ -149,6 +155,31 @@ public class ReplicationServer {
     return port;
   }
 
+  public void setPoolSize(int size) {
+    if (size <= 0) {
+      throw new IllegalArgumentException("Pool size must be positive.");
+    }
+
+    int currentCorePoolSize = executor.getCorePoolSize();
+
+    // In ThreadPoolExecutor, maximumPoolSize must always be greater than or
+    // equal to the corePoolSize. We must make sure this invariant holds when
+    // changing the pool size. Therefore, we take into account whether the
+    // new size is greater or smaller than the current core pool size.
+    if (size > currentCorePoolSize) {
+      executor.setMaximumPoolSize(size);
+      executor.setCorePoolSize(size);
+    } else {
+      executor.setCorePoolSize(size);
+      executor.setMaximumPoolSize(size);
+    }
+  }
+
+  @VisibleForTesting
+  public ThreadPoolExecutor getExecutor() {
+    return executor;
+  }
+
   /**
    * Replication-related configuration.
    */
@@ -171,6 +202,11 @@ public class ReplicationServer {
     private static final double OUTOFSERVICE_FACTOR_MAX = 10;
     static final String REPLICATION_OUTOFSERVICE_FACTOR_KEY =
         PREFIX + "." + OUTOFSERVICE_FACTOR_KEY;
+
+    public static final String ZEROCOPY_ENABLE_KEY = "zerocopy.enabled";
+    private static final boolean ZEROCOPY_ENABLE_DEFAULT = true;
+    private static final String ZEROCOPY_ENABLE_DEFAULT_VALUE =
+        "true";
 
     /**
      * The maximum number of replication commands a single datanode can execute
@@ -213,6 +249,15 @@ public class ReplicationServer {
     )
     private double outOfServiceFactor = OUTOFSERVICE_FACTOR_DEFAULT;
 
+    @Config(key = ZEROCOPY_ENABLE_KEY,
+        type = ConfigType.BOOLEAN,
+        defaultValue =  ZEROCOPY_ENABLE_DEFAULT_VALUE,
+        tags = {DATANODE, SCM},
+        description = "Specify if zero-copy should be enabled for " +
+            "replication protocol."
+    )
+    private boolean zeroCopyEnable = ZEROCOPY_ENABLE_DEFAULT;
+
     public double getOutOfServiceFactor() {
       return outOfServiceFactor;
     }
@@ -244,6 +289,14 @@ public class ReplicationServer {
 
     public void setReplicationQueueLimit(int limit) {
       this.replicationQueueLimit = limit;
+    }
+
+    public boolean isZeroCopyEnable() {
+      return zeroCopyEnable;
+    }
+
+    public void setZeroCopyEnable(boolean zeroCopyEnable) {
+      this.zeroCopyEnable = zeroCopyEnable;
     }
 
     @PostConstruct

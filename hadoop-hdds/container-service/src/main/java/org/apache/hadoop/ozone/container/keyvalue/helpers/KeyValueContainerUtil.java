@@ -23,7 +23,6 @@ import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.List;
 
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos;
 
@@ -32,7 +31,6 @@ import org.apache.hadoop.hdds.utils.MetadataKeyFilters;
 import org.apache.hadoop.hdds.utils.db.Table;
 import org.apache.hadoop.ozone.OzoneConsts;
 import org.apache.hadoop.ozone.container.common.helpers.BlockData;
-import org.apache.hadoop.ozone.container.common.helpers.ChunkInfo;
 import org.apache.hadoop.ozone.container.common.helpers.ContainerUtils;
 import org.apache.hadoop.ozone.container.common.interfaces.BlockIterator;
 import org.apache.hadoop.ozone.container.common.statemachine.DatanodeConfiguration;
@@ -64,12 +62,6 @@ public final class KeyValueContainerUtil {
 
   private static final Logger LOG = LoggerFactory.getLogger(
       KeyValueContainerUtil.class);
-
-  /**
-   *
-   * @param containerMetaDataPath
-   * @throws IOException
-   */
 
   /**
    * creates metadata path, chunks path and metadata DB for the specified
@@ -232,7 +224,8 @@ public final class KeyValueContainerUtil {
       LOG.error("Container DB file is missing for ContainerID {}. " +
           "Skipping loading of this container.", containerID);
       // Don't further process this container, as it is missing db file.
-      return;
+      throw new IOException("Container DB file is missing for containerID "
+          + containerID);
     }
     kvContainerData.setDbFile(dbFile);
 
@@ -363,6 +356,29 @@ public final class KeyValueContainerUtil {
     // startup. If this method is called but not as a part of startup,
     // The inspectors will be unloaded and this will be a no-op.
     ContainerInspectorUtil.process(kvContainerData, store);
+
+    // Load finalizeBlockLocalIds for container in memory.
+    populateContainerFinalizeBlock(kvContainerData, store);
+  }
+
+  /**
+   * Loads finalizeBlockLocalIds for container in memory.
+   * @param kvContainerData - KeyValueContainerData
+   * @param store - DatanodeStore
+   * @throws IOException
+   */
+  private static void populateContainerFinalizeBlock(
+      KeyValueContainerData kvContainerData, DatanodeStore store)
+      throws IOException {
+    if (store.getFinalizeBlocksTable() != null) {
+      try (BlockIterator<Long> iter =
+               store.getFinalizeBlockIterator(kvContainerData.getContainerID(),
+                   kvContainerData.getUnprefixedKeyFilter())) {
+        while (iter.hasNext()) {
+          kvContainerData.addToFinalizedBlockSet(iter.nextBlock());
+        }
+      }
+    }
   }
 
   /**
@@ -410,46 +426,9 @@ public final class KeyValueContainerUtil {
   }
 
   public static long getBlockLength(BlockData block) throws IOException {
-    long blockLen = 0;
-    List<ContainerProtos.ChunkInfo> chunkInfoList = block.getChunks();
-
-    for (ContainerProtos.ChunkInfo chunk : chunkInfoList) {
-      ChunkInfo info = ChunkInfo.getFromProtoBuf(chunk);
-      blockLen += info.getLen();
-    }
-
-    return blockLen;
-  }
-
-  /**
-   * Returns the path where data or chunks live for a given container.
-   *
-   * @param kvContainerData - KeyValueContainerData
-   * @return - Path to the chunks directory
-   */
-  public static Path getDataDirectory(KeyValueContainerData kvContainerData) {
-
-    String chunksPath = kvContainerData.getChunksPath();
-    Preconditions.checkNotNull(chunksPath);
-
-    return Paths.get(chunksPath);
-  }
-
-  /**
-   * Container metadata directory -- here is where the RocksDB and
-   * .container file lives.
-   *
-   * @param kvContainerData - KeyValueContainerData
-   * @return Path to the metadata directory
-   */
-  public static Path getMetadataDirectory(
-      KeyValueContainerData kvContainerData) {
-
-    String metadataPath = kvContainerData.getMetadataPath();
-    Preconditions.checkNotNull(metadataPath);
-
-    return Paths.get(metadataPath);
-
+    return block.getChunks().stream()
+        .mapToLong(ContainerProtos.ChunkInfo::getLen)
+        .sum();
   }
 
   public static boolean isSameSchemaVersion(String schema, String other) {
@@ -460,13 +439,13 @@ public final class KeyValueContainerUtil {
 
   /**
    * Moves container directory to a new location
-   * under "<volume>/hdds/<cluster-id>/tmp/deleted-containers"
+   * under "volume/hdds/cluster-id/tmp/deleted-containers"
    * and updates metadata and chunks path.
    * Containers will be moved under it before getting deleted
    * to avoid, in case of failure, having artifact leftovers
    * on the default container path on the disk.
    *
-   * Delete operation for Schema < V3
+   * Delete operation for Schema &lt; V3
    * 1. Container is marked DELETED
    * 2. Container is removed from memory container set
    * 3. Container DB handler from cache is removed and closed
@@ -481,7 +460,6 @@ public final class KeyValueContainerUtil {
    * 5. Container is deleted from tmp directory.
    *
    * @param keyValueContainerData
-   * @return true if renaming was successful
    */
   public static void moveToDeletedContainerDir(
       KeyValueContainerData keyValueContainerData,

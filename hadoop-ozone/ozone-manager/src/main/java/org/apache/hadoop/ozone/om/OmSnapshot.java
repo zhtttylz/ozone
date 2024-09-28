@@ -31,6 +31,7 @@ import org.apache.hadoop.ozone.om.helpers.OmKeyArgs;
 import org.apache.hadoop.ozone.om.helpers.OmKeyInfo;
 import org.apache.hadoop.ozone.om.helpers.OmKeyLocationInfoGroup;
 import org.apache.hadoop.ozone.om.helpers.OzoneFileStatus;
+import org.apache.hadoop.ozone.om.helpers.OzoneFileStatusLight;
 import org.apache.hadoop.ozone.om.helpers.SnapshotInfo;
 import org.apache.hadoop.ozone.security.acl.IAccessAuthorizer;
 import org.apache.hadoop.ozone.security.acl.OzoneAuthorizerFactory;
@@ -46,6 +47,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.UUID;
 import java.util.stream.Collectors;
 
 /**
@@ -73,6 +75,7 @@ public class OmSnapshot implements IOmMetadataReader, Closeable {
   private final String volumeName;
   private final String bucketName;
   private final String snapshotName;
+  private final UUID snapshotID;
   // To access snapshot checkpoint DB metadata
   private final OMMetadataManager omMetadataManager;
   private final KeyManager keyManager;
@@ -82,7 +85,8 @@ public class OmSnapshot implements IOmMetadataReader, Closeable {
                     OzoneManager ozoneManager,
                     String volumeName,
                     String bucketName,
-                    String snapshotName) {
+                    String snapshotName,
+                    UUID snapshotID) {
     IAccessAuthorizer accessAuthorizer =
         OzoneAuthorizerFactory.forSnapshot(ozoneManager,
             keyManager, prefixManager);
@@ -92,6 +96,7 @@ public class OmSnapshot implements IOmMetadataReader, Closeable {
     this.snapshotName = snapshotName;
     this.bucketName = bucketName;
     this.volumeName = volumeName;
+    this.snapshotID = snapshotID;
     this.keyManager = keyManager;
     this.omMetadataManager = keyManager.getMetadataManager();
   }
@@ -120,6 +125,19 @@ public class OmSnapshot implements IOmMetadataReader, Closeable {
         recursive, normalizeKeyName(startKey), numEntries,
         allowPartialPrefixes);
     return l.stream().map(this::denormalizeOzoneFileStatus)
+        .collect(Collectors.toList());
+  }
+
+  @Override
+  public List<OzoneFileStatusLight> listStatusLight(OmKeyArgs args,
+      boolean recursive, String startKey, long numEntries,
+      boolean allowPartialPrefixes) throws IOException {
+
+    List<OzoneFileStatus> ozoneFileStatuses =
+        listStatus(args, recursive, startKey, numEntries, allowPartialPrefixes);
+
+    return ozoneFileStatuses.stream()
+        .map(OzoneFileStatusLight::fromOzoneFileStatus)
         .collect(Collectors.toList());
   }
 
@@ -279,6 +297,10 @@ public class OmSnapshot implements IOmMetadataReader, Closeable {
 
   public String getName() {
     return snapshotName;
+  }
+
+  public UUID getSnapshotID() {
+    return snapshotID;
   }
 
   @Override

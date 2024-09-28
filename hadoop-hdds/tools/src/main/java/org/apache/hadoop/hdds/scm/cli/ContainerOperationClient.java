@@ -31,10 +31,13 @@ import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos.DeletedBlocksTransactionInfo;
 import org.apache.hadoop.hdds.protocol.proto.StorageContainerLocationProtocolProtos.DecommissionScmResponseProto;
 import org.apache.hadoop.hdds.protocol.proto.StorageContainerLocationProtocolProtos.StartContainerBalancerResponseProto;
+import org.apache.hadoop.hdds.protocol.proto.StorageContainerLocationProtocolProtos.ContainerBalancerStatusInfoResponseProto;
 import org.apache.hadoop.hdds.scm.DatanodeAdminError;
 import org.apache.hadoop.hdds.scm.ScmConfigKeys;
 import org.apache.hadoop.hdds.scm.XceiverClientManager;
 import org.apache.hadoop.hdds.scm.XceiverClientSpi;
+import org.apache.hadoop.hdds.scm.client.ClientTrustManager;
+import org.apache.hadoop.hdds.security.x509.certificate.client.CACertificateProvider;
 import org.apache.hadoop.hdds.scm.client.ScmClient;
 import org.apache.hadoop.hdds.scm.container.ContainerID;
 import org.apache.hadoop.hdds.scm.container.ContainerInfo;
@@ -53,11 +56,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 
 import static org.apache.hadoop.hdds.HddsConfigKeys.HDDS_CONTAINER_TOKEN_ENABLED;
 import static org.apache.hadoop.hdds.HddsConfigKeys.HDDS_CONTAINER_TOKEN_ENABLED_DEFAULT;
@@ -96,8 +99,8 @@ public class ContainerOperationClient implements ScmClient {
     containerSizeB = (int) conf.getStorageSize(OZONE_SCM_CONTAINER_SIZE,
         OZONE_SCM_CONTAINER_SIZE_DEFAULT, StorageUnit.BYTES);
     boolean useRatis = conf.getBoolean(
-        ScmConfigKeys.DFS_CONTAINER_RATIS_ENABLED_KEY,
-        ScmConfigKeys.DFS_CONTAINER_RATIS_ENABLED_DEFAULT);
+        ScmConfigKeys.HDDS_CONTAINER_RATIS_ENABLED_KEY,
+        ScmConfigKeys.HDDS_CONTAINER_RATIS_ENABLED_DEFAULT);
     if (useRatis) {
       replicationFactor = HddsProtos.ReplicationFactor.THREE;
       replicationType = HddsProtos.ReplicationType.RATIS;
@@ -113,11 +116,10 @@ public class ContainerOperationClient implements ScmClient {
       throws IOException {
     XceiverClientManager manager;
     if (OzoneSecurityUtil.isSecurityEnabled(conf)) {
-      List<X509Certificate> caCertificates =
-          HAUtils.buildCAX509List(null, conf);
+      CACertificateProvider caCerts = () -> HAUtils.buildCAX509List(conf);
       manager = new XceiverClientManager(conf,
           conf.getObject(XceiverClientManager.ScmClientConfig.class),
-          caCertificates);
+          new ClientTrustManager(caCerts, null));
     } else {
       manager = new XceiverClientManager(conf);
     }
@@ -183,7 +185,7 @@ public class ContainerOperationClient implements ScmClient {
     }
   }
 
-  private String getEncodedContainerToken(long containerId) throws IOException {
+  public String getEncodedContainerToken(long containerId) throws IOException {
     if (!containerTokenEnabled) {
       return "";
     }
@@ -216,6 +218,11 @@ public class ContainerOperationClient implements ScmClient {
   }
 
   @Override
+  public Map<String, List<ContainerID>> getContainersOnDecomNode(DatanodeDetails dn) throws IOException {
+    return storageContainerLocationClient.getContainersOnDecomNode(dn);
+  }
+
+  @Override
   public List<HddsProtos.Node> queryNode(
       HddsProtos.NodeOperationalState opState,
       HddsProtos.NodeState nodeState,
@@ -226,9 +233,14 @@ public class ContainerOperationClient implements ScmClient {
   }
 
   @Override
-  public List<DatanodeAdminError> decommissionNodes(List<String> hosts)
+  public HddsProtos.Node queryNode(UUID uuid) throws IOException {
+    return storageContainerLocationClient.queryNode(uuid);
+  }
+
+  @Override
+  public List<DatanodeAdminError> decommissionNodes(List<String> hosts, boolean force)
       throws IOException {
-    return storageContainerLocationClient.decommissionNodes(hosts);
+    return storageContainerLocationClient.decommissionNodes(hosts, force);
   }
 
   @Override
@@ -239,9 +251,9 @@ public class ContainerOperationClient implements ScmClient {
 
   @Override
   public List<DatanodeAdminError> startMaintenanceNodes(List<String> hosts,
-      int endHours) throws IOException {
+      int endHours, boolean force) throws IOException {
     return storageContainerLocationClient.startMaintenanceNodes(
-        hosts, endHours);
+        hosts, endHours, force);
   }
 
   @Override
@@ -472,12 +484,19 @@ public class ContainerOperationClient implements ScmClient {
       Optional<Integer> maxDatanodesPercentageToInvolvePerIteration,
       Optional<Long> maxSizeToMovePerIterationInGB,
       Optional<Long> maxSizeEnteringTargetInGB,
-      Optional<Long> maxSizeLeavingSourceInGB)
-      throws IOException {
+      Optional<Long> maxSizeLeavingSourceInGB,
+      Optional<Integer> balancingInterval,
+      Optional<Integer> moveTimeout,
+      Optional<Integer> moveReplicationTimeout,
+      Optional<Boolean> networkTopologyEnable,
+      Optional<String> includeNodes,
+      Optional<String> excludeNodes) throws IOException {
     return storageContainerLocationClient.startContainerBalancer(threshold,
         iterations, maxDatanodesPercentageToInvolvePerIteration,
         maxSizeToMovePerIterationInGB, maxSizeEnteringTargetInGB,
-        maxSizeLeavingSourceInGB);
+        maxSizeLeavingSourceInGB, balancingInterval, moveTimeout,
+        moveReplicationTimeout, networkTopologyEnable, includeNodes,
+        excludeNodes);
   }
 
   @Override
@@ -488,6 +507,11 @@ public class ContainerOperationClient implements ScmClient {
   @Override
   public boolean getContainerBalancerStatus() throws IOException {
     return storageContainerLocationClient.getContainerBalancerStatus();
+  }
+
+  @Override
+  public ContainerBalancerStatusInfoResponseProto getContainerBalancerStatusInfo() throws IOException {
+    return storageContainerLocationClient.getContainerBalancerStatusInfo();
   }
 
   @Override
@@ -519,8 +543,8 @@ public class ContainerOperationClient implements ScmClient {
 
   @Override
   public List<HddsProtos.DatanodeUsageInfoProto> getDatanodeUsageInfo(
-      String ipaddress, String uuid) throws IOException {
-    return storageContainerLocationClient.getDatanodeUsageInfo(ipaddress,
+      String address, String uuid) throws IOException {
+    return storageContainerLocationClient.getDatanodeUsageInfo(address,
         uuid, ClientVersion.CURRENT_VERSION);
   }
 
@@ -550,6 +574,11 @@ public class ContainerOperationClient implements ScmClient {
       String scmId)
       throws IOException {
     return storageContainerLocationClient.decommissionScm(scmId);
+  }
+
+  @Override
+  public String getMetrics(String query) throws IOException {
+    return storageContainerLocationClient.getMetrics(query);
   }
 
 }

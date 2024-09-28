@@ -1,4 +1,4 @@
-/**
+ /**
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -17,8 +17,14 @@
  */
 package org.apache.hadoop.ozone;
 
+import org.apache.commons.lang3.RandomStringUtils;
+import org.apache.commons.lang3.RandomUtils;
+import org.apache.hadoop.hdds.client.BlockID;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.protocol.DatanodeDetails;
+import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos;
+import org.apache.hadoop.hdds.scm.XceiverClientManager;
+import org.apache.hadoop.hdds.scm.XceiverClientSpi;
 import org.apache.hadoop.hdds.scm.container.common.helpers.ContainerWithPipeline;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
 import org.apache.hadoop.hdds.scm.PlacementPolicy;
@@ -27,41 +33,46 @@ import org.apache.hadoop.hdds.scm.ScmConfigKeys;
 import org.apache.hadoop.hdds.scm.cli.ContainerOperationClient;
 import org.apache.hadoop.hdds.scm.client.ScmClient;
 import org.apache.hadoop.hdds.scm.ha.SCMHAUtils;
+import org.apache.hadoop.hdds.scm.pipeline.Pipeline;
 import org.apache.hadoop.hdds.scm.pipeline.PipelineID;
 import org.apache.hadoop.hdds.scm.pipeline.PipelineNotFoundException;
-import org.junit.AfterClass;
-import org.junit.Assert;
-import org.junit.BeforeClass;
-import org.junit.Test;
-import org.junit.Rule;
-import org.junit.rules.TestRule;
-import org.junit.rules.Timeout;
-import org.apache.ozone.test.JUnit5AwareTimeout;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.apache.hadoop.hdds.protocol.DatanodeDetails.Port.Name.REPLICATION;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
+
+import org.apache.hadoop.hdds.scm.protocolPB.StorageContainerLocationProtocolClientSideTranslatorPB;
+import org.apache.hadoop.hdds.scm.storage.ContainerProtocolCalls;
+import org.apache.hadoop.io.IOUtils;
+import org.apache.hadoop.ozone.container.ContainerTestHelper;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * This class tests container operations (TODO currently only supports create)
  * from cblock clients.
  */
+@Timeout(value = 300, unit = TimeUnit.SECONDS)
 public class TestContainerOperations {
-
-  /**
-    * Set a timeout for each test.
-    */
-  @Rule
-  public TestRule timeout = new JUnit5AwareTimeout(Timeout.seconds(300));
-
   private static ScmClient storageClient;
   private static MiniOzoneCluster cluster;
   private static OzoneConfiguration ozoneConf;
+  private static StorageContainerLocationProtocolClientSideTranslatorPB
+      storageContainerLocationClient;
+  private static XceiverClientManager xceiverClientManager;
 
-  @BeforeClass
+  @BeforeAll
   public static void setup() throws Exception {
     ozoneConf = new OzoneConfiguration();
     ozoneConf.setClass(ScmConfigKeys.OZONE_SCM_CONTAINER_PLACEMENT_IMPL_KEY,
@@ -69,13 +80,54 @@ public class TestContainerOperations {
     cluster = MiniOzoneCluster.newBuilder(ozoneConf).setNumDatanodes(3).build();
     storageClient = new ContainerOperationClient(ozoneConf);
     cluster.waitForClusterToBeReady();
+    storageContainerLocationClient =
+        cluster.getStorageContainerLocationClient();
+    xceiverClientManager = new XceiverClientManager(ozoneConf);
   }
 
-  @AfterClass
+  @AfterAll
   public static void cleanup() throws Exception {
     if (cluster != null) {
       cluster.shutdown();
     }
+    IOUtils.cleanupWithLogger(null, storageContainerLocationClient);
+  }
+
+  @Test
+  void testContainerStateMachineIdempotency() throws Exception {
+    ContainerWithPipeline container = storageContainerLocationClient
+        .allocateContainer(HddsProtos.ReplicationType.RATIS,
+            HddsProtos.ReplicationFactor.ONE, OzoneConsts.OZONE);
+    long containerID = container.getContainerInfo().getContainerID();
+    Pipeline pipeline = container.getPipeline();
+    XceiverClientSpi client = xceiverClientManager.acquireClient(pipeline);
+    //create the container
+    ContainerProtocolCalls.createContainer(client, containerID, null);
+    // call create Container again
+    BlockID blockID = ContainerTestHelper.getTestBlockID(containerID);
+    byte[] data =
+        RandomStringUtils.random(RandomUtils.nextInt(0, 1024)).getBytes(UTF_8);
+    ContainerProtos.ContainerCommandRequestProto writeChunkRequest =
+        ContainerTestHelper
+            .getWriteChunkRequest(container.getPipeline(), blockID,
+                data.length);
+    client.sendCommand(writeChunkRequest);
+
+    //Make the write chunk request again without requesting for overWrite
+    client.sendCommand(writeChunkRequest);
+    // Now, explicitly make a putKey request for the block.
+    ContainerProtos.ContainerCommandRequestProto putKeyRequest =
+        ContainerTestHelper
+            .getPutBlockRequest(pipeline, writeChunkRequest.getWriteChunk());
+    client.sendCommand(putKeyRequest).getPutBlock();
+    // send the putBlock again
+    client.sendCommand(putKeyRequest);
+
+    // close container call
+    ContainerProtocolCalls.closeContainer(client, containerID, null);
+    ContainerProtocolCalls.closeContainer(client, containerID, null);
+
+    xceiverClientManager.releaseClient(client, false);
   }
 
   /**
@@ -98,15 +150,10 @@ public class TestContainerOperations {
    */
   @Test
   public void testGetPipeline() throws Exception {
-    try {
-      storageClient.getPipeline(PipelineID.randomId().getProtobuf());
-      Assert.fail("Get Pipeline should fail");
-    } catch (Exception e) {
-      assertTrue(
-          SCMHAUtils.unwrapException(e) instanceof PipelineNotFoundException);
-    }
-
-    Assert.assertFalse(storageClient.listPipelines().isEmpty());
+    Exception e =
+        assertThrows(Exception.class, () -> storageClient.getPipeline(PipelineID.randomId().getProtobuf()));
+    assertInstanceOf(PipelineNotFoundException.class, SCMHAUtils.unwrapException(e));
+    assertThat(storageClient.listPipelines()).isNotEmpty();
   }
 
   @Test
@@ -161,8 +208,7 @@ public class TestContainerOperations {
                       dn.getIpAddress(), dn.getUuidString());
 
       assertEquals(1, usageInfoList.size());
-      assertTrue(usageInfoList.get(0).getContainerCount() >= 0 &&
-              usageInfoList.get(0).getContainerCount() <= 1);
+      assertThat(usageInfoList.get(0).getContainerCount()).isGreaterThanOrEqualTo(0).isLessThanOrEqualTo(1);
       totalContainerCount[(int)usageInfoList.get(0).getContainerCount()]++;
     }
     assertEquals(2, totalContainerCount[0]);

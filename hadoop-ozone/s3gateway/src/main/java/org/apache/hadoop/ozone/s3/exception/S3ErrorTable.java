@@ -64,7 +64,10 @@ public final class S3ErrorTable {
           " or might be invalid", HTTP_FORBIDDEN);
 
   public static final OS3Exception BUCKET_NOT_EMPTY = new OS3Exception(
-      "BucketNotEmpty", "The bucket you tried to delete is not empty.",
+      "BucketNotEmpty", "The bucket you tried to delete is not empty. " +
+      "If you are using --force option to delete all objects in the bucket, " +
+      "please ensure that the bucket layout is OBJECT_STORE or " +
+      "that the bucket is completely empty before delete.",
       HTTP_CONFLICT);
 
   public static final OS3Exception MALFORMED_HEADER = new OS3Exception(
@@ -135,6 +138,12 @@ public final class S3ErrorTable {
   public static final OS3Exception BUCKET_ALREADY_EXISTS = new OS3Exception(
       "BucketAlreadyExists", "The requested bucket name is not available" +
       " as it already exists.", HTTP_CONFLICT);
+
+  public static final OS3Exception INVALID_TAG = new OS3Exception(
+      "InvalidTag", "Your request contains tag input that is not valid.", HTTP_BAD_REQUEST);
+
+  public static final OS3Exception NO_SUCH_TAG_SET = new OS3Exception(
+      "NoSuchTagSet", "The specified tag does not exist.", HTTP_NOT_FOUND);
 
   public static OS3Exception newError(OS3Exception e, String resource) {
     return newError(e, resource, null);

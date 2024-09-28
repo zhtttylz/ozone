@@ -19,11 +19,13 @@ package org.apache.hadoop.hdds.scm.protocol;
 
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.hadoop.hdds.client.ReplicationConfig;
+import org.apache.hadoop.hdds.protocol.DatanodeDetails;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos.DeletedBlocksTransactionInfo;
 import org.apache.hadoop.hdds.protocol.proto.StorageContainerLocationProtocolProtos.DecommissionScmResponseProto;
 import org.apache.hadoop.hdds.protocol.proto.StorageContainerLocationProtocolProtos.StartContainerBalancerResponseProto;
 import org.apache.hadoop.hdds.protocol.proto.StorageContainerLocationProtocolProtos.Type;
+import org.apache.hadoop.hdds.protocol.proto.StorageContainerLocationProtocolProtos.ContainerBalancerStatusInfoResponseProto;
 import org.apache.hadoop.hdds.scm.DatanodeAdminError;
 import org.apache.hadoop.hdds.scm.ScmConfig;
 import org.apache.hadoop.hdds.scm.ScmInfo;
@@ -44,6 +46,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 
 /**
  * ContainerLocationProtocol is used by an HDFS node to find the set of nodes
@@ -53,7 +56,8 @@ import java.util.Set;
       .HDDS_SCM_KERBEROS_PRINCIPAL_KEY)
 public interface StorageContainerLocationProtocol extends Closeable {
 
-  @SuppressWarnings("checkstyle:ConstantName")
+  // Accessed and checked via reflection in Hadoop RPC - changing it is incompatible
+  @SuppressWarnings({"checkstyle:ConstantName", "unused"})
   /**
    * Version 1: Initial version.
    */
@@ -220,6 +224,14 @@ public interface StorageContainerLocationProtocol extends Closeable {
   void deleteContainer(long containerID) throws IOException;
 
   /**
+   * Gets the list of underReplicated and unClosed containers on a decommissioning node.
+   *
+   * @param dn - Datanode detail
+   * @return Lists of underReplicated and unClosed containers
+   */
+  Map<String, List<ContainerID>> getContainersOnDecomNode(DatanodeDetails dn) throws IOException;
+
+  /**
    *  Queries a list of Node Statuses. Passing a null for either opState or
    *  state acts like a wildcard returning all nodes in that state.
    * @param opState The node operational state
@@ -232,14 +244,16 @@ public interface StorageContainerLocationProtocol extends Closeable {
       HddsProtos.NodeState state, HddsProtos.QueryScope queryScope,
       String poolName, int clientVersion) throws IOException;
 
-  List<DatanodeAdminError> decommissionNodes(List<String> nodes)
+  HddsProtos.Node queryNode(UUID uuid) throws IOException;
+
+  List<DatanodeAdminError> decommissionNodes(List<String> nodes, boolean force)
       throws IOException;
 
   List<DatanodeAdminError> recommissionNodes(List<String> nodes)
       throws IOException;
 
   List<DatanodeAdminError> startMaintenanceNodes(List<String> nodes,
-      int endInHours) throws IOException;
+      int endInHours, boolean force) throws IOException;
 
   /**
    * Close a container.
@@ -323,7 +337,7 @@ public interface StorageContainerLocationProtocol extends Closeable {
    * considered to be failed if it has been sent more than MAX_RETRY limit
    * and its count is reset to -1.
    *
-   * @param count Maximum num of returned transactions, if < 0. return all.
+   * @param count Maximum num of returned transactions, if {@literal < 0}. return all.
    * @param startTxId The least transaction id to start with.
    * @return a list of failed deleted block transactions.
    * @throws IOException
@@ -389,13 +403,20 @@ public interface StorageContainerLocationProtocol extends Closeable {
    * @return {@link StartContainerBalancerResponseProto} that contains the
    * start status and an optional message.
    */
+  @SuppressWarnings("checkstyle:parameternumber")
   StartContainerBalancerResponseProto startContainerBalancer(
       Optional<Double> threshold,
       Optional<Integer> iterations,
       Optional<Integer> maxDatanodesPercentageToInvolvePerIteration,
       Optional<Long> maxSizeToMovePerIterationInGB,
       Optional<Long> maxSizeEnteringTargetInGB,
-      Optional<Long> maxSizeLeavingSourceInGB) throws IOException;
+      Optional<Long> maxSizeLeavingSourceInGB,
+      Optional<Integer> balancingInterval,
+      Optional<Integer> moveTimeout,
+      Optional<Integer> moveReplicationTimeout,
+      Optional<Boolean> networkTopologyEnable,
+      Optional<String> includeNodes,
+      Optional<String> excludeNodes) throws IOException;
 
   /**
    * Stop ContainerBalancer.
@@ -409,10 +430,12 @@ public interface StorageContainerLocationProtocol extends Closeable {
    */
   boolean getContainerBalancerStatus() throws IOException;
 
+  ContainerBalancerStatusInfoResponseProto getContainerBalancerStatusInfo() throws IOException;
+
   /**
-   * Get Datanode usage information by ip or uuid.
+   * Get Datanode usage information by ip or hostname or uuid.
    *
-   * @param ipaddress datanode IP address String
+   * @param address datanode IP address or Hostname String
    * @param uuid datanode UUID String
    * @param clientVersion Client's version number
    * @return List of DatanodeUsageInfoProto. Each element contains info such as
@@ -421,7 +444,7 @@ public interface StorageContainerLocationProtocol extends Closeable {
    * @see org.apache.hadoop.ozone.ClientVersion
    */
   List<HddsProtos.DatanodeUsageInfoProto> getDatanodeUsageInfo(
-      String ipaddress, String uuid, int clientVersion) throws IOException;
+      String address, String uuid, int clientVersion) throws IOException;
 
   /**
    * Get usage information of most or least used datanodes.
@@ -461,4 +484,6 @@ public interface StorageContainerLocationProtocol extends Closeable {
 
   DecommissionScmResponseProto decommissionScm(
       String scmId) throws IOException;
+
+  String getMetrics(String query) throws IOException;
 }

@@ -19,16 +19,15 @@ package org.apache.hadoop.ozone.debug;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.StringWriter;
-import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 
-import org.junit.AfterClass;
-import org.junit.BeforeClass;
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.rules.TestRule;
-import org.junit.rules.Timeout;
-import org.apache.ozone.test.JUnit5AwareTimeout;
+import org.apache.hadoop.fs.LeaseRecoverable;
+import org.apache.hadoop.hdds.scm.OzoneClientConfig;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import picocli.CommandLine;
 
 import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
@@ -43,26 +42,24 @@ import org.apache.hadoop.ozone.OzoneConfigKeys;
 import org.apache.hadoop.ozone.TestDataUtil;
 import org.apache.hadoop.ozone.client.OzoneBucket;
 import org.apache.hadoop.ozone.client.OzoneClient;
-import org.apache.hadoop.ozone.om.exceptions.OMException;
 import org.apache.hadoop.ozone.om.helpers.BucketLayout;
 
 import static org.apache.hadoop.ozone.OzoneConsts.OZONE_OFS_URI_SCHEME;
 import static org.apache.hadoop.ozone.OzoneConsts.OZONE_URI_DELIMITER;
 import static org.apache.hadoop.ozone.om.OMConfigKeys.OZONE_OM_ADDRESS_KEY;
-import static org.junit.Assert.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Test cases for LeaseRecoverer.
  */
+@Timeout(value = 120000, unit = TimeUnit.MILLISECONDS)
 public class TestLeaseRecoverer {
   private static MiniOzoneCluster cluster = null;
   private static OzoneConfiguration conf;
   private static OzoneBucket fsoOzoneBucket;
   private static OzoneClient client;
-
-  @Rule
-  public TestRule timeout = new JUnit5AwareTimeout(new Timeout(120000));
 
   /**
    * Create a MiniDFSCluster for testing.
@@ -70,16 +67,18 @@ public class TestLeaseRecoverer {
    *
    * @throws IOException
    */
-  @BeforeClass
+  @BeforeAll
   public static void init() throws Exception {
     conf = new OzoneConfiguration();
+    conf.setBoolean(OzoneConfigKeys.OZONE_HBASE_ENHANCEMENTS_ALLOWED, true);
+    conf.setBoolean("ozone.client.hbase.enhancements.allowed", true);
     conf.setBoolean(OzoneConfigKeys.OZONE_FS_HSYNC_ENABLED, true);
-    String clusterId = UUID.randomUUID().toString();
-    String scmId = UUID.randomUUID().toString();
-    String omId = UUID.randomUUID().toString();
+    conf.set(OzoneConfigKeys.OZONE_OM_LEASE_SOFT_LIMIT, "0s");
+    OzoneClientConfig clientConfig = conf.getObject(OzoneClientConfig.class);
+    clientConfig.setStreamBufferFlushDelay(false);
+    conf.setFromObject(clientConfig);
     // Set the number of keys to be processed during batch operate.
-    cluster = MiniOzoneCluster.newBuilder(conf).setClusterId(clusterId)
-        .setScmId(scmId).setOmId(omId).build();
+    cluster = MiniOzoneCluster.newBuilder(conf).build();
     cluster.waitForClusterToBeReady();
     client = cluster.newClient();
 
@@ -88,7 +87,7 @@ public class TestLeaseRecoverer {
         .createVolumeAndBucket(client, BucketLayout.FILE_SYSTEM_OPTIMIZED);
   }
 
-  @AfterClass
+  @AfterAll
   public static void teardownClass() {
     IOUtils.closeQuietly(client);
     if (cluster != null) {
@@ -131,20 +130,27 @@ public class TestLeaseRecoverer {
     // make sure file is visible and closed
     FileStatus fileStatus = fs.getFileStatus(file);
     assertEquals(dataSize, fileStatus.getLen());
-    // make sure the writer can not write again.
-    // TODO: write does not fail here. Looks like a bug. HDDS-8439 to fix it.
+    // write data
     os.write(data);
+    // flush should fail since flush will call writeChunk and putBlock
+    assertThrows(IOException.class, os::flush);
+
     fileStatus = fs.getFileStatus(file);
     assertEquals(dataSize, fileStatus.getLen());
     // make sure hsync fails
-    assertThrows(OMException.class, os::hsync);
+    assertThrows(IOException.class, os::hsync);
     // make sure length remains the same
     fileStatus = fs.getFileStatus(file);
     assertEquals(dataSize, fileStatus.getLen());
-    // make sure close fails
-    assertThrows(OMException.class, os::close);
+    // close succeeds since it's already closed in failure handling of flush
+    assertTrue(((LeaseRecoverable)fs).isFileClosed(file));
+    os.close();
     // make sure length remains the same
     fileStatus = fs.getFileStatus(file);
     assertEquals(dataSize, fileStatus.getLen());
+
+    // recover the same file second time should succeed
+    cmd.execute(args);
+    assertEquals("", stderr.toString());
   }
 }

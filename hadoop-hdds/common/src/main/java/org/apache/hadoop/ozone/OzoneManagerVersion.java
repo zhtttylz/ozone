@@ -40,11 +40,17 @@ public enum OzoneManagerVersion implements ComponentVersion {
   LIGHTWEIGHT_LIST_KEYS(4, "OzoneManager version that supports lightweight"
       + " listKeys API."),
 
+  OBJECT_TAG(5, "OzoneManager version that supports object tags"),
+
+  ATOMIC_REWRITE_KEY(6, "OzoneManager version that supports rewriting key as atomic operation"),
+  HBASE_SUPPORT(7, "OzoneManager version that supports HBase integration"),
+  LIGHTWEIGHT_LIST_STATUS(8, "OzoneManager version that supports lightweight"
+      + " listStatus API."),
+
   FUTURE_VERSION(-1, "Used internally in the client when the server side is "
       + " newer and an unknown server version has arrived to the client.");
 
   public static final OzoneManagerVersion CURRENT = latest();
-  public static final int CURRENT_VERSION = CURRENT.version;
 
   private static final Map<Integer, OzoneManagerVersion> BY_PROTO_VALUE =
       Arrays.stream(values())

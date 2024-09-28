@@ -44,6 +44,7 @@ import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.conf.StorageUnit;
 import org.apache.hadoop.hdds.utils.LegacyHadoopConfigurationSource;
 import org.apache.hadoop.ozone.OzoneConfigKeys;
+import org.apache.hadoop.ozone.OzoneFsServerDefaults;
 import org.apache.hadoop.ozone.client.io.SelectorOutputStream;
 import org.apache.hadoop.ozone.om.exceptions.OMException;
 import org.apache.hadoop.ozone.om.helpers.OzoneFSUtils;
@@ -146,9 +147,6 @@ public class BasicOzoneFileSystem extends FileSystem {
         OzoneConfigKeys.OZONE_FS_DATASTREAM_AUTO_THRESHOLD,
         OzoneConfigKeys.OZONE_FS_DATASTREAM_AUTO_THRESHOLD_DEFAULT,
         StorageUnit.BYTES);
-    hsyncEnabled = conf.getBoolean(
-        OzoneConfigKeys.OZONE_FS_HSYNC_ENABLED,
-        OZONE_FS_HSYNC_ENABLED_DEFAULT);
     setConf(conf);
     Preconditions.checkNotNull(name.getScheme(),
         "No scheme provided in %s", name);
@@ -196,6 +194,8 @@ public class BasicOzoneFileSystem extends FileSystem {
       LOG.trace("Ozone URI for ozfs initialization is {}", uri);
 
       ConfigurationSource source = getConfSource();
+      this.hsyncEnabled = OzoneFSUtils.canEnableHsync(source, true);
+      LOG.debug("hsyncEnabled = {}", hsyncEnabled);
       this.adapter =
           createAdapter(source, bucketStr,
               volumeStr, omHost, omPort);
@@ -722,6 +722,12 @@ public class BasicOzoneFileSystem extends FileSystem {
   }
 
   @Override
+  public Path getHomeDirectory() {
+    return makeQualified(new Path(OZONE_USER_DIR + "/"
+        + this.userName));
+  }
+
+  @Override
   public Token<?> getDelegationToken(String renewer) throws IOException {
     return adapter.getDelegationToken(renewer);
   }
@@ -860,6 +866,11 @@ public class BasicOzoneFileSystem extends FileSystem {
   }
 
   @Override
+  public OzoneFsServerDefaults getServerDefaults() throws IOException {
+    return adapter.getServerDefaults();
+  }
+
+  @Override
   public void copyFromLocalFile(boolean delSrc, boolean overwrite, Path[] srcs,
       Path dst) throws IOException {
     incrementCounter(Statistic.INVOCATION_COPY_FROM_LOCAL_FILE);
@@ -952,6 +963,12 @@ public class BasicOzoneFileSystem extends FileSystem {
         .createSnapshot(pathToKey(path), snapshotName);
     return new Path(OzoneFSUtils.trimPathToDepth(path, PATH_DEPTH_TO_BUCKET),
         OM_SNAPSHOT_INDICATOR + OZONE_URI_DELIMITER + snapshot);
+  }
+
+  @Override
+  public void renameSnapshot(Path path, String snapshotOldName, String snapshotNewName)
+      throws IOException {
+    getAdapter().renameSnapshot(pathToKey(path), snapshotOldName, snapshotNewName);
   }
 
   @Override
@@ -1277,7 +1294,7 @@ public class BasicOzoneFileSystem extends FileSystem {
     FileStatus fileStatus = constructFileStatus(fileStatusAdapter);
 
     BlockLocation[] blockLocations = fileStatusAdapter.getBlockLocations();
-    if (blockLocations == null || blockLocations.length == 0) {
+    if (blockLocations.length == 0) {
       return fileStatus;
     }
     return new LocatedFileStatus(fileStatus, blockLocations);

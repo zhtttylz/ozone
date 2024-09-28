@@ -19,16 +19,12 @@
 package org.apache.hadoop.ozone;
 
 import org.apache.hadoop.hdds.annotation.InterfaceAudience;
-import org.apache.hadoop.security.UserGroupInformation;
-import org.apache.ratis.thirdparty.io.grpc.Context;
-import org.apache.ratis.thirdparty.io.grpc.Metadata;
 
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.regex.Pattern;
-
-import static org.apache.ratis.thirdparty.io.grpc.Metadata.ASCII_STRING_MARSHALLER;
 
 /**
  * Set of constants used in Ozone implementation.
@@ -44,7 +40,6 @@ public final class OzoneConsts {
   public static final String SCM_CERT_SERIAL_ID = "scmCertSerialId";
   public static final String PRIMARY_SCM_NODE_ID = "primaryScmNodeId";
 
-  public static final String OZONE_SIMPLE_ROOT_USER = "root";
   public static final String OZONE_SIMPLE_HDFS_USER = "hdfs";
 
   public static final String STORAGE_ID = "storageID";
@@ -80,12 +75,6 @@ public final class OzoneConsts {
       "EEE, dd MMM yyyy HH:mm:ss zzz";
   public static final String OZONE_TIME_ZONE = "GMT";
 
-  public static final String OZONE_COMPONENT = "component";
-  public static final String OZONE_FUNCTION  = "function";
-  public static final String OZONE_RESOURCE = "resource";
-  public static final String OZONE_USER = "user";
-  public static final String OZONE_REQUEST = "request";
-
   // OM Http server endpoints
   public static final String OZONE_OM_SERVICE_LIST_HTTP_ENDPOINT =
       "/serviceList";
@@ -101,37 +90,33 @@ public final class OzoneConsts {
   public static final String OZONE_HTTP_SCHEME = "http";
   public static final String OZONE_URI_DELIMITER = "/";
   public static final String OZONE_ROOT = OZONE_URI_DELIMITER;
+  public static final Path ROOT_PATH = Paths.get(OZONE_ROOT);
 
 
   public static final String CONTAINER_EXTENSION = ".container";
-  public static final String CONTAINER_META = ".meta";
-
-  // Refer to {@link ContainerReader} for container storage layout on disk.
-  public static final String CONTAINER_PREFIX  = "containers";
   public static final String CONTAINER_META_PATH = "metadata";
   public static final String CONTAINER_TEMPORARY_CHUNK_PREFIX = "tmp";
   public static final String CONTAINER_CHUNK_NAME_DELIMITER = ".";
-  public static final String CONTAINER_ROOT_PREFIX = "repository";
 
   public static final String FILE_HASH = "SHA-256";
   public static final String MD5_HASH = "MD5";
   public static final String CHUNK_OVERWRITE = "OverWriteRequested";
 
   public static final int CHUNK_SIZE = 1 * 1024 * 1024; // 1 MB
+  // for client and DataNode to label a block contains a incremental chunk list.
+  public static final String INCREMENTAL_CHUNK_LIST = "incremental";
   public static final long KB = 1024L;
   public static final long MB = KB * 1024L;
   public static final long GB = MB * 1024L;
   public static final long TB = GB * 1024L;
+  public static final long PB = TB * 1024L;
+  public static final long EB = PB * 1024L;
 
   /**
    * level DB names used by SCM and data nodes.
    */
   public static final String CONTAINER_DB_SUFFIX = "container.db";
-  public static final String PIPELINE_DB_SUFFIX = "pipeline.db";
-  public static final String CRL_DB_SUFFIX = "crl.db";
   public static final String DN_CONTAINER_DB = "-dn-" + CONTAINER_DB_SUFFIX;
-  public static final String DN_CRL_DB = "dn-" + CRL_DB_SUFFIX;
-  public static final String CRL_DB_DIRECTORY_NAME = "crl";
   public static final String OM_DB_NAME = "om.db";
   public static final String SCM_DB_NAME = "scm.db";
   public static final String OM_DB_BACKUP_PREFIX = "om.db.backup.";
@@ -150,17 +135,6 @@ public final class OzoneConsts {
       "#RANGEROZONESERVICEVERSION";
 
   public static final String MULTIPART_FORM_DATA_BOUNDARY = "---XXX";
-
-  /**
-   * Supports Bucket Versioning.
-   */
-  public enum Versioning {
-    NOT_DEFINED, ENABLED, DISABLED;
-
-    public static Versioning getVersioning(boolean versioning) {
-      return versioning ? ENABLED : DISABLED;
-    }
-  }
 
   // Block ID prefixes used in datanode containers.
   public static final String DELETING_KEY_PREFIX = "#deleting#";
@@ -200,21 +174,14 @@ public final class OzoneConsts {
   public static final String OM_USER_PREFIX = "$";
   public static final String OM_S3_PREFIX = "S3:";
   public static final String OM_S3_CALLER_CONTEXT_PREFIX = "S3Auth:S3G|";
-  public static final String OM_S3_VOLUME_PREFIX = "s3";
   public static final String OM_S3_SECRET = "S3Secret:";
   public static final String OM_PREFIX = "Prefix:";
-  public static final String OM_TENANT = "Tenant:";
 
   /**
    *   Max chunk size limit.
    */
   public static final int OZONE_SCM_CHUNK_MAX_SIZE = 32 * 1024 * 1024;
 
-
-  /**
-   * Max OM Quota size of Long.MAX_VALUE.
-   */
-  public static final long MAX_QUOTA_IN_BYTES = Long.MAX_VALUE;
 
   /**
    * Quota RESET default is -1, which means quota is not set.
@@ -228,35 +195,19 @@ public final class OzoneConsts {
   public enum Units { TB, GB, MB, KB, B }
 
   /**
-   * Max number of keys returned per list buckets operation.
-   */
-  public static final int MAX_LISTBUCKETS_SIZE  = 1024;
-
-  /**
-   * Max number of keys returned per list keys operation.
-   */
-  public static final int MAX_LISTKEYS_SIZE  = 1024;
-
-  /**
-   * Max number of volumes returned per list volumes operation.
-   */
-  public static final int MAX_LISTVOLUMES_SIZE = 1024;
-
-  public static final int INVALID_PORT = -1;
-
-  /**
    * Object ID to identify reclaimable uncommitted blocks.
    */
   public static final long OBJECT_ID_RECLAIM_BLOCKS = 0L;
-
 
   /**
    * Default SCM Datanode ID file name.
    */
   public static final String OZONE_SCM_DATANODE_ID_FILE_DEFAULT = "datanode.id";
 
-  // The ServiceListJSONServlet context attribute where OzoneManager
-  // instance gets stored.
+  /**
+   * The ServiceListJSONServlet context attribute where OzoneManager
+   * instance gets stored.
+   */
   public static final String OM_CONTEXT_ATTRIBUTE = "ozone.om";
 
   public static final String SCM_CONTEXT_ATTRIBUTE = "ozone.scm";
@@ -321,12 +272,8 @@ public final class OzoneConsts {
   public static final String KEY_PREFIX = "keyPrefix";
   public static final String ACL = "acl";
   public static final String ACLS = "acls";
-  public static final String USER_ACL = "userAcl";
-  public static final String ADD_ACLS = "addAcls";
-  public static final String REMOVE_ACLS = "removeAcls";
   public static final String MAX_NUM_OF_BUCKETS = "maxNumOfBuckets";
   public static final String HAS_SNAPSHOT = "hasSnapshot";
-  public static final String TO_KEY_NAME = "toKeyName";
   public static final String STORAGE_TYPE = "storageType";
   public static final String RESOURCE_TYPE = "resourceType";
   public static final String IS_VERSION_ENABLED = "isVersionEnabled";
@@ -336,7 +283,6 @@ public final class OzoneConsts {
   public static final String REPLICATION_TYPE = "replicationType";
   public static final String REPLICATION_FACTOR = "replicationFactor";
   public static final String REPLICATION_CONFIG = "replicationConfig";
-  public static final String KEY_LOCATION_INFO = "keyLocationInfo";
   public static final String MULTIPART_LIST = "multipartList";
   public static final String UPLOAD_ID = "uploadID";
   public static final String PART_NUMBER_MARKER = "partNumberMarker";
@@ -357,6 +303,7 @@ public final class OzoneConsts {
   public static final String BUCKET_LAYOUT = "bucketLayout";
   public static final String TENANT = "tenant";
   public static final String USER_PREFIX = "userPrefix";
+  public static final String REWRITE_GENERATION = "rewriteGeneration";
 
   // For multi-tenancy
   public static final String TENANT_ID_USERNAME_DELIMITER = "$";
@@ -381,16 +328,6 @@ public final class OzoneConsts {
   // https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html
   public static final int MAXIMUM_NUMBER_OF_PARTS_PER_UPLOAD = 10000;
 
-  // GRPC block token metadata header and context key
-  public static final String OZONE_BLOCK_TOKEN = "blocktoken";
-  public static final Context.Key<UserGroupInformation> UGI_CTX_KEY =
-      Context.key("UGI");
-
-  public static final Metadata.Key<String> OBT_METADATA_KEY =
-      Metadata.Key.of(OZONE_BLOCK_TOKEN, ASCII_STRING_MARSHALLER);
-  public static final Metadata.Key<String> USER_METADATA_KEY =
-      Metadata.Key.of(OZONE_USER, ASCII_STRING_MARSHALLER);
-
   public static final String RPC_PORT = "RPC";
 
   // Default OMServiceID for OM Ratis servers to use as RaftGroupId
@@ -400,23 +337,22 @@ public final class OzoneConsts {
   public static final String JAVA_TMP_DIR = "java.io.tmpdir";
   public static final String LOCALHOST = "localhost";
 
-
-  public static final int S3_BUCKET_MIN_LENGTH = 3;
-  public static final int S3_BUCKET_MAX_LENGTH = 64;
-
   public static final int S3_SECRET_KEY_MIN_LENGTH = 8;
 
   public static final int S3_REQUEST_HEADER_METADATA_SIZE_LIMIT_KB = 2;
 
   /** Metadata stored in OmKeyInfo. */
   public static final String HSYNC_CLIENT_ID = "hsyncClientId";
+  public static final String LEASE_RECOVERY = "leaseRecovery";
+  public static final String DELETED_HSYNC_KEY = "deletedHsyncKey";
+  public static final String OVERWRITTEN_HSYNC_KEY = "overwrittenHsyncKey";
+  public static final String FORCE_LEASE_RECOVERY_ENV = "OZONE.CLIENT.RECOVER.LEASE.FORCE";
 
   //GDPR
   public static final String GDPR_FLAG = "gdprEnabled";
   public static final String GDPR_ALGORITHM_NAME = "AES";
   public static final int GDPR_DEFAULT_RANDOM_SECRET_LENGTH = 16;
   public static final Charset GDPR_CHARSET = StandardCharsets.UTF_8;
-  public static final String GDPR_LENGTH = "length";
   public static final String GDPR_SECRET = "secret";
   public static final String GDPR_ALGORITHM = "algorithm";
 
@@ -427,7 +363,7 @@ public final class OzoneConsts {
    * contains illegal characters when creating/renaming key.
    *
    * Avoid the following characters in a key name:
-   * "\", "{", "}", "<", ">", "^", "%", "~", "#", "|", "`", "[", "]", Quotation
+   * {@literal "\", "{", "}", "<", ">", "^", "%", "~", "#", "|", "`", "[", "]"}, Quotation
    * marks and Non-printable ASCII characters (128–255 decimal characters).
    * https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-keys.html
    */
@@ -444,13 +380,6 @@ public final class OzoneConsts {
 
   public static final String CONTAINER_DB_TYPE_ROCKSDB = "RocksDB";
 
-  // SCM HA
-  public static final String SCM_SERVICE_ID_DEFAULT = "scmServiceIdDefault";
-
-  // SCM Ratis snapshot file to store the last applied index
-  public static final String SCM_RATIS_SNAPSHOT_INDEX = "scmRatisSnapshotIndex";
-
-  public static final String SCM_RATIS_SNAPSHOT_TERM = "scmRatisSnapshotTerm";
   // An on-disk transient marker file used when replacing DB with checkpoint
   public static final String DB_TRANSIENT_MARKER = "dbInconsistentMarker";
 
@@ -474,9 +403,6 @@ public final class OzoneConsts {
   public static final String SCM_DUMMY_NODEID = "scmNodeId";
   public static final String SCM_DUMMY_SERVICE_ID = "scmServiceId";
 
-  // CRL Sequence Id
-  public static final String CRL_SEQUENCE_ID_KEY = "CRL_SEQUENCE_ID";
-
   public static final String SCM_CA_PATH = "ca";
   public static final String SCM_CA_CERT_STORAGE_DIR = "scm";
   public static final String SCM_SUB_CA_PATH = "sub-ca";
@@ -486,9 +412,9 @@ public final class OzoneConsts {
 
   // %s to distinguish different certificates
   public static final String SCM_SUB_CA = "scm-sub";
-  public static final String SCM_SUB_CA_PREFIX = SCM_SUB_CA + "-%s@";
+  public static final String SCM_SUB_CA_PREFIX = SCM_SUB_CA + "@";
   public static final String SCM_ROOT_CA = "scm";
-  public static final String SCM_ROOT_CA_PREFIX = SCM_ROOT_CA + "-%s@";
+  public static final String SCM_ROOT_CA_PREFIX = SCM_ROOT_CA + "@";
 
   // Layout Version written into Meta Table ONLY during finalization.
   public static final String LAYOUT_VERSION_KEY = "#LAYOUTVERSION";
@@ -611,4 +537,9 @@ public final class OzoneConsts {
    */
   public static final String COMPACTION_LOG_TABLE =
       "compactionLogTable";
+
+  /**
+   * S3G multipart upload request's ETag header key.
+   */
+  public static final String ETAG = "ETag";
 }

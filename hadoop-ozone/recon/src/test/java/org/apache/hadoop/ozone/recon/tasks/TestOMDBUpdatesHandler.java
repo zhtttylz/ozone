@@ -21,13 +21,13 @@ package org.apache.hadoop.ozone.recon.tasks;
 import static org.apache.hadoop.ozone.recon.tasks.OMDBUpdateEvent.OMDBUpdateAction.PUT;
 import static org.apache.hadoop.ozone.recon.tasks.OMDBUpdateEvent.OMDBUpdateAction.UPDATE;
 import static org.apache.hadoop.ozone.recon.tasks.OMDBUpdateEvent.OMDBUpdateAction.DELETE;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 
-import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
@@ -42,17 +42,18 @@ import org.apache.hadoop.io.Text;
 import org.apache.hadoop.ozone.om.OMMetadataManager;
 import org.apache.hadoop.ozone.om.OmMetadataManagerImpl;
 import org.apache.hadoop.ozone.om.codec.OMDBDefinition;
+import org.apache.hadoop.ozone.om.helpers.RepeatedOmKeyInfo;
+import org.apache.hadoop.ozone.om.helpers.OmDirectoryInfo;
 import org.apache.hadoop.ozone.om.helpers.BucketLayout;
 import org.apache.hadoop.ozone.om.helpers.OmBucketInfo;
 import org.apache.hadoop.ozone.om.helpers.OmKeyInfo;
 import org.apache.hadoop.ozone.om.helpers.OmVolumeArgs;
 import org.apache.hadoop.hdds.utils.db.RDBStore;
 import org.apache.hadoop.ozone.security.OzoneTokenIdentifier;
-import org.jetbrains.annotations.NotNull;
-import org.junit.Before;
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.rules.TemporaryFolder;
+import jakarta.annotation.Nonnull;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.rocksdb.RocksDBException;
 import org.rocksdb.TransactionLogIterator;
 import org.rocksdb.WriteBatch;
@@ -62,30 +63,29 @@ import org.rocksdb.WriteBatch;
  */
 public class TestOMDBUpdatesHandler {
 
-  @Rule
-  public TemporaryFolder folder = new TemporaryFolder();
+  @TempDir
+  private Path temporaryFolder;
 
   private OMMetadataManager omMetadataManager;
   private OMMetadataManager reconOmMetadataManager;
   private OMDBDefinition omdbDefinition = new OMDBDefinition();
   private Random random = new Random();
 
-  private OzoneConfiguration createNewTestPath() throws IOException {
+  private OzoneConfiguration createNewTestPath(String folderName)
+      throws IOException {
     OzoneConfiguration configuration = new OzoneConfiguration();
-    File newFolder = folder.newFolder();
-    if (!newFolder.exists()) {
-      assertTrue(newFolder.mkdirs());
-    }
-    ServerUtils.setOzoneMetaDirPath(configuration, newFolder.toString());
+    Path tempDirPath =
+        Files.createDirectory(temporaryFolder.resolve(folderName));
+    ServerUtils.setOzoneMetaDirPath(configuration, tempDirPath.toString());
     return configuration;
   }
 
-  @Before
+  @BeforeEach
   public void setUp() throws Exception {
-    OzoneConfiguration configuration = createNewTestPath();
+    OzoneConfiguration configuration = createNewTestPath("config");
     omMetadataManager = new OmMetadataManagerImpl(configuration, null);
 
-    OzoneConfiguration reconConfiguration = createNewTestPath();
+    OzoneConfiguration reconConfiguration = createNewTestPath("reconConfig");
     reconOmMetadataManager = new OmMetadataManagerImpl(reconConfiguration,
         null);
   }
@@ -152,8 +152,6 @@ public class TestOMDBUpdatesHandler {
   public void testDelete() throws Exception {
     // Write 1 volume, 1 key into source and target OM DBs.
     String volumeKey = omMetadataManager.getVolumeKey("sampleVol");
-    String nonExistVolumeKey = omMetadataManager
-        .getVolumeKey("nonExistingVolume");
     OmVolumeArgs args =
         OmVolumeArgs.newBuilder()
             .setVolume("sampleVol")
@@ -183,7 +181,9 @@ public class TestOMDBUpdatesHandler {
     OMDBUpdatesHandler omdbUpdatesHandler = captureEvents(writeBatches);
 
     List<OMDBUpdateEvent> events = omdbUpdatesHandler.getEvents();
-    assertEquals(4, events.size());
+
+    // Assert for non existent keys, no events will be captured and handled.
+    assertEquals(2, events.size());
 
     OMDBUpdateEvent keyEvent = events.get(0);
     assertEquals(OMDBUpdateEvent.OMDBUpdateAction.DELETE, keyEvent.getAction());
@@ -196,19 +196,6 @@ public class TestOMDBUpdatesHandler {
     assertNotNull(volEvent.getValue());
     OmVolumeArgs volumeInfo = (OmVolumeArgs) volEvent.getValue();
     assertEquals("sampleVol", volumeInfo.getVolume());
-
-    // Assert the values of non existent keys are set to null.
-    OMDBUpdateEvent nonExistKey = events.get(2);
-    assertEquals(OMDBUpdateEvent.OMDBUpdateAction.DELETE,
-        nonExistKey.getAction());
-    assertEquals("/sampleVol/bucketOne/key_two", nonExistKey.getKey());
-    assertNull(nonExistKey.getValue());
-
-    OMDBUpdateEvent nonExistVolume = events.get(3);
-    assertEquals(OMDBUpdateEvent.OMDBUpdateAction.DELETE,
-        nonExistVolume.getAction());
-    assertEquals(nonExistVolumeKey, nonExistVolume.getKey());
-    assertNull(nonExistVolume.getValue());
   }
 
   @Test
@@ -301,6 +288,71 @@ public class TestOMDBUpdatesHandler {
         ((OmKeyInfo)keyPut2.getOldValue()).getKeyName());
   }
 
+  /**
+   * Test to verify that events with duplicate keys in different tables
+   * (FileTable and DirectoryTable) are handled correctly without causing
+   * ClassCastException or event conflicts.
+   *
+   * This test simulates creating a file, deleting the file, and then creating
+   * a directory with the same name under the same parent ID in different tables.
+   * It ensures that the events are correctly processed and stored in the
+   * `omdbLatestUpdateEvents` map without causing any type mismatches or
+   * exceptions.
+   *
+   * @throws Exception if any error occurs during the test execution.
+   */
+  @Test
+  public void testEventsHavingDuplicateRocksDBKey() throws Exception {
+    // Step 1: Create a file with the name "sameName" in the fileTable
+    OmKeyInfo fileKeyInfo = getOmKeyInfo("sampleVol", "bucketOne", "sameName");
+    omMetadataManager.getFileTable().put("/sampleVol/bucketOne/parentId/sameName", fileKeyInfo);
+
+    // Step 2: Delete the file by adding its information to the deletedTable
+    RepeatedOmKeyInfo repeatedKeyInfo = new RepeatedOmKeyInfo(fileKeyInfo);
+    omMetadataManager.getDeletedTable().put("/sampleVol/bucketOne/parentId/sameName", repeatedKeyInfo);
+
+    // Step 3: Create a directory with the same name "sameName" in the directoryTable
+    OmDirectoryInfo dirInfo = OmDirectoryInfo.newBuilder()
+        .setName("sameName")
+        .setParentObjectID(fileKeyInfo.getParentObjectID())
+        .setObjectID(fileKeyInfo.getObjectID())
+        .setCreationTime(System.currentTimeMillis())
+        .setModificationTime(System.currentTimeMillis())
+        .build();
+    omMetadataManager.getDirectoryTable().put("/sampleVol/bucketOne/parentId/sameName", dirInfo);
+
+    // Capture the events from the OM Metadata Manager
+    List<byte[]> writeBatches = getBytesFromOmMetaManager(0);
+    OMDBUpdatesHandler omdbUpdatesHandler = captureEvents(writeBatches);
+
+    // Retrieve the captured events and assert the correct number of events
+    List<OMDBUpdateEvent> events = omdbUpdatesHandler.getEvents();
+    // Verify no events were discarded
+    assertEquals(3, events.size());
+
+    // Validate the file creation event
+    OMDBUpdateEvent filePutEvent = events.get(0);
+    assertEquals(PUT, filePutEvent.getAction());
+    assertEquals("/sampleVol/bucketOne/parentId/sameName", filePutEvent.getKey());
+    assertEquals("sameName", ((OmKeyInfo) filePutEvent.getValue()).getKeyName());
+    assertNull(filePutEvent.getOldValue());
+
+    // Validate the file deletion event
+    OMDBUpdateEvent fileDeleteEvent = events.get(1);
+    assertEquals(PUT, fileDeleteEvent.getAction());
+    assertEquals("/sampleVol/bucketOne/parentId/sameName", fileDeleteEvent.getKey());
+    assertEquals("sameName",
+        ((RepeatedOmKeyInfo) fileDeleteEvent.getValue()).getOmKeyInfoList().get(0).getKeyName());
+
+    // Validate the directory creation event
+    OMDBUpdateEvent dirPutEvent = events.get(2);
+    assertEquals(PUT, dirPutEvent.getAction());
+    assertEquals("/sampleVol/bucketOne/parentId/sameName", dirPutEvent.getKey());
+    assertEquals("sameName", ((OmDirectoryInfo) dirPutEvent.getValue()).getName());
+    // There will be no old value as the key was not present in the directoryTable before
+    assertNull(dirPutEvent.getOldValue());
+  }
+
   @Test
   public void testGetKeyType() throws IOException {
     final String keyTable = omMetadataManager
@@ -330,7 +382,7 @@ public class TestOMDBUpdatesHandler {
         omdbDefinition.getColumnFamily(bucketTable).getValueType());
   }
 
-  @NotNull
+  @Nonnull
   private List<byte[]> getBytesFromOmMetaManager(int getUpdatesSince)
       throws RocksDBException, IOException {
     RDBStore rdbStore = (RDBStore) omMetadataManager.getStore();
@@ -351,7 +403,7 @@ public class TestOMDBUpdatesHandler {
     return writeBatches;
   }
 
-  @NotNull
+  @Nonnull
   private OMDBUpdatesHandler captureEvents(List<byte[]> writeBatches)
       throws RocksDBException {
     OMDBUpdatesHandler omdbUpdatesHandler =

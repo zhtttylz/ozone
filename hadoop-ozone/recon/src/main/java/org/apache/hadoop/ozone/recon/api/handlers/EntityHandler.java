@@ -18,11 +18,8 @@
 package org.apache.hadoop.ozone.recon.api.handlers;
 
 import org.apache.hadoop.hdds.scm.server.OzoneStorageContainerManager;
-import org.apache.hadoop.hdds.utils.db.Table;
-import org.apache.hadoop.hdds.utils.db.TableIterator;
 import org.apache.hadoop.ozone.OmUtils;
-import org.apache.hadoop.ozone.om.helpers.OmVolumeArgs;
-import org.apache.hadoop.ozone.om.helpers.OmBucketInfo;
+import org.apache.hadoop.ozone.om.helpers.BucketLayout;
 import org.apache.hadoop.ozone.recon.ReconConstants;
 import org.apache.hadoop.ozone.recon.api.types.NamespaceSummaryResponse;
 import org.apache.hadoop.ozone.recon.api.types.DUResponse;
@@ -35,8 +32,6 @@ import org.apache.hadoop.ozone.recon.spi.ReconNamespaceSummaryManager;
 
 import java.io.IOException;
 
-import java.util.List;
-import java.util.ArrayList;
 import java.util.Set;
 
 import static org.apache.hadoop.ozone.OzoneConsts.OM_KEY_PREFIX;
@@ -66,16 +61,25 @@ public abstract class EntityHandler {
     this.omMetadataManager = omMetadataManager;
     this.reconSCM = reconSCM;
     this.bucketHandler = bucketHandler;
-    normalizedPath = normalizePath(path);
-    names = parseRequestPath(normalizedPath);
 
+    // Defaulting to FILE_SYSTEM_OPTIMIZED if bucketHandler is null
+    BucketLayout layout =
+        (bucketHandler != null) ? bucketHandler.getBucketLayout() :
+            BucketLayout.FILE_SYSTEM_OPTIMIZED;
+
+    // Normalize the path based on the determined layout
+    normalizedPath = normalizePath(path, layout);
+
+    // Choose the parsing method based on the bucket layout
+    names = (layout == BucketLayout.OBJECT_STORE) ?
+        parseObjectStorePath(normalizedPath) : parseRequestPath(normalizedPath);
   }
 
   public abstract NamespaceSummaryResponse getSummaryResponse()
           throws IOException;
 
   public abstract DUResponse getDuResponse(
-          boolean listFile, boolean withReplica)
+      boolean listFile, boolean withReplica, boolean sort)
           throws IOException;
 
   public abstract QuotaUsageResponse getQuotaResponse()
@@ -124,7 +128,8 @@ public abstract class EntityHandler {
           String path) throws IOException {
     BucketHandler bucketHandler;
 
-    String normalizedPath = normalizePath(path);
+    String normalizedPath =
+        normalizePath(path, BucketLayout.FILE_SYSTEM_OPTIMIZED);
     String[] names = parseRequestPath(normalizedPath);
     if (path.equals(OM_KEY_PREFIX)) {
       return EntityType.ROOT.create(reconNamespaceSummaryManager,
@@ -136,7 +141,7 @@ public abstract class EntityHandler {
               omMetadataManager, reconSCM, null, path);
     } else if (names.length == 1) { // volume level check
       String volName = names[0];
-      if (!volumeExists(omMetadataManager, volName)) {
+      if (!omMetadataManager.volumeExists(volName)) {
         return EntityType.UNKNOWN.create(reconNamespaceSummaryManager,
                 omMetadataManager, reconSCM, null, path);
       }
@@ -162,23 +167,36 @@ public abstract class EntityHandler {
       String volName = names[0];
       String bucketName = names[1];
 
-      String keyName = BucketHandler.getKeyName(names);
-
+      // Assuming getBucketHandler already validates volume and bucket existence
       bucketHandler = BucketHandler.getBucketHandler(
-              reconNamespaceSummaryManager,
-              omMetadataManager, reconSCM,
-              volName, bucketName);
+          reconNamespaceSummaryManager, omMetadataManager, reconSCM, volName,
+          bucketName);
 
-      // check if either volume or bucket doesn't exist
-      if (bucketHandler == null
-          || !volumeExists(omMetadataManager, volName)
-          || !bucketHandler.bucketExists(volName, bucketName)) {
+      if (bucketHandler == null) {
         return EntityType.UNKNOWN.create(reconNamespaceSummaryManager,
-                omMetadataManager, reconSCM, null, path);
+            omMetadataManager, reconSCM, null, path);
       }
-      return bucketHandler.determineKeyPath(keyName)
-          .create(reconNamespaceSummaryManager,
-          omMetadataManager, reconSCM, bucketHandler, path);
+
+      // Directly handle path normalization and parsing based on the layout
+      if (bucketHandler.getBucketLayout() == BucketLayout.OBJECT_STORE) {
+        String[] parsedObjectLayoutPath = parseObjectStorePath(
+            normalizePath(path, bucketHandler.getBucketLayout()));
+        if (parsedObjectLayoutPath == null) {
+          return EntityType.UNKNOWN.create(reconNamespaceSummaryManager,
+              omMetadataManager, reconSCM, null, path);
+        }
+        // Use the key part directly from the parsed path
+        return bucketHandler.determineKeyPath(parsedObjectLayoutPath[2])
+            .create(reconNamespaceSummaryManager, omMetadataManager, reconSCM,
+                bucketHandler, path);
+      } else {
+        // Use the existing names array for non-OBJECT_STORE layouts to derive
+        // the keyName
+        String keyName = BucketHandler.getKeyName(names);
+        return bucketHandler.determineKeyPath(keyName)
+            .create(reconNamespaceSummaryManager, omMetadataManager, reconSCM,
+                bucketHandler, path);
+      }
     }
   }
 
@@ -215,80 +233,6 @@ public abstract class EntityHandler {
       totalCnt += getTotalDirCount(subdir);
     }
     return totalCnt;
-  }
-
-  /**
-   * Return all volumes in the file system.
-   * This method can be optimized by using username as a filter.
-   * @return a list of volume names under the system
-   */
-  List<OmVolumeArgs> listVolumes() throws IOException {
-    List<OmVolumeArgs> result = new ArrayList<>();
-    Table<String, OmVolumeArgs> volumeTable =
-        omMetadataManager.getVolumeTable();
-    try (TableIterator<String, ? extends Table.KeyValue<String, OmVolumeArgs>>
-        iterator = volumeTable.iterator()) {
-
-      while (iterator.hasNext()) {
-        Table.KeyValue<String, OmVolumeArgs> kv = iterator.next();
-
-        OmVolumeArgs omVolumeArgs = kv.getValue();
-        if (omVolumeArgs != null) {
-          result.add(omVolumeArgs);
-        }
-      }
-    }
-    return result;
-  }
-
-  /**
-   * List all buckets under a volume, if volume name is null, return all buckets
-   * under the system.
-   * @param volumeName volume name
-   * @return a list of buckets
-   * @throws IOException IOE
-   */
-  List<OmBucketInfo> listBucketsUnderVolume(final String volumeName)
-      throws IOException {
-    List<OmBucketInfo> result = new ArrayList<>();
-    // if volume name is null, seek prefix is an empty string
-    String seekPrefix = "";
-
-    Table<String, OmBucketInfo> bucketTable =
-        omMetadataManager.getBucketTable();
-
-    try (TableIterator<String, ? extends Table.KeyValue<String, OmBucketInfo>>
-        iterator = bucketTable.iterator()) {
-
-      if (volumeName != null) {
-        if (!volumeExists(omMetadataManager, volumeName)) {
-          return result;
-        }
-        seekPrefix = omMetadataManager.getVolumeKey(volumeName + OM_KEY_PREFIX);
-      }
-
-      while (iterator.hasNext()) {
-        Table.KeyValue<String, OmBucketInfo> kv = iterator.next();
-
-        String key = kv.getKey();
-        OmBucketInfo omBucketInfo = kv.getValue();
-
-        if (omBucketInfo != null) {
-          // We should return only the keys, whose keys match with
-          // the seek prefix
-          if (key.startsWith(seekPrefix)) {
-            result.add(omBucketInfo);
-          }
-        }
-      }
-    }
-    return result;
-  }
-
-  static boolean volumeExists(ReconOMMetadataManager omMetadataManager,
-                              String volName) throws IOException {
-    String volDBKey = omMetadataManager.getVolumeKey(volName);
-    return omMetadataManager.getVolumeTable().getSkipCache(volDBKey) != null;
   }
 
   /**
@@ -336,7 +280,52 @@ public abstract class EntityHandler {
     return names;
   }
 
-  private static String normalizePath(String path) {
+  /**
+   * Splits an object store path into volume, bucket, and key name components.
+   *
+   * This method parses a path of the format "/volumeName/bucketName/keyName",
+   * including paths with additional '/' characters within the key name. It's
+   * designed for object store paths where the first three '/' characters
+   * separate the root, volume and bucket names from the key name.
+   *
+   * @param path The object store path to parse, starting with a slash.
+   * @return A String array with three elements: volume name, bucket name, and
+   * key name, or {null} if the path format is invalid.
+   */
+  public static String[] parseObjectStorePath(String path) {
+    // Removing the leading slash for correct splitting
+    path = path.substring(1);
+
+    // Splitting the modified path by "/", limiting to 3 parts
+    String[] parts = path.split("/", 3);
+
+    // Checking if we correctly obtained 3 parts after removing the leading slash
+    if (parts.length <= 3) {
+      return parts;
+    } else {
+      return null;
+    }
+  }
+
+  /**
+   * Normalizes a given path based on the specified bucket layout.
+   *
+   * This method adjusts the path according to the bucket layout.
+   * For {OBJECT_STORE Layout}, it normalizes the path up to the bucket level
+   * using OmUtils.normalizePathUptoBucket. For other layouts, it
+   * normalizes the entire path, including the key, using
+   * OmUtils.normalizeKey, and does not preserve any trailing slashes.
+   * The normalized path will always be prefixed with OM_KEY_PREFIX to ensure it
+   * is consistent with the expected format for object storage paths in Ozone.
+   *
+   * @param path
+   * @param bucketLayout
+   * @return A normalized path
+   */
+  public static String normalizePath(String path, BucketLayout bucketLayout) {
+    if (bucketLayout == BucketLayout.OBJECT_STORE) {
+      return OM_KEY_PREFIX + OmUtils.normalizePathUptoBucket(path);
+    }
     return OM_KEY_PREFIX + OmUtils.normalizeKey(path, false);
   }
 }

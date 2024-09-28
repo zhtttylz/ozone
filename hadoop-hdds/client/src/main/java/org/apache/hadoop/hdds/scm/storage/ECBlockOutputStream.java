@@ -25,6 +25,7 @@ import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ChunkInfo;
 import org.apache.hadoop.hdds.scm.ContainerClientMetrics;
 import org.apache.hadoop.hdds.scm.OzoneClientConfig;
+import org.apache.hadoop.hdds.scm.StreamBufferArgs;
 import org.apache.hadoop.hdds.scm.XceiverClientFactory;
 import org.apache.hadoop.hdds.scm.XceiverClientReply;
 import org.apache.hadoop.hdds.scm.pipeline.Pipeline;
@@ -37,12 +38,18 @@ import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 import static org.apache.hadoop.hdds.scm.storage.ContainerProtocolCalls.putBlockAsync;
@@ -66,6 +73,7 @@ public class ECBlockOutputStream extends BlockOutputStream {
    * @param pipeline             pipeline where block will be written
    * @param bufferPool           pool of buffers
    */
+  @SuppressWarnings("checkstyle:ParameterNumber")
   public ECBlockOutputStream(
       BlockID blockID,
       XceiverClientFactory xceiverClientManager,
@@ -73,18 +81,20 @@ public class ECBlockOutputStream extends BlockOutputStream {
       BufferPool bufferPool,
       OzoneClientConfig config,
       Token<? extends TokenIdentifier> token,
-      ContainerClientMetrics clientMetrics
+      ContainerClientMetrics clientMetrics, StreamBufferArgs streamBufferArgs,
+      Supplier<ExecutorService> executorServiceSupplier
   ) throws IOException {
-    super(blockID, xceiverClientManager,
-        pipeline, bufferPool, config, token, clientMetrics);
+    super(blockID, -1, xceiverClientManager,
+        pipeline, bufferPool, config, token, clientMetrics, streamBufferArgs, executorServiceSupplier);
     // In EC stream, there will be only one node in pipeline.
     this.datanodeDetails = pipeline.getClosestNode();
   }
 
   @Override
-  public void write(byte[] b, int off, int len) throws IOException {
+  public synchronized void write(byte[] b, int off, int len) throws IOException {
     this.currentChunkRspFuture =
-        writeChunkToContainer(ChunkBuffer.wrap(ByteBuffer.wrap(b, off, len)));
+        writeChunkToContainer(
+            ChunkBuffer.wrap(ByteBuffer.wrap(b, off, len)));
     updateWrittenDataLength(len);
   }
 
@@ -110,23 +120,60 @@ public class ECBlockOutputStream extends BlockOutputStream {
     }
 
     BlockData checksumBlockData = null;
+    BlockID blockID = null;
     //Reverse Traversal as all parity will have checksumBytes
     for (int i = blockData.length - 1; i >= 0; i--) {
       BlockData bd = blockData[i];
       if (bd == null) {
         continue;
       }
+      if (blockID == null) {
+        // store the BlockID for logging
+        blockID = bd.getBlockID();
+      }
       List<ChunkInfo> chunks = bd.getChunks();
-      if (chunks != null && chunks.size() > 0 && chunks.get(0)
-          .hasStripeChecksum()) {
-        checksumBlockData = bd;
-        break;
+      if (chunks != null && chunks.size() > 0) {
+        if (chunks.get(0).hasStripeChecksum()) {
+          checksumBlockData = bd;
+          break;
+        } else {
+          ChunkInfo chunk = chunks.get(0);
+          LOG.debug("The first chunk in block with index {} does not have stripeChecksum. BlockID: {}, Block " +
+                  "size: {}. Chunk length: {}, Chunk offset: {}, hasChecksumData: {}, chunks size: {}.", i,
+              bd.getBlockID(), bd.getSize(), chunk.getLen(), chunk.getOffset(), chunk.hasChecksumData(), chunks.size());
+        }
       }
     }
 
     if (checksumBlockData != null) {
-      List<ChunkInfo> currentChunks = getContainerBlockData().getChunksList();
+
+      // For the same BlockGroupLength, we need to find the larger value of Block DataSize.
+      // This is because we do not send empty chunks to the DataNode, so the larger value is more accurate.
+      Map<Long, Optional<BlockData>> maxDataSizeByGroup = Arrays.stream(blockData)
+          .filter(Objects::nonNull)
+          .collect(Collectors.groupingBy(BlockData::getBlockGroupLength,
+          Collectors.maxBy(Comparator.comparingLong(BlockData::getSize))));
+      BlockData maxBlockData = maxDataSizeByGroup.get(blockGroupLength).get();
+
+      // When calculating the checksum size,
+      // We need to consider both blockGroupLength and the actual size of blockData.
+      //
+      // We use the smaller value to determine the size of the ChunkList.
+      //
+      // 1. In most cases, blockGroupLength is equal to the size of blockData.
+      // 2. Occasionally, blockData is not fully filled; if a chunk is empty,
+      // it is not sent to the DN, resulting in blockData size being smaller than blockGroupLength.
+      // 3. In cases with 'dirty data',
+      // if an error occurs when writing to the EC-Stripe (e.g., DN reports Container Closed),
+      // and the length confirmed with OM is smaller, blockGroupLength may be smaller than blockData size.
+      long blockDataSize = Math.min(maxBlockData.getSize(), blockGroupLength);
+      int chunkSize = (int) Math.ceil(((double) blockDataSize / repConfig.getEcChunkSize()));
       List<ChunkInfo> checksumBlockDataChunks = checksumBlockData.getChunks();
+      if (chunkSize > 0) {
+        checksumBlockDataChunks = checksumBlockData.getChunks().subList(0, chunkSize);
+      }
+
+      List<ChunkInfo> currentChunks = getContainerBlockData().getChunksList();
 
       Preconditions.checkArgument(
           currentChunks.size() == checksumBlockDataChunks.size(),
@@ -153,9 +200,8 @@ public class ECBlockOutputStream extends BlockOutputStream {
       getContainerBlockData().clearChunks();
       getContainerBlockData().addAllChunks(newChunkList);
     } else {
-      throw new IOException("None of the block data have checksum " +
-          "which means " + parity + "(parity)+1 blocks are " +
-          "not present");
+      LOG.warn("Could not find checksum data in any index for blockData with BlockID {}, length {} and " +
+          "blockGroupLength {}.", blockID, blockData.length, blockGroupLength);
     }
 
     return executePutBlock(close, force, blockGroupLength);
@@ -183,7 +229,7 @@ public class ECBlockOutputStream extends BlockOutputStream {
       ContainerCommandResponseProto> executePutBlock(boolean close,
       boolean force, long blockGroupLength) throws IOException {
     updateBlockGroupLengthInPutBlockMeta(blockGroupLength);
-    return executePutBlock(close, force);
+    return executePutBlock(close, force).thenApply(PutBlockResult::getResponse);
   }
 
   private void updateBlockGroupLengthInPutBlockMeta(final long blockGroupLen) {
@@ -216,17 +262,17 @@ public class ECBlockOutputStream extends BlockOutputStream {
    * @param force true if no data was written since most recent putBlock and
    *            stream is being closed
    */
-  public CompletableFuture<ContainerProtos.
-      ContainerCommandResponseProto> executePutBlock(boolean close,
+  @Override
+  public CompletableFuture<PutBlockResult> executePutBlock(boolean close,
       boolean force) throws IOException {
     checkOpen();
 
     CompletableFuture<ContainerProtos.
-        ContainerCommandResponseProto> flushFuture = null;
+        ContainerCommandResponseProto> flushFuture;
     try {
       ContainerProtos.BlockData blockData = getContainerBlockData().build();
       XceiverClientReply asyncReply =
-          putBlockAsync(getXceiverClient(), blockData, close, getToken());
+          putBlockAsync(getXceiverClient(), blockData, close, getTokenString());
       CompletableFuture<ContainerProtos.ContainerCommandResponseProto> future =
           asyncReply.getResponse();
       flushFuture = future.thenApplyAsync(e -> {
@@ -253,13 +299,15 @@ public class ECBlockOutputStream extends BlockOutputStream {
         throw ce;
       });
     } catch (IOException | ExecutionException e) {
-      throw new IOException(EXCEPTION_MSG + e.toString(), e);
+      throw new IOException(EXCEPTION_MSG + e, e);
     } catch (InterruptedException ex) {
       Thread.currentThread().interrupt();
       handleInterruptedException(ex, false);
+      // never reach.
+      return null;
     }
     this.putBlkRspFuture = flushFuture;
-    return flushFuture;
+    return flushFuture.thenApply(r -> new PutBlockResult(0, 0, r));
   }
 
   /**

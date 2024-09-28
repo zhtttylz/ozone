@@ -36,14 +36,23 @@ public final class ReconConstants {
   public static final String RECON_SCM_SNAPSHOT_DB = "scm.snapshot.db";
 
   // By default, limit the number of results returned
+
+  /**
+   * The maximum number of top disk usage records to return in a /du response.
+   */
+  public static final int DISK_USAGE_TOP_RECORDS_LIMIT = 30;
   public static final String DEFAULT_OPEN_KEY_INCLUDE_NON_FSO = "false";
   public static final String DEFAULT_OPEN_KEY_INCLUDE_FSO = "false";
+  public static final String DEFAULT_START_PREFIX = "/";
   public static final String DEFAULT_FETCH_COUNT = "1000";
+  public static final String DEFAULT_KEY_SIZE = "0";
   public static final String DEFAULT_BATCH_NUMBER = "1";
   public static final String RECON_QUERY_BATCH_PARAM = "batchNum";
   public static final String RECON_QUERY_PREVKEY = "prevKey";
   public static final String RECON_OPEN_KEY_INCLUDE_NON_FSO = "includeNonFso";
   public static final String RECON_OPEN_KEY_INCLUDE_FSO = "includeFso";
+  public static final String RECON_OPEN_KEY_DEFAULT_SEARCH_LIMIT = "1000";
+  public static final String RECON_OPEN_KEY_SEARCH_DEFAULT_PREV_KEY = "";
   public static final String RECON_QUERY_FILTER = "missingIn";
   public static final String PREV_CONTAINER_ID_DEFAULT_VALUE = "0";
   public static final String PREV_DELETED_BLOCKS_TRANSACTION_ID_DEFAULT_VALUE =
@@ -58,6 +67,9 @@ public final class ReconConstants {
   public static final String RECON_ENTITY_PATH = "path";
   public static final String RECON_ENTITY_TYPE = "entityType";
   public static final String RECON_ACCESS_METADATA_START_DATE = "startDate";
+  public static final String CONTAINER_COUNT = "CONTAINER_COUNT";
+  public static final String TOTAL_KEYS = "TOTAL_KEYS";
+  public static final String TOTAL_USED_BYTES = "TOTAL_USED_BYTES";
 
   // 1125899906842624L = 1PB
   public static final long MAX_FILE_SIZE_UPPER_BOUND = 1125899906842624L;

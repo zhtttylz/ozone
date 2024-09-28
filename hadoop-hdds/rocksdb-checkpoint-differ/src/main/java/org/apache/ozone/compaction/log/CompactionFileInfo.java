@@ -18,8 +18,9 @@
 
 package org.apache.ozone.compaction.log;
 
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
-import org.apache.hadoop.util.Preconditions;
 
 import java.util.Objects;
 
@@ -32,10 +33,11 @@ public final class CompactionFileInfo {
   private final String endKey;
   private final String columnFamily;
 
-  private CompactionFileInfo(String fileName,
-                             String startRange,
-                             String endRange,
-                             String columnFamily) {
+  @VisibleForTesting
+  public CompactionFileInfo(String fileName,
+                            String startRange,
+                            String endRange,
+                            String columnFamily) {
     this.fileName = fileName;
     this.startKey = startRange;
     this.endKey = endRange;

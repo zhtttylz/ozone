@@ -19,11 +19,12 @@ package org.apache.hadoop.hdds.server;
 
 import java.io.IOException;
 
+import org.apache.hadoop.hdds.JsonTestUtils;
 import org.apache.hadoop.hdds.client.OzoneQuota;
 
 import org.junit.jupiter.api.Test;
 
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Test the json object printer.
@@ -35,18 +36,17 @@ public class TestJsonUtils {
     OzoneQuota spaceQuota = OzoneQuota.parseSpaceQuota("123MB");
 
     String spaceStr =
-        JsonUtils.toJsonStringWithDefaultPrettyPrinter(spaceQuota);
+        JsonTestUtils.toJsonStringWithDefaultPrettyPrinter(spaceQuota);
     assertContains(spaceStr, "\"rawSize\" : 123");
     assertContains(spaceStr, "\"unit\" : \"MB\"");
 
     OzoneQuota nameSpace = OzoneQuota.parseNameSpaceQuota("1000");
     String nameSpaceStr =
-        JsonUtils.toJsonStringWithDefaultPrettyPrinter(nameSpace);
+        JsonTestUtils.toJsonStringWithDefaultPrettyPrinter(nameSpace);
     assertContains(nameSpaceStr, "\"quotaInNamespace\" : 1000");
   }
 
   private static void assertContains(String str, String part) {
-    assertTrue(str.contains(part),
-        "Expected JSON to contain '" + part + "', but didn't: " + str);
+    assertThat(str).contains(part);
   }
 }

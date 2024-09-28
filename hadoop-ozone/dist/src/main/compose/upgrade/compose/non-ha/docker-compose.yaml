@@ -14,8 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-version: "3.8"
-
 # reusable fragments (see https://docs.docker.com/compose/compose-file/#extension-fields)
 x-common-config:
   &common-config
@@ -36,7 +34,7 @@ x-datanode:
   environment:
     <<: *environment
   ports:
-    - 9864
+    - 19864
     - 9882
 
 x-volumes:

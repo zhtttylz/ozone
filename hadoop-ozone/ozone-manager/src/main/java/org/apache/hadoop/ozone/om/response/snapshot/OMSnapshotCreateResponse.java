@@ -28,7 +28,7 @@ import org.apache.hadoop.ozone.om.response.CleanupTableInfo;
 import org.apache.hadoop.ozone.om.response.OMClientResponse;
 import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos.OMResponse;
 
-import javax.annotation.Nonnull;
+import jakarta.annotation.Nonnull;
 import java.io.IOException;
 
 import static org.apache.hadoop.ozone.OzoneConsts.OM_KEY_PREFIX;
@@ -79,7 +79,7 @@ public class OMSnapshotCreateResponse extends OMClientResponse {
 
     // Create the snapshot checkpoint. Also cleans up some tables.
     OmSnapshotManager.createOmSnapshotCheckpoint(omMetadataManager,
-        snapshotInfo);
+        snapshotInfo, batchOperation);
 
     // TODO: [SNAPSHOT] Move to createOmSnapshotCheckpoint and add table lock
     // Remove all entries from snapshotRenamedTable

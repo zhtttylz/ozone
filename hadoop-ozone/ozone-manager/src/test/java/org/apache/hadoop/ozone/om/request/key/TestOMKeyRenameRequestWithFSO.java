@@ -18,8 +18,14 @@
 
 package org.apache.hadoop.ozone.om.request.key;
 
+import static org.apache.hadoop.hdds.protocol.proto.HddsProtos.ReplicationFactor.ONE;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
+import org.apache.hadoop.hdds.client.RatisReplicationConfig;
 import org.apache.hadoop.ozone.OmUtils;
 import org.apache.hadoop.ozone.OzoneConsts;
 import org.apache.hadoop.ozone.om.exceptions.OMException;
@@ -33,10 +39,8 @@ import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos;
 import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos.KeyArgs;
 import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos.OMRequest;
 import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos.RenameKeyRequest;
-import org.apache.hadoop.util.Time;
-import org.junit.Assert;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.util.UUID;
@@ -48,7 +52,7 @@ public class TestOMKeyRenameRequestWithFSO extends TestOMKeyRenameRequest {
   private OmKeyInfo fromKeyParentInfo;
   private OmKeyInfo toKeyParentInfo;
   @Override
-  @Before
+  @BeforeEach
   public void createParentKey() throws Exception {
     OMRequestTestUtils.addVolumeAndBucketToDB(volumeName, bucketName,
         omMetadataManager, getBucketLayout());
@@ -86,9 +90,8 @@ public class TestOMKeyRenameRequestWithFSO extends TestOMKeyRenameRequest {
     OMKeyRenameRequest omKeyRenameRequest =
         getOMKeyRenameRequest(modifiedOmRequest);
     OMClientResponse response =
-            omKeyRenameRequest.validateAndUpdateCache(ozoneManager, 100L,
-            ozoneManagerDoubleBufferHelper);
-    Assert.assertEquals(OzoneManagerProtocolProtos.Status.RENAME_OPEN_FILE,
+        omKeyRenameRequest.validateAndUpdateCache(ozoneManager, 100L);
+    assertEquals(OzoneManagerProtocolProtos.Status.RENAME_OPEN_FILE,
         response.getOMResponse().getStatus());
   }
 
@@ -96,37 +99,36 @@ public class TestOMKeyRenameRequestWithFSO extends TestOMKeyRenameRequest {
   @Test
   public void testValidateAndUpdateCacheWithToKeyInvalid() throws Exception {
     String invalidToKeyName = "invalid:";
-    Assert.assertThrows(
+    assertThrows(
         OMException.class, () -> doPreExecute(createRenameKeyRequest(
             volumeName, bucketName, fromKeyName, invalidToKeyName)));  }
 
   @Test
   public void testValidateAndUpdateCacheWithEmptyToKey() throws Exception {
     String emptyToKeyName = "";
-    OMRequest omRequest = doPreExecute(createRenameKeyRequest(volumeName,
-        bucketName, fromKeyName, emptyToKeyName));
-    Assert.assertEquals(omRequest.getRenameKeyRequest().getToKeyName(), "");
+    OMRequest omRequest = createRenameKeyRequest(volumeName,
+        bucketName, fromKeyName, emptyToKeyName);
+    assertEquals(omRequest.getRenameKeyRequest().getToKeyName(), "");
   }
 
   @Override
   @Test
   public void testValidateAndUpdateCacheWithFromKeyInvalid() throws Exception {
     String invalidFromKeyName = "";
-    Assert.assertThrows(
+    assertThrows(
         OMException.class, () -> doPreExecute(createRenameKeyRequest(
             volumeName, bucketName, invalidFromKeyName, toKeyName)));
   }
 
   @Test
   public void testPreExecuteWithUnNormalizedPath() throws Exception {
+    addKeyToTable(fromKeyInfo);
     String toKeyName =
         "///root" + OzoneConsts.OZONE_URI_DELIMITER +
             OzoneConsts.OZONE_URI_DELIMITER +
             UUID.randomUUID();
     String fromKeyName =
-        "///root/sub-dir" + OzoneConsts.OZONE_URI_DELIMITER +
-            OzoneConsts.OZONE_URI_DELIMITER +
-            UUID.randomUUID();
+        "///" + fromKeyInfo.getKeyName();
     OMRequest modifiedOmRequest =
         doPreExecute(createRenameKeyRequest(toKeyName, fromKeyName));
     String normalizedSrcName =
@@ -135,8 +137,8 @@ public class TestOMKeyRenameRequestWithFSO extends TestOMKeyRenameRequest {
         modifiedOmRequest.getRenameKeyRequest().getKeyArgs().getKeyName();
     String expectedSrcKeyName = OmUtils.normalizeKey(toKeyName, false);
     String expectedDstKeyName = OmUtils.normalizeKey(fromKeyName, false);
-    Assert.assertEquals(expectedSrcKeyName, normalizedSrcName);
-    Assert.assertEquals(expectedDstKeyName, normalizedDstName);
+    assertEquals(expectedSrcKeyName, normalizedSrcName);
+    assertEquals(expectedDstKeyName, normalizedDstName);
   }
 
   /**
@@ -167,10 +169,10 @@ public class TestOMKeyRenameRequestWithFSO extends TestOMKeyRenameRequest {
 
     // Will not be equal, as UserInfo will be set and modification time is
     // set in KeyArgs.
-    Assert.assertNotEquals(originalOmRequest, modifiedOmRequest);
+    assertNotEquals(originalOmRequest, modifiedOmRequest);
 
-    Assert.assertTrue(modifiedOmRequest.getRenameKeyRequest()
-        .getKeyArgs().getModificationTime() > 0);
+    assertThat(modifiedOmRequest.getRenameKeyRequest()
+        .getKeyArgs().getModificationTime()).isGreaterThan(0);
 
     return modifiedOmRequest;
   }
@@ -178,10 +180,10 @@ public class TestOMKeyRenameRequestWithFSO extends TestOMKeyRenameRequest {
   @Override
   protected OmKeyInfo getOmKeyInfo(String keyName) {
     long bucketId = random.nextLong();
-    return OMRequestTestUtils.createOmKeyInfo(
-        volumeName, bucketName, keyName,
-        HddsProtos.ReplicationType.RATIS, HddsProtos.ReplicationFactor.ONE,
-        bucketId + 100L, bucketId + 101L, 0L, Time.now());
+    return OMRequestTestUtils.createOmKeyInfo(volumeName, bucketName, keyName, RatisReplicationConfig.getInstance(ONE))
+        .setObjectID(bucketId + 100L)
+        .setParentObjectID(bucketId + 101L)
+        .build();
   }
 
   @Override
@@ -213,8 +215,8 @@ public class TestOMKeyRenameRequestWithFSO extends TestOMKeyRenameRequest {
         .getDirectoryTable().get(getDBKeyName(fromKeyParentInfo));
     OmDirectoryInfo updatedToKeyParentInfo = omMetadataManager
         .getDirectoryTable().get(getDBKeyName(toKeyParentInfo));
-    Assert.assertEquals(except, updatedFromKeyParentInfo.getModificationTime());
-    Assert.assertEquals(except, updatedToKeyParentInfo.getModificationTime());
+    assertEquals(except, updatedFromKeyParentInfo.getModificationTime());
+    assertEquals(except, updatedToKeyParentInfo.getModificationTime());
   }
 
   @Override

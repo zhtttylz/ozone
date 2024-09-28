@@ -19,12 +19,13 @@
 
 package org.apache.hadoop.hdds.security.x509.certificate.client;
 
+import org.apache.hadoop.hdds.scm.client.ClientTrustManager;
 import org.apache.hadoop.hdds.security.exception.OzoneSecurityException;
-import org.apache.hadoop.hdds.security.ssl.KeyStoresFactory;
-import org.apache.hadoop.hdds.security.x509.certificate.authority.CAType;
+import org.apache.hadoop.hdds.security.ssl.ReloadingX509KeyManager;
+import org.apache.hadoop.hdds.security.ssl.ReloadingX509TrustManager;
+import org.apache.hadoop.hdds.security.exception.SCMSecurityException;
 import org.apache.hadoop.hdds.security.x509.certificate.utils.CertificateSignRequest;
 import org.apache.hadoop.hdds.security.x509.exception.CertificateException;
-import org.bouncycastle.pkcs.PKCS10CertificationRequest;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -129,44 +130,6 @@ public interface CertificateClient extends Closeable {
   Set<X509Certificate> getAllCaCerts();
 
   /**
-   * Return the pem encoded CA certificate list.
-   * <p>
-   * If initialized return list of pem encoded CA certificates, else return
-   * null.
-   *
-   * @return list of pem encoded CA certificates.
-   */
-  List<String> getCAList();
-
-  /**
-   * Return the pem encoded  CA certificate list.
-   *
-   * If list is null, fetch the list from SCM and returns the list.
-   * If list is not null, return the pem encoded  CA certificate list.
-   *
-   * @return list of pem encoded  CA certificates.
-   * @throws IOException
-   */
-  List<String> listCA() throws IOException;
-
-  /**
-   * Update and returns the pem encoded CA certificate list.
-   * @return list of pem encoded  CA certificates.
-   * @throws IOException
-   */
-  List<String> updateCAList() throws IOException;
-
-  /**
-   * Creates digital signature over the data stream using the components private
-   * key.
-   *
-   * @param data data to be signed
-   * @return byte array - containing the signature
-   * @throws CertificateException - on Error
-   */
-  byte[] signData(byte[] data) throws CertificateException;
-
-  /**
    * Verifies a digital Signature, given the signature and the certificate of
    * the signer.
    * @param data - Data in byte array.
@@ -178,33 +141,13 @@ public interface CertificateClient extends Closeable {
       X509Certificate cert) throws CertificateException;
 
   /**
-   * Returns a CSR builder that can be used to create a Certificate sigining
-   * request.
+   * Returns a CertificateSignRequest Builder object, that can be used to configure the sign request
+   * which we use to get  a signed certificate from our CA server implementation.
    *
-   * @return CertificateSignRequest.Builder
+   * @return CertificateSignRequest.Builder a {@link CertificateSignRequest}
+   *           based on which the certificate may be issued to this client.
    */
-  CertificateSignRequest.Builder getCSRBuilder()
-      throws CertificateException;
-
-  /**
-   * Send request to SCM to sign the certificate and save certificates returned
-   * by SCM to PEM files on disk.
-   *
-   * @return the serial ID of the new certificate
-   */
-  String signAndStoreCertificate(PKCS10CertificationRequest request)
-      throws CertificateException;
-
-  /**
-   * Stores the Certificate  for this client. Don't use this api to add
-   * trusted certificates of others.
-   *
-   * @param pemEncodedCert - pem encoded X509 Certificate
-   * @param caType         - Is CA certificate.
-   * @throws CertificateException - on Error.
-   */
-  void storeCertificate(String pemEncodedCert, CAType caType)
-      throws CertificateException;
+  CertificateSignRequest.Builder configureCSRBuilder() throws SCMSecurityException;
 
   default void assertValidKeysAndCertificate() throws OzoneSecurityException {
     try {
@@ -218,14 +161,30 @@ public interface CertificateClient extends Closeable {
   }
 
   /**
-   * Return the store factory for key manager and trust manager for server.
+   * Gets a KeyManager containing this CertificateClient's key material and trustchain.
+   * During certificate rotation this KeyManager is automatically updated with the new keys/certificates.
+   *
+   * @return A KeyManager containing keys and the trustchain for this CertificateClient.
+   * @throws CertificateException
    */
-  KeyStoresFactory getServerKeyStoresFactory() throws CertificateException;
+  ReloadingX509KeyManager getKeyManager() throws CertificateException;
 
   /**
-   * Return the store factory for key manager and trust manager for client.
+   * Gets a TrustManager containing the trusted certificates of this CertificateClient.
+   * During certificate rotation this TrustManager is automatically updated with the new certificates.
+   *
+   * @return A TrustManager containing trusted certificates for this CertificateClient.
+   * @throws CertificateException
    */
-  KeyStoresFactory getClientKeyStoresFactory() throws CertificateException;
+  ReloadingX509TrustManager getTrustManager() throws CertificateException;
+
+  /**
+   * Creates a ClientTrustManager instance using the trusted certificates of this certificate client.
+   *
+   * @return The new ClientTrustManager instance.
+   * @throws IOException
+   */
+  ClientTrustManager createClientTrustManager() throws IOException;
 
   /**
    * Register a receiver that will be called after the certificate renewed.
@@ -248,7 +207,7 @@ public interface CertificateClient extends Closeable {
    * Initialize certificate client.
    *
    * */
-  InitResponse init() throws CertificateException;
+  void initWithRecovery() throws IOException;
 
   /**
    * Represents initialization response of client.
@@ -262,7 +221,6 @@ public interface CertificateClient extends Closeable {
   enum InitResponse {
     SUCCESS,
     FAILURE,
-    GETCERT,
-    RECOVER
+    GETCERT
   }
 }

@@ -19,14 +19,15 @@ package org.apache.hadoop.ozone.om.ratis.utils;
 
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
+import com.google.protobuf.RpcController;
 import com.google.protobuf.ServiceException;
 import java.io.File;
+import java.nio.file.InvalidPathException;
 import java.nio.file.Paths;
 
 import org.apache.hadoop.hdds.conf.ConfigurationSource;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.security.SecurityConfig;
-import org.apache.hadoop.hdds.security.ssl.KeyStoresFactory;
 import org.apache.hadoop.hdds.security.x509.certificate.client.CertificateClient;
 import org.apache.hadoop.hdds.server.ServerUtils;
 import org.apache.hadoop.hdds.utils.HAUtils;
@@ -77,12 +78,15 @@ import org.apache.hadoop.ozone.om.request.security.OMRenewDelegationTokenRequest
 import org.apache.hadoop.ozone.om.request.snapshot.OMSnapshotCreateRequest;
 import org.apache.hadoop.ozone.om.request.snapshot.OMSnapshotDeleteRequest;
 import org.apache.hadoop.ozone.om.request.snapshot.OMSnapshotMoveDeletedKeysRequest;
+import org.apache.hadoop.ozone.om.request.snapshot.OMSnapshotMoveTableKeysRequest;
 import org.apache.hadoop.ozone.om.request.snapshot.OMSnapshotPurgeRequest;
+import org.apache.hadoop.ozone.om.request.snapshot.OMSnapshotRenameRequest;
 import org.apache.hadoop.ozone.om.request.snapshot.OMSnapshotSetPropertyRequest;
 import org.apache.hadoop.ozone.om.request.upgrade.OMCancelPrepareRequest;
 import org.apache.hadoop.ozone.om.request.upgrade.OMFinalizeUpgradeRequest;
 import org.apache.hadoop.ozone.om.request.upgrade.OMPrepareRequest;
 import org.apache.hadoop.ozone.om.request.util.OMEchoRPCWriteRequest;
+import org.apache.hadoop.ozone.om.request.volume.OMQuotaRepairRequest;
 import org.apache.hadoop.ozone.om.request.volume.OMVolumeCreateRequest;
 import org.apache.hadoop.ozone.om.request.volume.OMVolumeDeleteRequest;
 import org.apache.hadoop.ozone.om.request.volume.OMVolumeSetOwnerRequest;
@@ -96,6 +100,7 @@ import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos.OzoneOb
 import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos.Status;
 import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos.Type;
 import org.apache.ratis.grpc.GrpcTlsConfig;
+import org.apache.ratis.protocol.ClientId;
 import org.rocksdb.RocksDBException;
 
 import java.io.IOException;
@@ -115,6 +120,7 @@ import static org.apache.hadoop.ozone.om.OzoneManagerUtils.getBucketLayout;
 public final class OzoneManagerRatisUtils {
   private static final Logger LOG = LoggerFactory
       .getLogger(OzoneManagerRatisUtils.class);
+  private static final RpcController NULL_RPC_CONTROLLER = null;
 
   private OzoneManagerRatisUtils() {
   }
@@ -223,8 +229,12 @@ public final class OzoneManagerRatisUtils {
       return new OMSnapshotCreateRequest(omRequest);
     case DeleteSnapshot:
       return new OMSnapshotDeleteRequest(omRequest);
+    case RenameSnapshot:
+      return new OMSnapshotRenameRequest(omRequest);
     case SnapshotMoveDeletedKeys:
       return new OMSnapshotMoveDeletedKeysRequest(omRequest);
+    case SnapshotMoveTableKeys:
+      return new OMSnapshotMoveTableKeysRequest(omRequest);
     case SnapshotPurge:
       return new OMSnapshotPurgeRequest(omRequest);
     case SetSnapshotProperty:
@@ -328,6 +338,8 @@ public final class OzoneManagerRatisUtils {
       return new OMEchoRPCWriteRequest(omRequest);
     case AbortExpiredMultiPartUploads:
       return new S3ExpiredMultipartUploadsAbortRequest(omRequest);
+    case QuotaRepair:
+      return new OMQuotaRepairRequest(omRequest);
     default:
       throw new OMException("Unrecognized write command type request "
           + cmdType, OMException.ResultCodes.INVALID_REQUEST);
@@ -399,9 +411,11 @@ public final class OzoneManagerRatisUtils {
    * @param exception
    * @return OzoneManagerProtocolProtos.Status
    */
-  public static Status exceptionToResponseStatus(IOException exception) {
+  public static Status exceptionToResponseStatus(Exception exception) {
     if (exception instanceof OMException) {
       return Status.values()[((OMException) exception).getResult().ordinal()];
+    } else if (exception instanceof InvalidPathException) {
+      return Status.INVALID_PATH;
     } else {
       // Doing this here, because when DB error happens we need to return
       // correct error code, so that in applyTransaction we can
@@ -489,11 +503,18 @@ public final class OzoneManagerRatisUtils {
   public static GrpcTlsConfig createServerTlsConfig(SecurityConfig conf,
       CertificateClient caClient) throws IOException {
     if (conf.isSecurityEnabled() && conf.isGrpcTlsEnabled()) {
-      KeyStoresFactory serverKeyFactory = caClient.getServerKeyStoresFactory();
-      return new GrpcTlsConfig(serverKeyFactory.getKeyManagers()[0],
-          serverKeyFactory.getTrustManagers()[0], true);
+      return new GrpcTlsConfig(caClient.getKeyManager(), caClient.getTrustManager(), true);
     }
 
     return null;
+  }
+
+  public static OzoneManagerProtocolProtos.OMResponse submitRequest(
+      OzoneManager om, OMRequest omRequest, ClientId clientId, long callId) throws ServiceException {
+    if (om.isRatisEnabled()) {
+      return om.getOmRatisServer().submitRequest(omRequest, clientId, callId);
+    } else {
+      return om.getOmServerProtocol().submitRequest(NULL_RPC_CONTROLLER, omRequest);
+    }
   }
 }

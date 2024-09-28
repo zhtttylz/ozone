@@ -21,7 +21,6 @@ package org.apache.hadoop.ozone.container;
 import java.io.IOException;
 import java.security.MessageDigest;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -42,8 +41,10 @@ import org.apache.hadoop.hdds.scm.container.ContainerReplica;
 import org.apache.hadoop.hdds.scm.events.SCMEvents;
 import org.apache.hadoop.hdds.scm.pipeline.Pipeline;
 import org.apache.hadoop.hdds.scm.pipeline.PipelineNotFoundException;
+import org.apache.hadoop.hdds.scm.server.StorageContainerManager;
 import org.apache.hadoop.ozone.HddsDatanodeService;
 import org.apache.hadoop.ozone.MiniOzoneCluster;
+import org.apache.hadoop.ozone.MiniOzoneHAClusterImpl;
 import org.apache.hadoop.ozone.OzoneConsts;
 import org.apache.hadoop.ozone.client.ObjectStore;
 import org.apache.hadoop.ozone.client.io.BlockDataStreamOutputEntry;
@@ -62,11 +63,16 @@ import org.apache.hadoop.ozone.om.helpers.OmKeyLocationInfo;
 import org.apache.ozone.test.GenericTestUtils;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.statemachine.StateMachine;
-import org.junit.Assert;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import static java.util.stream.Collectors.toList;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /**
  * Helpers for container tests.
@@ -186,7 +192,7 @@ public final class TestHelper {
       sha1.update(data);
       MessageDigest sha2 = MessageDigest.getInstance(OzoneConsts.FILE_HASH);
       sha2.update(readData);
-      Assert.assertTrue(Arrays.equals(sha1.digest(), sha2.digest()));
+      assertArrayEquals(sha1.digest(), sha2.digest());
     }
   }
 
@@ -203,7 +209,7 @@ public final class TestHelper {
         containerIdList.add(id);
       }
     }
-    Assert.assertTrue(!containerIdList.isEmpty());
+    assertThat(containerIdList).isNotEmpty();
     waitForContainerClose(cluster, containerIdList.toArray(new Long[0]));
   }
 
@@ -221,7 +227,7 @@ public final class TestHelper {
         containerIdList.add(id);
       }
     }
-    Assert.assertTrue(!containerIdList.isEmpty());
+    assertThat(containerIdList).isNotEmpty();
     waitForContainerClose(cluster, containerIdList.toArray(new Long[0]));
   }
 
@@ -239,7 +245,7 @@ public final class TestHelper {
         containerIdList.add(id);
       }
     }
-    Assert.assertTrue(!containerIdList.isEmpty());
+    assertThat(containerIdList).isNotEmpty();
     waitForPipelineClose(cluster, waitForContainerCreation,
         containerIdList.toArray(new Long[0]));
   }
@@ -268,10 +274,10 @@ public final class TestHelper {
           GenericTestUtils
               .waitFor(() -> isContainerPresent(cluster, containerID, details),
                   500, 100 * 1000);
-          Assert.assertTrue(isContainerPresent(cluster, containerID, details));
+          assertTrue(isContainerPresent(cluster, containerID, details));
 
           // make sure the container gets created first
-          Assert.assertFalse(isContainerClosed(cluster, containerID, details));
+          assertFalse(isContainerClosed(cluster, containerID, details));
         }
       }
     }
@@ -294,7 +300,7 @@ public final class TestHelper {
         XceiverServerSpi server =
             cluster.getHddsDatanodes().get(cluster.getHddsDatanodeIndex(dn))
                 .getDatanodeStateMachine().getContainer().getWriteChannel();
-        Assert.assertTrue(server instanceof XceiverServerRatis);
+        assertInstanceOf(XceiverServerRatis.class, server);
         GenericTestUtils.waitFor(() -> !server.isExist(pipelineId),
             100, 30_000);
       }
@@ -311,7 +317,7 @@ public final class TestHelper {
               cluster.getHddsDatanodes().get(cluster.getHddsDatanodeIndex(dn))
                       .getDatanodeStateMachine().getContainer()
                       .getWriteChannel();
-      Assert.assertTrue(server instanceof XceiverServerRatis);
+      assertInstanceOf(XceiverServerRatis.class, server);
       try {
         server.addGroup(pipeline.getId().getProtobuf(), Collections.
                 unmodifiableList(pipeline.getNodes()));
@@ -325,14 +331,17 @@ public final class TestHelper {
       Long... containerIdList)
       throws ContainerNotFoundException, PipelineNotFoundException,
       TimeoutException, InterruptedException {
+    StorageContainerManager scm;
+    if (cluster instanceof MiniOzoneHAClusterImpl) {
+      MiniOzoneHAClusterImpl haCluster = (MiniOzoneHAClusterImpl) cluster;
+      scm = haCluster.getScmLeader();
+    } else {
+      scm = cluster.getStorageContainerManager();
+    }
     List<Pipeline> pipelineList = new ArrayList<>();
     for (long containerID : containerIdList) {
-      ContainerInfo container =
-          cluster.getStorageContainerManager().getContainerManager()
-              .getContainer(ContainerID.valueOf(containerID));
-      Pipeline pipeline =
-          cluster.getStorageContainerManager().getPipelineManager()
-              .getPipeline(container.getPipelineID());
+      ContainerInfo container = scm.getContainerManager().getContainer(ContainerID.valueOf(containerID));
+      Pipeline pipeline = scm.getPipelineManager().getPipeline(container.getPipelineID());
       pipelineList.add(pipeline);
       List<DatanodeDetails> datanodes = pipeline.getNodes();
 
@@ -343,14 +352,12 @@ public final class TestHelper {
         GenericTestUtils
             .waitFor(() -> isContainerPresent(cluster, containerID, details),
                 500, 100 * 1000);
-        Assert.assertTrue(isContainerPresent(cluster, containerID, details));
+        assertTrue(isContainerPresent(cluster, containerID, details));
 
         // make sure the container gets created first
-        Assert.assertFalse(isContainerClosed(cluster, containerID, details));
+        assertFalse(isContainerClosed(cluster, containerID, details));
         // send the order to close the container
-        cluster.getStorageContainerManager().getEventQueue()
-            .fireEvent(SCMEvents.CLOSE_CONTAINER,
-                ContainerID.valueOf(containerID));
+        scm.getEventQueue().fireEvent(SCMEvents.CLOSE_CONTAINER, ContainerID.valueOf(containerID));
       }
     }
     int index = 0;
@@ -366,7 +373,7 @@ public final class TestHelper {
             15 * 1000);
         //double check if it's really closed
         // (waitFor also throws an exception)
-        Assert.assertTrue(
+        assertTrue(
             isContainerClosed(cluster, containerID, datanodeDetails));
       }
       index++;
@@ -410,7 +417,7 @@ public final class TestHelper {
         services.add(service);
       }
     }
-    Assert.assertEquals(pipelineNodes.size(), services.size());
+    assertEquals(pipelineNodes.size(), services.size());
     return services;
   }
 
@@ -438,6 +445,6 @@ public final class TestHelper {
   public static void waitForReplicaCount(long containerID, int count,
       MiniOzoneCluster cluster) throws TimeoutException, InterruptedException {
     GenericTestUtils.waitFor(() -> countReplicas(containerID, cluster) == count,
-        1000, 30000);
+        200, 30000);
   }
 }

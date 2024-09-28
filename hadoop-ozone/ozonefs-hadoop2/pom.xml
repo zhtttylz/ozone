@@ -19,14 +19,13 @@
   <parent>
     <groupId>org.apache.ozone</groupId>
     <artifactId>ozone</artifactId>
-    <version>1.4.0-SNAPSHOT</version>
+    <version>1.5.0-SNAPSHOT</version>
   </parent>
   <artifactId>ozone-filesystem-hadoop2</artifactId>
   <name>Apache Ozone FS Hadoop 2.x compatibility</name>
   <packaging>jar</packaging>
-  <version>1.4.0-SNAPSHOT</version>
+  <version>1.5.0-SNAPSHOT</version>
   <properties>
-    <maven.test.skip>true</maven.test.skip> <!-- no tests in this module so far -->
     <shaded.prefix>org.apache.hadoop.ozone.shaded</shaded.prefix>
   </properties>
   <dependencies>
@@ -67,6 +66,10 @@
           <groupId>org.slf4j</groupId>
           <artifactId>slf4j-log4j12</artifactId>
         </exclusion>
+        <exclusion>
+          <groupId>com.sun.jersey</groupId>
+          <artifactId>*</artifactId>
+        </exclusion>
       </exclusions>
     </dependency>
     <dependency>
@@ -97,9 +100,29 @@
       <artifactId>slf4j-reload4j</artifactId>
       <scope>provided</scope>
     </dependency>
+
+    <!-- Test dependencies -->
+    <dependency>
+      <groupId>org.apache.ozone</groupId>
+      <artifactId>hdds-hadoop-dependency-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.ozone</groupId>
+      <artifactId>ozone-common</artifactId>
+      <type>test-jar</type>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
   <build>
     <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <configuration>
+          <proc>none</proc>
+        </configuration>
+      </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-dependency-plugin</artifactId>
@@ -111,6 +134,7 @@
               <goal>unpack</goal>
             </goals>
             <configuration>
+              <skip>${maven.shade.skip}</skip>
               <excludes>META-INF/versions/**/*.*</excludes>
               <artifactItems>
                 <artifactItem>

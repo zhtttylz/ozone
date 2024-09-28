@@ -21,8 +21,6 @@ import com.google.common.base.Preconditions;
 import org.apache.hadoop.hdds.protocol.DatanodeDetails;
 import org.apache.hadoop.hdds.protocol.proto.StorageContainerDatanodeProtocolProtos.CommandQueueReportProto;
 import org.apache.hadoop.hdds.protocol.proto
-    .StorageContainerDatanodeProtocolProtos.CRLStatusReport;
-import org.apache.hadoop.hdds.protocol.proto
     .StorageContainerDatanodeProtocolProtos.IncrementalContainerReportProto;
 import org.apache.hadoop.hdds.protocol.proto.StorageContainerDatanodeProtocolProtos.LayoutVersionProto;
 import org.apache.hadoop.hdds.protocol.proto.StorageContainerDatanodeProtocolProtos.SCMCommandProto;
@@ -130,8 +128,7 @@ public final class SCMDatanodeHeartbeatDispatcher {
         commandQueueReport = heartbeat.getCommandQueueReport();
       }
       // should we dispatch heartbeat through eventPublisher?
-      commands = nodeManager.processHeartbeat(datanodeDetails,
-          layoutVersion, commandQueueReport);
+      commands = nodeManager.processHeartbeat(datanodeDetails, commandQueueReport);
       if (heartbeat.hasNodeReport()) {
         LOG.debug("Dispatching Node Report.");
         eventPublisher.fireEvent(
@@ -214,7 +211,7 @@ public final class SCMDatanodeHeartbeatDispatcher {
 
     private final DatanodeDetails datanodeDetails;
 
-    private final T report;
+    private T report;
 
     public ReportFromDatanode(DatanodeDetails datanodeDetails, T report) {
       this.datanodeDetails = datanodeDetails;
@@ -227,6 +224,10 @@ public final class SCMDatanodeHeartbeatDispatcher {
 
     public T getReport() {
       return report;
+    }
+
+    public void setReport(T report) {
+      this.report = report;
     }
   }
 
@@ -279,6 +280,7 @@ public final class SCMDatanodeHeartbeatDispatcher {
   public interface ContainerReport {
     DatanodeDetails getDatanodeDetails();
     ContainerReportType getType();
+    void mergeReport(ContainerReport val);
   }
 
   /**
@@ -287,12 +289,12 @@ public final class SCMDatanodeHeartbeatDispatcher {
   public enum ContainerReportType {
     /**
      * Incremental container report type
-     * {@liks IncrementalContainerReportFromDatanode}.
+     * {@link IncrementalContainerReportFromDatanode}.
      */
     ICR,
     /**
      * Full container report type
-     * {@liks ContainerReportFromDatanode}.
+     * {@link ContainerReportFromDatanode}.
      */
     FCR
   }
@@ -334,6 +336,9 @@ public final class SCMDatanodeHeartbeatDispatcher {
       return getDatanodeDetails().toString() + ", {type: " + getType()
           + ", size: " + getReport().getReportsList().size() + "}";
     }
+
+    @Override
+    public void mergeReport(ContainerReport nextReport) { }
   }
 
   /**
@@ -373,6 +378,17 @@ public final class SCMDatanodeHeartbeatDispatcher {
     public String getEventId() {
       return getDatanodeDetails().toString() + ", {type: " + getType()
           + ", size: " + getReport().getReportList().size() + "}";
+    }
+
+    @Override
+    public void mergeReport(ContainerReport nextReport) {
+      if (nextReport.getType() == ContainerReportType.ICR) {
+        // To update existing report list , need to create a builder and then
+        // merge new reports to existing report list.
+        IncrementalContainerReportProto reportProto = getReport().toBuilder().addAllReport(
+            ((ReportFromDatanode<IncrementalContainerReportProto>) nextReport).getReport().getReportList()).build();
+        setReport(reportProto);
+      }
     }
   }
 
@@ -420,18 +436,6 @@ public final class SCMDatanodeHeartbeatDispatcher {
 
     public CommandStatusReportFromDatanode(DatanodeDetails datanodeDetails,
         CommandStatusReportsProto report) {
-      super(datanodeDetails, report);
-    }
-  }
-
-  /**
-   * CRL Status report event payload with origin.
-   */
-  public static class CRLStatusReportFromDatanode
-      extends ReportFromDatanode<CRLStatusReport> {
-
-    public CRLStatusReportFromDatanode(DatanodeDetails datanodeDetails,
-                                           CRLStatusReport report) {
       super(datanodeDetails, report);
     }
   }

@@ -36,7 +36,6 @@ import org.apache.hadoop.ozone.client.protocol.ClientProtocol;
 import org.apache.hadoop.ozone.om.helpers.OmKeyInfo;
 import org.apache.hadoop.ozone.om.helpers.OmKeyLocationInfo;
 import org.apache.hadoop.security.token.Token;
-import org.apache.hadoop.util.CrcUtil;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -187,13 +186,10 @@ public class ECFileChecksumHelper extends BaseFileChecksumHelper {
         LOG.debug("Initializing BlockInputStream for get key to access {}",
             blockID.getContainerID());
       }
-      xceiverClientSpi =
-          getXceiverClientFactory().acquireClientForReadData(pipeline);
+      xceiverClientSpi = getXceiverClientFactory().acquireClientForReadData(pipeline);
 
-      ContainerProtos.DatanodeBlockID datanodeBlockID = blockID
-          .getDatanodeBlockIDProtobuf();
       ContainerProtos.GetBlockResponseProto response = ContainerProtocolCalls
-          .getBlock(xceiverClientSpi, datanodeBlockID, token);
+          .getBlock(xceiverClientSpi, blockID, token, pipeline.getReplicaIndexes());
 
       chunks = response.getBlockData().getChunksList();
     } finally {

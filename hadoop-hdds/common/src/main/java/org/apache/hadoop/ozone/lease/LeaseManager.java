@@ -17,7 +17,6 @@
 
 package org.apache.hadoop.ozone.lease;
 
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
@@ -63,7 +62,7 @@ public class LeaseManager<T> {
    *        Default timeout in milliseconds to be used for lease creation.
    */
   public LeaseManager(String name, long defaultTimeout) {
-    this.name = name;
+    this.name = name + "LeaseManager";
     this.defaultTimeout = defaultTimeout;
   }
 
@@ -71,11 +70,11 @@ public class LeaseManager<T> {
    * Starts the lease manager service.
    */
   public void start() {
-    LOG.debug("Starting {} LeaseManager service", name);
+    LOG.debug("Starting {} service", name);
     activeLeases = new ConcurrentHashMap<>();
     leaseMonitor = new LeaseMonitor();
     leaseMonitorThread = new Thread(leaseMonitor);
-    leaseMonitorThread.setName(name + "-LeaseManager#LeaseMonitor");
+    leaseMonitorThread.setName(name + "#LeaseMonitor");
     leaseMonitorThread.setDaemon(true);
     leaseMonitorThread.setUncaughtExceptionHandler((thread, throwable) -> {
       // Let us just restart this thread after logging an error.
@@ -84,7 +83,7 @@ public class LeaseManager<T> {
           thread.toString(), throwable);
       leaseMonitorThread.start();
     });
-    LOG.debug("Starting {}-LeaseManager#LeaseMonitor Thread", name);
+    LOG.debug("Starting {} Thread", leaseMonitorThread.getName());
     leaseMonitorThread.start();
     isRunning = true;
   }
@@ -268,10 +267,10 @@ public class LeaseManager<T> {
             long remainingTime = lease.getRemainingTime();
             if (remainingTime <= 0) {
               //Lease has timed out
-              List<Callable<Void>> leaseCallbacks = lease.getCallbacks();
+              Callable<Void> leaseCallback = lease.getCallback();
               release(resource);
               executorService.execute(
-                  new LeaseCallbackExecutor<>(resource, leaseCallbacks));
+                  new LeaseCallbackExecutor<>(resource, leaseCallback));
             } else {
               sleepTime = Math.min(remainingTime, sleepTime);
             }
@@ -282,7 +281,7 @@ public class LeaseManager<T> {
 
         try {
           // ignore return value, just used for wait
-          boolean b = semaphore.tryAcquire(sleepTime, TimeUnit.MILLISECONDS);
+          boolean ignored = semaphore.tryAcquire(sleepTime, TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
           LOG.warn("Lease manager is interrupted. Shutting down...", e);
           Thread.currentThread().interrupt();

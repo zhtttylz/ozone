@@ -35,6 +35,7 @@ import org.apache.hadoop.hdds.scm.server.OzoneStorageContainerManager;
 import org.apache.hadoop.ozone.OzoneConsts;
 import org.apache.hadoop.ozone.om.OMMetadataManager;
 import org.apache.hadoop.ozone.om.OmMetadataManagerImpl;
+import org.apache.hadoop.ozone.om.helpers.OmKeyInfo;
 import org.apache.hadoop.ozone.om.helpers.BucketLayout;
 import org.apache.hadoop.ozone.om.helpers.OmVolumeArgs;
 import org.apache.hadoop.ozone.om.helpers.OmBucketInfo;
@@ -42,12 +43,14 @@ import org.apache.hadoop.ozone.om.helpers.OmKeyLocationInfo;
 import org.apache.hadoop.ozone.om.helpers.OmKeyLocationInfoGroup;
 import org.apache.hadoop.ozone.recon.ReconConstants;
 import org.apache.hadoop.ozone.recon.ReconTestInjector;
+import org.apache.hadoop.ozone.recon.ReconUtils;
 import org.apache.hadoop.ozone.recon.api.handlers.BucketHandler;
 import org.apache.hadoop.ozone.recon.api.handlers.EntityHandler;
 import org.apache.hadoop.ozone.recon.api.types.DUResponse;
-import org.apache.hadoop.ozone.recon.api.types.FileSizeDistributionResponse;
-import org.apache.hadoop.ozone.recon.api.types.ResponseStatus;
+import org.apache.hadoop.ozone.recon.api.types.NSSummary;
 import org.apache.hadoop.ozone.recon.api.types.QuotaUsageResponse;
+import org.apache.hadoop.ozone.recon.api.types.ResponseStatus;
+import org.apache.hadoop.ozone.recon.api.types.FileSizeDistributionResponse;
 import org.apache.hadoop.ozone.recon.common.CommonUtils;
 import org.apache.hadoop.ozone.recon.recovery.ReconOMMetadataManager;
 import org.apache.hadoop.ozone.recon.scm.ReconNodeManager;
@@ -57,16 +60,19 @@ import org.apache.hadoop.ozone.recon.spi.StorageContainerServiceProvider;
 import org.apache.hadoop.ozone.recon.spi.impl.OzoneManagerServiceProviderImpl;
 import org.apache.hadoop.ozone.recon.spi.impl.StorageContainerServiceProviderImpl;
 import org.apache.hadoop.ozone.recon.tasks.NSSummaryTaskWithFSO;
-import org.junit.Assert;
-import org.junit.Before;
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.rules.TemporaryFolder;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.mockito.ArgumentCaptor;
+import org.slf4j.Logger;
 
 import javax.ws.rs.core.Response;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
@@ -81,8 +87,12 @@ import static org.apache.hadoop.ozone.recon.OMMetadataManagerTestUtils.writeKeyT
 import static org.apache.hadoop.ozone.recon.OMMetadataManagerTestUtils.getTestReconOmMetadataManager;
 import static org.apache.hadoop.ozone.recon.OMMetadataManagerTestUtils.getMockOzoneManagerServiceProviderWithFSO;
 import static org.apache.hadoop.ozone.recon.ReconServerConfigKeys.OZONE_RECON_NSSUMMARY_FLUSH_TO_DB_MAX_THRESHOLD;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.anyLong;
+import static org.mockito.Mockito.verify;
 
 /**
  * Test for NSSummary REST APIs with FSO.
@@ -108,10 +118,11 @@ import static org.mockito.Mockito.when;
  * so there is no need to test process() on DB's updates
  */
 public class TestNSSummaryEndpointWithFSO {
-  @Rule
-  public TemporaryFolder temporaryFolder = new TemporaryFolder();
+  @TempDir
+  private Path temporaryFolder;
 
   private ReconOMMetadataManager reconOMMetadataManager;
+  private ReconNamespaceSummaryManager reconNamespaceSummaryManager;
   private NSSummaryEndpoint nsSummaryEndpoint;
   private OzoneConfiguration ozoneConfiguration;
   private CommonUtils commonUtils;
@@ -348,20 +359,21 @@ public class TestNSSummaryEndpointWithFSO {
   private static final long DIR_ONE_DATA_SIZE = KEY_TWO_SIZE +
           KEY_THREE_SIZE + KEY_SIX_SIZE;
 
-  @Before
+  @BeforeEach
   public void setUp() throws Exception {
     ozoneConfiguration = new OzoneConfiguration();
     ozoneConfiguration.setLong(OZONE_RECON_NSSUMMARY_FLUSH_TO_DB_MAX_THRESHOLD,
         10);
     OMMetadataManager omMetadataManager = initializeNewOmMetadataManager(
-        temporaryFolder.newFolder());
+        Files.createDirectory(temporaryFolder.resolve("JunitOmDBDir"))
+            .toFile());
     OzoneManagerServiceProviderImpl ozoneManagerServiceProvider =
         getMockOzoneManagerServiceProviderWithFSO();
     reconOMMetadataManager = getTestReconOmMetadataManager(omMetadataManager,
-            temporaryFolder.newFolder());
+        Files.createDirectory(temporaryFolder.resolve("OmMetataDir")).toFile());
 
     ReconTestInjector reconTestInjector =
-            new ReconTestInjector.Builder(temporaryFolder)
+            new ReconTestInjector.Builder(temporaryFolder.toFile())
                     .withReconOm(reconOMMetadataManager)
                     .withOmServiceProvider(ozoneManagerServiceProvider)
                     .withReconSqlDb()
@@ -372,7 +384,7 @@ public class TestNSSummaryEndpointWithFSO {
                             mock(StorageContainerServiceProviderImpl.class))
                     .addBinding(NSSummaryEndpoint.class)
                     .build();
-    ReconNamespaceSummaryManager reconNamespaceSummaryManager =
+    this.reconNamespaceSummaryManager =
         reconTestInjector.getInstance(ReconNamespaceSummaryManager.class);
     nsSummaryEndpoint = reconTestInjector.getInstance(NSSummaryEndpoint.class);
 
@@ -388,11 +400,11 @@ public class TestNSSummaryEndpointWithFSO {
   @Test
   public void testUtility() {
     String[] names = EntityHandler.parseRequestPath(TEST_PATH_UTILITY);
-    Assert.assertArrayEquals(TEST_NAMES, names);
+    assertArrayEquals(TEST_NAMES, names);
     String keyName = BucketHandler.getKeyName(names);
-    Assert.assertEquals(TEST_KEY_NAMES, keyName);
+    assertEquals(TEST_KEY_NAMES, keyName);
     String subpath = BucketHandler.buildSubpath(PARENT_DIR, "file1.txt");
-    Assert.assertEquals(TEST_PATH_UTILITY, subpath);
+    assertEquals(TEST_PATH_UTILITY, subpath);
   }
 
   @Test
@@ -446,91 +458,96 @@ public class TestNSSummaryEndpointWithFSO {
   public void testDiskUsageRoot() throws Exception {
     // root level DU
     Response rootResponse = nsSummaryEndpoint.getDiskUsage(ROOT_PATH,
-        false, false);
+        false, false, false);
     DUResponse duRootRes = (DUResponse) rootResponse.getEntity();
-    Assert.assertEquals(2, duRootRes.getCount());
+    assertEquals(2, duRootRes.getCount());
     List<DUResponse.DiskUsage> duRootData = duRootRes.getDuData();
     // sort based on subpath
     Collections.sort(duRootData,
         Comparator.comparing(DUResponse.DiskUsage::getSubpath));
     DUResponse.DiskUsage duVol1 = duRootData.get(0);
     DUResponse.DiskUsage duVol2 = duRootData.get(1);
-    Assert.assertEquals(VOL_PATH, duVol1.getSubpath());
-    Assert.assertEquals(VOL_TWO_PATH, duVol2.getSubpath());
-    Assert.assertEquals(VOL_DATA_SIZE, duVol1.getSize());
-    Assert.assertEquals(VOL_TWO_DATA_SIZE, duVol2.getSize());
+    assertEquals(VOL_PATH, duVol1.getSubpath());
+    assertEquals(VOL_TWO_PATH, duVol2.getSubpath());
+    assertEquals(VOL_DATA_SIZE, duVol1.getSize());
+    assertEquals(VOL_TWO_DATA_SIZE, duVol2.getSize());
   }
+
   @Test
   public void testDiskUsageVolume() throws Exception {
     // volume level DU
     Response volResponse = nsSummaryEndpoint.getDiskUsage(VOL_PATH,
-            false, false);
+        false, false, false);
     DUResponse duVolRes = (DUResponse) volResponse.getEntity();
-    Assert.assertEquals(2, duVolRes.getCount());
+    assertEquals(2, duVolRes.getCount());
     List<DUResponse.DiskUsage> duData = duVolRes.getDuData();
     // sort based on subpath
     Collections.sort(duData,
             Comparator.comparing(DUResponse.DiskUsage::getSubpath));
     DUResponse.DiskUsage duBucket1 = duData.get(0);
     DUResponse.DiskUsage duBucket2 = duData.get(1);
-    Assert.assertEquals(BUCKET_ONE_PATH, duBucket1.getSubpath());
-    Assert.assertEquals(BUCKET_TWO_PATH, duBucket2.getSubpath());
-    Assert.assertEquals(BUCKET_ONE_DATA_SIZE, duBucket1.getSize());
-    Assert.assertEquals(BUCKET_TWO_DATA_SIZE, duBucket2.getSize());
+    assertEquals(BUCKET_ONE_PATH, duBucket1.getSubpath());
+    assertEquals(BUCKET_TWO_PATH, duBucket2.getSubpath());
+    assertEquals(BUCKET_ONE_DATA_SIZE, duBucket1.getSize());
+    assertEquals(BUCKET_TWO_DATA_SIZE, duBucket2.getSize());
 
   }
+
   @Test
   public void testDiskUsageBucket() throws Exception {
     // bucket level DU
     Response bucketResponse = nsSummaryEndpoint.getDiskUsage(BUCKET_ONE_PATH,
-            false, false);
+        false, false, false);
     DUResponse duBucketResponse = (DUResponse) bucketResponse.getEntity();
-    Assert.assertEquals(1, duBucketResponse.getCount());
+    assertEquals(1, duBucketResponse.getCount());
     DUResponse.DiskUsage duDir1 = duBucketResponse.getDuData().get(0);
-    Assert.assertEquals(DIR_ONE_PATH, duDir1.getSubpath());
-    Assert.assertEquals(DIR_ONE_DATA_SIZE, duDir1.getSize());
+    assertEquals(DIR_ONE_PATH, duDir1.getSubpath());
+    assertEquals(DIR_ONE_DATA_SIZE, duDir1.getSize());
 
   }
+
   @Test
   public void testDiskUsageDir() throws Exception {
     // dir level DU
     Response dirResponse = nsSummaryEndpoint.getDiskUsage(DIR_ONE_PATH,
-            false, false);
+        false, false, false);
     DUResponse duDirReponse = (DUResponse) dirResponse.getEntity();
-    Assert.assertEquals(3, duDirReponse.getCount());
+    assertEquals(3, duDirReponse.getCount());
     List<DUResponse.DiskUsage> duSubDir = duDirReponse.getDuData();
     Collections.sort(duSubDir,
             Comparator.comparing(DUResponse.DiskUsage::getSubpath));
     DUResponse.DiskUsage duDir2 = duSubDir.get(0);
     DUResponse.DiskUsage duDir3 = duSubDir.get(1);
     DUResponse.DiskUsage duDir4 = duSubDir.get(2);
-    Assert.assertEquals(DIR_TWO_PATH, duDir2.getSubpath());
-    Assert.assertEquals(KEY_TWO_SIZE, duDir2.getSize());
+    assertEquals(DIR_TWO_PATH, duDir2.getSubpath());
+    assertEquals(KEY_TWO_SIZE, duDir2.getSize());
 
-    Assert.assertEquals(DIR_THREE_PATH, duDir3.getSubpath());
-    Assert.assertEquals(KEY_THREE_SIZE, duDir3.getSize());
+    assertEquals(DIR_THREE_PATH, duDir3.getSubpath());
+    assertEquals(KEY_THREE_SIZE, duDir3.getSize());
 
-    Assert.assertEquals(DIR_FOUR_PATH, duDir4.getSubpath());
-    Assert.assertEquals(KEY_SIX_SIZE, duDir4.getSize());
+    assertEquals(DIR_FOUR_PATH, duDir4.getSubpath());
+    assertEquals(KEY_SIX_SIZE, duDir4.getSize());
 
   }
+
   @Test
   public void testDiskUsageKey() throws Exception {
     // key level DU
     Response keyResponse = nsSummaryEndpoint.getDiskUsage(KEY_PATH,
-            false, false);
+        false, false, false);
     DUResponse keyObj = (DUResponse) keyResponse.getEntity();
-    Assert.assertEquals(0, keyObj.getCount());
-    Assert.assertEquals(KEY_FOUR_SIZE, keyObj.getSize());
+    assertEquals(0, keyObj.getCount());
+    assertEquals(KEY_FOUR_SIZE, keyObj.getSize());
 
   }
+
   @Test
   public void testDiskUsageUnknown() throws Exception {
     // invalid path check
     Response invalidResponse = nsSummaryEndpoint.getDiskUsage(INVALID_PATH,
-            false, false);
+        false, false, false);
     DUResponse invalidObj = (DUResponse) invalidResponse.getEntity();
-    Assert.assertEquals(ResponseStatus.PATH_NOT_FOUND,
+    assertEquals(ResponseStatus.PATH_NOT_FOUND,
             invalidObj.getStatus());
   }
 
@@ -538,10 +555,10 @@ public class TestNSSummaryEndpointWithFSO {
   public void testDiskUsageWithReplication() throws Exception {
     setUpMultiBlockKey();
     Response keyResponse = nsSummaryEndpoint.getDiskUsage(MULTI_BLOCK_KEY_PATH,
-            false, true);
+        false, true, false);
     DUResponse replicaDUResponse = (DUResponse) keyResponse.getEntity();
-    Assert.assertEquals(ResponseStatus.OK, replicaDUResponse.getStatus());
-    Assert.assertEquals(MULTI_BLOCK_KEY_SIZE_WITH_REPLICA,
+    assertEquals(ResponseStatus.OK, replicaDUResponse.getStatus());
+    assertEquals(MULTI_BLOCK_KEY_SIZE_WITH_REPLICA,
             replicaDUResponse.getSizeWithReplica());
   }
 
@@ -550,12 +567,12 @@ public class TestNSSummaryEndpointWithFSO {
     setUpMultiBlockReplicatedKeys();
     //   withReplica is true
     Response rootResponse = nsSummaryEndpoint.getDiskUsage(ROOT_PATH,
-        false, true);
+        false, true, false);
     DUResponse replicaDUResponse = (DUResponse) rootResponse.getEntity();
-    Assert.assertEquals(ResponseStatus.OK, replicaDUResponse.getStatus());
-    Assert.assertEquals(MULTI_BLOCK_TOTAL_SIZE_WITH_REPLICA_UNDER_ROOT,
+    assertEquals(ResponseStatus.OK, replicaDUResponse.getStatus());
+    assertEquals(MULTI_BLOCK_TOTAL_SIZE_WITH_REPLICA_UNDER_ROOT,
         replicaDUResponse.getSizeWithReplica());
-    Assert.assertEquals(MULTI_BLOCK_TOTAL_SIZE_WITH_REPLICA_UNDER_VOL,
+    assertEquals(MULTI_BLOCK_TOTAL_SIZE_WITH_REPLICA_UNDER_VOL,
         replicaDUResponse.getDuData().get(0).getSizeWithReplica());
 
   }
@@ -564,12 +581,12 @@ public class TestNSSummaryEndpointWithFSO {
   public void testDataSizeUnderVolWithReplication() throws IOException {
     setUpMultiBlockReplicatedKeys();
     Response volResponse = nsSummaryEndpoint.getDiskUsage(VOL_PATH,
-        false, true);
+        false, true, false);
     DUResponse replicaDUResponse = (DUResponse) volResponse.getEntity();
-    Assert.assertEquals(ResponseStatus.OK, replicaDUResponse.getStatus());
-    Assert.assertEquals(MULTI_BLOCK_TOTAL_SIZE_WITH_REPLICA_UNDER_VOL,
+    assertEquals(ResponseStatus.OK, replicaDUResponse.getStatus());
+    assertEquals(MULTI_BLOCK_TOTAL_SIZE_WITH_REPLICA_UNDER_VOL,
         replicaDUResponse.getSizeWithReplica());
-    Assert.assertEquals(MULTI_BLOCK_TOTAL_SIZE_WITH_REPLICA_UNDER_BUCKET1,
+    assertEquals(MULTI_BLOCK_TOTAL_SIZE_WITH_REPLICA_UNDER_BUCKET1,
         replicaDUResponse.getDuData().get(0).getSizeWithReplica());
   }
 
@@ -577,12 +594,12 @@ public class TestNSSummaryEndpointWithFSO {
   public void testDataSizeUnderBucketWithReplication() throws IOException {
     setUpMultiBlockReplicatedKeys();
     Response bucketResponse = nsSummaryEndpoint.getDiskUsage(BUCKET_ONE_PATH,
-        false, true);
+        false, true, false);
     DUResponse replicaDUResponse = (DUResponse) bucketResponse.getEntity();
-    Assert.assertEquals(ResponseStatus.OK, replicaDUResponse.getStatus());
-    Assert.assertEquals(MULTI_BLOCK_TOTAL_SIZE_WITH_REPLICA_UNDER_BUCKET1,
+    assertEquals(ResponseStatus.OK, replicaDUResponse.getStatus());
+    assertEquals(MULTI_BLOCK_TOTAL_SIZE_WITH_REPLICA_UNDER_BUCKET1,
         replicaDUResponse.getSizeWithReplica());
-    Assert.assertEquals(MULTI_BLOCK_TOTAL_SIZE_WITH_REPLICA_UNDER_DIR1,
+    assertEquals(MULTI_BLOCK_TOTAL_SIZE_WITH_REPLICA_UNDER_DIR1,
         replicaDUResponse.getDuData().get(0).getSizeWithReplica());
   }
 
@@ -596,12 +613,12 @@ public class TestNSSummaryEndpointWithFSO {
   public void testDataSizeUnderDirWithReplication() throws IOException {
     setUpMultiBlockReplicatedKeys();
     Response dir1Response = nsSummaryEndpoint.getDiskUsage(DIR_ONE_PATH,
-        false, true);
+        false, true, false);
     DUResponse replicaDUResponse = (DUResponse) dir1Response.getEntity();
-    Assert.assertEquals(ResponseStatus.OK, replicaDUResponse.getStatus());
-    Assert.assertEquals(MULTI_BLOCK_TOTAL_SIZE_WITH_REPLICA_UNDER_DIR1,
+    assertEquals(ResponseStatus.OK, replicaDUResponse.getStatus());
+    assertEquals(MULTI_BLOCK_TOTAL_SIZE_WITH_REPLICA_UNDER_DIR1,
         replicaDUResponse.getSizeWithReplica());
-    Assert.assertEquals(MULTI_BLOCK_TOTAL_SIZE_WITH_REPLICA_UNDER_DIR2,
+    assertEquals(MULTI_BLOCK_TOTAL_SIZE_WITH_REPLICA_UNDER_DIR2,
         replicaDUResponse.getDuData().get(0).getSizeWithReplica());
   }
 
@@ -609,10 +626,10 @@ public class TestNSSummaryEndpointWithFSO {
   public void testDataSizeUnderKeyWithReplication() throws IOException {
     setUpMultiBlockReplicatedKeys();
     Response keyResponse = nsSummaryEndpoint.getDiskUsage(KEY_PATH,
-        false, true);
+        false, true, false);
     DUResponse replicaDUResponse = (DUResponse) keyResponse.getEntity();
-    Assert.assertEquals(ResponseStatus.OK, replicaDUResponse.getStatus());
-    Assert.assertEquals(MULTI_BLOCK_TOTAL_SIZE_WITH_REPLICA_UNDER_KEY,
+    assertEquals(ResponseStatus.OK, replicaDUResponse.getStatus());
+    assertEquals(MULTI_BLOCK_TOTAL_SIZE_WITH_REPLICA_UNDER_KEY,
         replicaDUResponse.getSizeWithReplica());
   }
 
@@ -622,45 +639,45 @@ public class TestNSSummaryEndpointWithFSO {
     Response rootResponse = nsSummaryEndpoint.getQuotaUsage(ROOT_PATH);
     QuotaUsageResponse quRootRes =
         (QuotaUsageResponse) rootResponse.getEntity();
-    Assert.assertEquals(ROOT_QUOTA, quRootRes.getQuota());
-    Assert.assertEquals(ROOT_DATA_SIZE, quRootRes.getQuotaUsed());
+    assertEquals(ROOT_QUOTA, quRootRes.getQuota());
+    assertEquals(ROOT_DATA_SIZE, quRootRes.getQuotaUsed());
 
     // volume level quota usage
     Response volResponse = nsSummaryEndpoint.getQuotaUsage(VOL_PATH);
     QuotaUsageResponse quVolRes = (QuotaUsageResponse) volResponse.getEntity();
-    Assert.assertEquals(VOL_QUOTA, quVolRes.getQuota());
-    Assert.assertEquals(VOL_DATA_SIZE, quVolRes.getQuotaUsed());
+    assertEquals(VOL_QUOTA, quVolRes.getQuota());
+    assertEquals(VOL_DATA_SIZE, quVolRes.getQuotaUsed());
 
     // bucket level quota usage
     Response bucketRes = nsSummaryEndpoint.getQuotaUsage(BUCKET_ONE_PATH);
     QuotaUsageResponse quBucketRes = (QuotaUsageResponse) bucketRes.getEntity();
-    Assert.assertEquals(BUCKET_ONE_QUOTA, quBucketRes.getQuota());
-    Assert.assertEquals(BUCKET_ONE_DATA_SIZE, quBucketRes.getQuotaUsed());
+    assertEquals(BUCKET_ONE_QUOTA, quBucketRes.getQuota());
+    assertEquals(BUCKET_ONE_DATA_SIZE, quBucketRes.getQuotaUsed());
 
     Response bucketRes2 = nsSummaryEndpoint.getQuotaUsage(BUCKET_TWO_PATH);
     QuotaUsageResponse quBucketRes2 =
             (QuotaUsageResponse) bucketRes2.getEntity();
-    Assert.assertEquals(BUCKET_TWO_QUOTA, quBucketRes2.getQuota());
-    Assert.assertEquals(BUCKET_TWO_DATA_SIZE, quBucketRes2.getQuotaUsed());
+    assertEquals(BUCKET_TWO_QUOTA, quBucketRes2.getQuota());
+    assertEquals(BUCKET_TWO_DATA_SIZE, quBucketRes2.getQuotaUsed());
 
     // other level not applicable
     Response naResponse1 = nsSummaryEndpoint.getQuotaUsage(DIR_ONE_PATH);
     QuotaUsageResponse quotaUsageResponse1 =
             (QuotaUsageResponse) naResponse1.getEntity();
-    Assert.assertEquals(ResponseStatus.TYPE_NOT_APPLICABLE,
+    assertEquals(ResponseStatus.TYPE_NOT_APPLICABLE,
             quotaUsageResponse1.getResponseCode());
 
     Response naResponse2 = nsSummaryEndpoint.getQuotaUsage(KEY_PATH);
     QuotaUsageResponse quotaUsageResponse2 =
             (QuotaUsageResponse) naResponse2.getEntity();
-    Assert.assertEquals(ResponseStatus.TYPE_NOT_APPLICABLE,
+    assertEquals(ResponseStatus.TYPE_NOT_APPLICABLE,
             quotaUsageResponse2.getResponseCode());
 
     // invalid path request
     Response invalidRes = nsSummaryEndpoint.getQuotaUsage(INVALID_PATH);
     QuotaUsageResponse invalidResObj =
             (QuotaUsageResponse) invalidRes.getEntity();
-    Assert.assertEquals(ResponseStatus.PATH_NOT_FOUND,
+    assertEquals(ResponseStatus.PATH_NOT_FOUND,
             invalidResObj.getResponseCode());
   }
 
@@ -679,14 +696,159 @@ public class TestNSSummaryEndpointWithFSO {
     FileSizeDistributionResponse fileSizeDistResObj =
             (FileSizeDistributionResponse) res.getEntity();
     int[] fileSizeDist = fileSizeDistResObj.getFileSizeDist();
-    Assert.assertEquals(bin0, fileSizeDist[0]);
-    Assert.assertEquals(bin1, fileSizeDist[1]);
-    Assert.assertEquals(bin2, fileSizeDist[2]);
-    Assert.assertEquals(bin3, fileSizeDist[3]);
+    assertEquals(bin0, fileSizeDist[0]);
+    assertEquals(bin1, fileSizeDist[1]);
+    assertEquals(bin2, fileSizeDist[2]);
+    assertEquals(bin3, fileSizeDist[3]);
     for (int i = 4; i < ReconConstants.NUM_OF_FILE_SIZE_BINS; ++i) {
-      Assert.assertEquals(0, fileSizeDist[i]);
+      assertEquals(0, fileSizeDist[i]);
     }
   }
+
+  @Test
+  public void testConstructFullPath() throws IOException {
+    OmKeyInfo keyInfo = new OmKeyInfo.Builder()
+        .setKeyName("file2")
+        .setVolumeName(VOL)
+        .setBucketName(BUCKET_ONE)
+        .setObjectID(KEY_TWO_OBJECT_ID)
+        .setParentObjectID(DIR_TWO_OBJECT_ID)
+        .build();
+    // Call constructFullPath and verify the result
+    String fullPath = ReconUtils.constructFullPath(keyInfo,
+        reconNamespaceSummaryManager, reconOMMetadataManager);
+    String expectedPath = "vol/bucket1/dir1/dir2/file2";
+    Assertions.assertEquals(expectedPath, fullPath);
+
+    // Create key info for file 3
+    keyInfo = new OmKeyInfo.Builder()
+        .setKeyName("file3")
+        .setVolumeName(VOL)
+        .setBucketName(BUCKET_ONE)
+        .setObjectID(KEY_THREE_OBJECT_ID)
+        .setParentObjectID(DIR_THREE_OBJECT_ID)
+        .build();
+    fullPath = ReconUtils.constructFullPath(keyInfo,
+        reconNamespaceSummaryManager, reconOMMetadataManager);
+    expectedPath = "vol/bucket1/dir1/dir3/file3";
+    Assertions.assertEquals(expectedPath, fullPath);
+
+    // Create key info for file 6
+    keyInfo = new OmKeyInfo.Builder()
+        .setKeyName("file6")
+        .setVolumeName(VOL)
+        .setBucketName(BUCKET_ONE)
+        .setObjectID(KEY_SIX_OBJECT_ID)
+        .setParentObjectID(DIR_FOUR_OBJECT_ID)
+        .build();
+    fullPath = ReconUtils.constructFullPath(keyInfo,
+        reconNamespaceSummaryManager, reconOMMetadataManager);
+    expectedPath = "vol/bucket1/dir1/dir4/file6";
+    Assertions.assertEquals(expectedPath, fullPath);
+
+    // Create key info for file 1
+    keyInfo = new OmKeyInfo.Builder()
+        .setKeyName("file1")
+        .setVolumeName(VOL)
+        .setBucketName(BUCKET_ONE)
+        .setObjectID(KEY_ONE_OBJECT_ID)
+        .setParentObjectID(BUCKET_ONE_OBJECT_ID)
+        .build();
+    fullPath = ReconUtils.constructFullPath(keyInfo,
+        reconNamespaceSummaryManager, reconOMMetadataManager);
+    expectedPath = "vol/bucket1/file1";
+    Assertions.assertEquals(expectedPath, fullPath);
+
+    // Create key info for file 9
+    keyInfo = new OmKeyInfo.Builder()
+        .setKeyName("file9")
+        .setVolumeName(VOL_TWO)
+        .setBucketName(BUCKET_THREE)
+        .setObjectID(KEY_NINE_OBJECT_ID)
+        .setParentObjectID(DIR_FIVE_OBJECT_ID)
+        .build();
+    fullPath = ReconUtils.constructFullPath(keyInfo,
+        reconNamespaceSummaryManager, reconOMMetadataManager);
+    expectedPath = "vol2/bucket3/dir5/file9";
+    Assertions.assertEquals(expectedPath, fullPath);
+
+    // Check for when we encounter a NSSUmamry with parentId -1
+    // Fetch NSSummary for dir1 and immediately update its parentId.
+    NSSummary dir1Summary = reconNamespaceSummaryManager.getNSSummary(DIR_ONE_OBJECT_ID);
+    dir1Summary.setParentId(-1);  // Update parentId to -1
+
+    reconNamespaceSummaryManager.deleteNSSummary(DIR_ONE_OBJECT_ID);
+    reconNamespaceSummaryManager.storeNSSummary(DIR_ONE_OBJECT_ID, dir1Summary);
+
+    NSSummary changedDir1Summary = reconNamespaceSummaryManager.getNSSummary(DIR_ONE_OBJECT_ID);
+    Assertions.assertEquals(-1, changedDir1Summary.getParentId(), "The parentId should be updated to -1");
+
+    keyInfo = new OmKeyInfo.Builder()
+        .setKeyName("file2")
+        .setVolumeName(VOL)
+        .setBucketName(BUCKET_ONE)
+        .setObjectID(KEY_TWO_OBJECT_ID)
+        .setParentObjectID(DIR_TWO_OBJECT_ID)
+        .build();
+    // Call constructFullPath and verify the result
+    fullPath = ReconUtils.constructFullPath(keyInfo,
+        reconNamespaceSummaryManager, reconOMMetadataManager);
+  }
+
+  @Test
+  public void testConstructFullPathWithNegativeParentIdTriggersRebuild() throws IOException {
+    // Setup
+    long dirOneObjectId = 1L; // Sample object ID for the directory
+    ReconNamespaceSummaryManager mockSummaryManager = mock(ReconNamespaceSummaryManager.class);
+    ReconOMMetadataManager mockMetadataManager = mock(ReconOMMetadataManager.class);
+    NSSummary dir1Summary = new NSSummary();
+    dir1Summary.setParentId(-1); // Simulate directory at the top of the tree
+    when(mockSummaryManager.getNSSummary(dirOneObjectId)).thenReturn(dir1Summary);
+
+    OmKeyInfo keyInfo = new OmKeyInfo.Builder()
+        .setKeyName("file2")
+        .setVolumeName("vol")
+        .setBucketName("bucket1")
+        .setObjectID(2L)
+        .setParentObjectID(dirOneObjectId)
+        .build();
+
+    String result = ReconUtils.constructFullPath(keyInfo, mockSummaryManager, mockMetadataManager);
+    assertEquals("", result, "Expected an empty string return due to rebuild trigger");
+  }
+
+  @Test
+  public void testLoggingWhenParentIdIsNegative() throws IOException {
+    ReconNamespaceSummaryManager mockManager =
+        mock(ReconNamespaceSummaryManager.class);
+    Logger mockLogger = mock(Logger.class);
+    ReconUtils.setLogger(mockLogger);
+
+    NSSummary mockSummary = new NSSummary();
+    mockSummary.setParentId(-1);
+    when(mockManager.getNSSummary(anyLong())).thenReturn(mockSummary);
+
+    OmKeyInfo keyInfo = new OmKeyInfo.Builder()
+        .setKeyName("testKey")
+        .setVolumeName("vol")
+        .setBucketName("bucket")
+        .setObjectID(1L)
+        .setParentObjectID(1L)
+        .build();
+
+    ReconUtils.constructFullPath(keyInfo, mockManager, null);
+
+    // Assert
+    ArgumentCaptor<String> logCaptor = ArgumentCaptor.forClass(String.class);
+    verify(mockLogger).warn(logCaptor.capture());
+    String loggedMessage = logCaptor.getValue();
+
+    // Here we can assert the exact message we expect to see in the logs.
+    assertEquals(
+        "NSSummary tree is currently being rebuilt, returning empty string " +
+            "for path construction.", loggedMessage);
+  }
+
 
   /**
    * Write directories and keys info into OM DB.
@@ -1244,7 +1406,7 @@ public class TestNSSummaryEndpointWithFSO {
   }
 
   private static SCMNodeStat getMockSCMRootStat() {
-    return new SCMNodeStat(ROOT_QUOTA, ROOT_DATA_SIZE, 
-        ROOT_QUOTA - ROOT_DATA_SIZE);
+    return new SCMNodeStat(ROOT_QUOTA, ROOT_DATA_SIZE,
+        ROOT_QUOTA - ROOT_DATA_SIZE, 0, ROOT_QUOTA - ROOT_DATA_SIZE - 1);
   }
 }

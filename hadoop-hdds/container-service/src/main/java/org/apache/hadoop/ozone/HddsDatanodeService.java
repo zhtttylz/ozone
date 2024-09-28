@@ -33,13 +33,10 @@ import org.apache.hadoop.conf.Configurable;
 import org.apache.hadoop.hdds.DFSConfigKeysLegacy;
 import org.apache.hadoop.hdds.DatanodeVersion;
 import org.apache.hadoop.hdds.HddsUtils;
-import org.apache.hadoop.hdds.StringUtils;
 import org.apache.hadoop.hdds.cli.GenericCli;
 import org.apache.hadoop.hdds.cli.HddsVersionProvider;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.conf.ReconfigurationHandler;
-import org.apache.hadoop.hdds.datanode.metadata.DatanodeCRLStore;
-import org.apache.hadoop.hdds.datanode.metadata.DatanodeCRLStoreImpl;
 import org.apache.hadoop.hdds.protocol.DatanodeDetails;
 import org.apache.hadoop.hdds.protocol.SecretKeyProtocol;
 import org.apache.hadoop.hdds.protocolPB.SCMSecurityProtocolClientSideTranslatorPB;
@@ -48,7 +45,6 @@ import org.apache.hadoop.hdds.security.symmetric.DefaultSecretKeyClient;
 import org.apache.hadoop.hdds.security.symmetric.SecretKeyClient;
 import org.apache.hadoop.hdds.security.x509.certificate.client.CertificateClient;
 import org.apache.hadoop.hdds.security.x509.certificate.client.DNCertificateClient;
-import org.apache.hadoop.hdds.security.x509.certificate.utils.CertificateSignRequest;
 import org.apache.hadoop.hdds.server.http.HttpConfig;
 import org.apache.hadoop.hdds.server.OzoneAdmins;
 import org.apache.hadoop.hdds.server.http.RatisDropwizardExports;
@@ -83,6 +79,7 @@ import static org.apache.hadoop.ozone.OzoneConfigKeys.HDDS_DATANODE_PLUGINS_KEY;
 import static org.apache.hadoop.ozone.OzoneConfigKeys.OZONE_BLOCK_DELETING_SERVICE_WORKERS;
 import static org.apache.hadoop.ozone.conf.OzoneServiceConfig.DEFAULT_SHUTDOWN_HOOK_PRIORITY;
 import static org.apache.hadoop.ozone.common.Storage.StorageState.INITIALIZED;
+import static org.apache.hadoop.ozone.container.replication.ReplicationServer.ReplicationConfig.REPLICATION_STREAMS_LIMIT_KEY;
 import static org.apache.hadoop.security.UserGroupInformation.getCurrentUser;
 import static org.apache.hadoop.ozone.container.common.statemachine.DatanodeConfiguration.HDDS_DATANODE_BLOCK_DELETE_THREAD_MAX;
 import static org.apache.hadoop.util.ExitUtil.terminate;
@@ -122,7 +119,6 @@ public class HddsDatanodeService extends GenericCli implements ServicePlugin {
   private DNMXBeanImpl serviceRuntimeInfo =
       new DNMXBeanImpl(HddsVersionInfo.HDDS_VERSION_INFO) { };
   private ObjectName dnInfoBeanName;
-  private DatanodeCRLStore dnCRLStore;
   private HddsDatanodeClientProtocolServer clientProtocolServer;
   private OzoneAdmins admins;
   private ReconfigurationHandler reconfigurationHandler;
@@ -175,7 +171,7 @@ public class HddsDatanodeService extends GenericCli implements ServicePlugin {
   public Void call() throws Exception {
     OzoneConfiguration configuration = createOzoneConfiguration();
     if (printBanner) {
-      StringUtils.startupShutdownMessage(HddsVersionInfo.HDDS_VERSION_INFO,
+      HddsServerUtil.startupShutdownMessage(HddsVersionInfo.HDDS_VERSION_INFO,
           HddsDatanodeService.class, args, LOG, configuration);
     }
     start(configuration);
@@ -233,7 +229,6 @@ public class HddsDatanodeService extends GenericCli implements ServicePlugin {
       datanodeDetails.setRevision(
           HddsVersionInfo.HDDS_VERSION_INFO.getRevision());
       datanodeDetails.setBuildDate(HddsVersionInfo.HDDS_VERSION_INFO.getDate());
-      datanodeDetails.setCurrentVersion(DatanodeVersion.CURRENT_VERSION);
       TracingUtil.initTracing(
           "HddsDatanodeService." + datanodeDetails.getUuidString()
               .substring(0, 8), conf);
@@ -272,17 +267,14 @@ public class HddsDatanodeService extends GenericCli implements ServicePlugin {
         layoutStorage.initialize();
       }
 
-      // initialize datanode CRL store
-      dnCRLStore = new DatanodeCRLStoreImpl(conf);
-
       if (OzoneSecurityUtil.isSecurityEnabled(conf)) {
         dnCertClient = initializeCertificateClient(dnCertClient);
 
         if (secConf.isTokenEnabled()) {
           SecretKeyProtocol secretKeyProtocol =
               HddsServerUtil.getSecretKeyClientForDatanode(conf);
-          secretKeyClient = DefaultSecretKeyClient.create(conf,
-              secretKeyProtocol);
+          secretKeyClient = DefaultSecretKeyClient.create(
+              conf, secretKeyProtocol, "");
           secretKeyClient.start(conf);
         }
       }
@@ -292,10 +284,12 @@ public class HddsDatanodeService extends GenericCli implements ServicePlugin {
               .register(HDDS_DATANODE_BLOCK_DELETE_THREAD_MAX,
                   this::reconfigBlockDeleteThreadMax)
               .register(OZONE_BLOCK_DELETING_SERVICE_WORKERS,
-                  this::reconfigDeletingServiceWorkers);
+                  this::reconfigDeletingServiceWorkers)
+              .register(REPLICATION_STREAMS_LIMIT_KEY,
+                  this::reconfigReplicationStreamsLimit);
 
-      datanodeStateMachine = new DatanodeStateMachine(datanodeDetails, conf,
-          dnCertClient, secretKeyClient, this::terminateDatanode, dnCRLStore,
+      datanodeStateMachine = new DatanodeStateMachine(this, datanodeDetails, conf,
+          dnCertClient, secretKeyClient, this::terminateDatanode,
           reconfigurationHandler);
       try {
         httpServer = new HddsDatanodeHttpServer(conf);
@@ -393,35 +387,7 @@ public class HddsDatanodeService extends GenericCli implements ServicePlugin {
           this::terminateDatanode);
       certClient = dnCertClient;
     }
-    CertificateClient.InitResponse response = certClient.init();
-    LOG.info("Init response: {}", response);
-    switch (response) {
-    case SUCCESS:
-      LOG.info("Initialization successful, case:{}.", response);
-      break;
-    case GETCERT:
-      CertificateSignRequest.Builder csrBuilder = certClient.getCSRBuilder();
-      String dnCertSerialId =
-          certClient.signAndStoreCertificate(csrBuilder.build());
-      // persist cert ID to VERSION file
-      datanodeDetails.setCertSerialId(dnCertSerialId);
-      persistDatanodeDetails(datanodeDetails);
-      LOG.info("Successfully stored SCM signed certificate, case:{}.",
-          response);
-      break;
-    case FAILURE:
-      LOG.error("DN security initialization failed, case:{}.", response);
-      throw new RuntimeException("DN security initialization failed.");
-    case RECOVER:
-      LOG.error("DN security initialization failed, case:{}. OM certificate " +
-          "is missing.", response);
-      throw new RuntimeException("DN security initialization failed.");
-    default:
-      LOG.error("DN security initialization failed. Init response: {}",
-          response);
-      throw new RuntimeException("DN security initialization failed.");
-    }
-
+    certClient.initWithRecovery();
     return certClient;
   }
 
@@ -450,17 +416,19 @@ public class HddsDatanodeService extends GenericCli implements ServicePlugin {
     String idFilePath = HddsServerUtil.getDatanodeIdFilePath(conf);
     Preconditions.checkNotNull(idFilePath);
     File idFile = new File(idFilePath);
+    DatanodeDetails details;
     if (idFile.exists()) {
-      return ContainerUtils.readDatanodeDetailsFrom(idFile);
+      details = ContainerUtils.readDatanodeDetailsFrom(idFile);
+      // Current version is always overridden to the latest
+      details.setCurrentVersion(getDefaultCurrentVersion());
     } else {
       // There is no datanode.id file, this might be the first time datanode
       // is started.
-      DatanodeDetails details = DatanodeDetails.newBuilder()
-          .setUuid(UUID.randomUUID()).build();
-      details.setInitialVersion(DatanodeVersion.CURRENT_VERSION);
-      details.setCurrentVersion(DatanodeVersion.CURRENT_VERSION);
-      return details;
+      details = DatanodeDetails.newBuilder().setUuid(UUID.randomUUID()).build();
+      details.setInitialVersion(getDefaultInitialVersion());
+      details.setCurrentVersion(getDefaultCurrentVersion());
     }
+    return details;
   }
 
   /**
@@ -530,11 +498,6 @@ public class HddsDatanodeService extends GenericCli implements ServicePlugin {
     return clientProtocolServer;
   }
 
-  @VisibleForTesting
-  public DatanodeCRLStore getCRLStore() {
-    return dnCRLStore;
-  }
-
   public void join() {
     if (datanodeStateMachine != null) {
       try {
@@ -586,14 +549,6 @@ public class HddsDatanodeService extends GenericCli implements ServicePlugin {
         getClientProtocolServer().stop();
       }
       unregisterMXBean();
-      // stop dn crl store
-      try {
-        if (dnCRLStore != null) {
-          dnCRLStore.stop();
-        }
-      } catch (Exception ex) {
-        LOG.error("Datanode CRL store stop failed", ex);
-      }
       RatisDropwizardExports.clear(ratisMetricsMap, ratisReporterList);
 
       if (secretKeyClient != null) {
@@ -665,6 +620,10 @@ public class HddsDatanodeService extends GenericCli implements ServicePlugin {
     }
   }
 
+  public boolean isStopped() {
+    return isStopped.get();
+  }
+
   /**
    * Check ozone admin privilege, throws exception if not admin.
    */
@@ -695,5 +654,29 @@ public class HddsDatanodeService extends GenericCli implements ServicePlugin {
     getDatanodeStateMachine().getContainer().getBlockDeletingService()
         .setPoolSize(Integer.parseInt(value));
     return value;
+  }
+
+  private String reconfigReplicationStreamsLimit(String value) {
+    getConf().set(REPLICATION_STREAMS_LIMIT_KEY, value);
+
+    getDatanodeStateMachine().getContainer().getReplicationServer()
+        .setPoolSize(Integer.parseInt(value));
+    return value;
+  }
+
+  /**
+   * Returns the initial version of the datanode.
+   */
+  @VisibleForTesting
+  public static int getDefaultInitialVersion() {
+    return DatanodeVersion.CURRENT_VERSION;
+  }
+
+  /**
+   * Returns the current version of the datanode.
+   */
+  @VisibleForTesting
+  public static int getDefaultCurrentVersion() {
+    return DatanodeVersion.CURRENT_VERSION;
   }
 }

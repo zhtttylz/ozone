@@ -21,7 +21,7 @@ import org.apache.hadoop.hdds.annotation.InterfaceAudience;
 import org.apache.hadoop.hdds.protocol.proto.StorageContainerLocationProtocolProtos.ContainerTokenSecretProto;
 import org.apache.hadoop.hdds.scm.container.ContainerID;
 import org.apache.hadoop.io.Text;
-import org.apache.hadoop.util.ProtobufUtils;
+import org.apache.hadoop.ozone.util.ProtobufUtils;
 
 import java.io.DataInput;
 import java.io.DataInputStream;
@@ -64,13 +64,18 @@ public class ContainerTokenIdentifier extends ShortLivedTokenIdentifier {
 
   @Override
   public void write(DataOutput out) throws IOException {
+    out.write(getBytes());
+  }
+
+  @Override
+  public byte[] getBytes() {
     ContainerTokenSecretProto.Builder builder = ContainerTokenSecretProto
         .newBuilder()
         .setOwnerId(getOwnerId())
         .setSecretKeyId(ProtobufUtils.toProtobuf(getSecretKeyId()))
         .setExpiryDate(getExpiry().toEpochMilli())
         .setContainerId(containerID.getProtobuf());
-    out.write(builder.build().toByteArray());
+    return builder.build().toByteArray();
   }
 
   @Override
@@ -81,6 +86,17 @@ public class ContainerTokenIdentifier extends ShortLivedTokenIdentifier {
     }
     ContainerTokenSecretProto proto =
         ContainerTokenSecretProto.parseFrom((DataInputStream) in);
+    readFromProto(proto);
+  }
+
+  @Override
+  public void readFromByteArray(byte[] bytes) throws IOException {
+    ContainerTokenSecretProto proto =
+        ContainerTokenSecretProto.parseFrom(bytes);
+    readFromProto(proto);
+  }
+
+  private void readFromProto(ContainerTokenSecretProto proto) {
     setSecretKeyId(ProtobufUtils.fromProtobuf(proto.getSecretKeyId()));
     setExpiry(Instant.ofEpochMilli(proto.getExpiryDate()));
     setOwnerId(proto.getOwnerId());

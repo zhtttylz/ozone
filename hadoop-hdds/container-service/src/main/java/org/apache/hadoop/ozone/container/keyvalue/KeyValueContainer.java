@@ -76,6 +76,7 @@ import static org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.Res
 import static org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.Result.ERROR_IN_COMPACT_DB;
 import static org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.Result.ERROR_IN_DB_SYNC;
 import static org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.Result.INVALID_CONTAINER_STATE;
+import static org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.Result.IO_EXCEPTION;
 import static org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.Result.UNSUPPORTED_REQUEST;
 import static org.apache.hadoop.ozone.container.common.utils.StorageVolumeUtil.onFailure;
 
@@ -433,6 +434,12 @@ public class KeyValueContainer implements Container<KeyValueContainerData> {
 
   @Override
   public void close() throws StorageContainerException {
+    try (DBHandle db = BlockUtils.getDB(containerData, config)) {
+      containerData.clearFinalizedBlock(db);
+    } catch (IOException ex) {
+      LOG.error("Error in deleting entry from Finalize Block table", ex);
+      throw new StorageContainerException(ex, IO_EXCEPTION);
+    }
     closeAndFlushIfNeeded(containerData::closeContainer);
     LOG.info("Container {} is closed with bcsId {}.",
         containerData.getContainerID(),
@@ -684,14 +691,15 @@ public class KeyValueContainer implements Container<KeyValueContainerData> {
       ContainerPacker<KeyValueContainerData> packer) throws IOException {
     writeLock();
     try {
-      // Closed/ Quasi closed containers are considered for replication by
-      // replication manager if they are under-replicated.
+      // Closed/ Quasi closed and unhealthy containers are considered for
+      // replication by replication manager if they are under-replicated.
       ContainerProtos.ContainerDataProto.State state =
           getContainerData().getState();
       if (!(state == ContainerProtos.ContainerDataProto.State.CLOSED ||
-          state == ContainerDataProto.State.QUASI_CLOSED)) {
+          state == ContainerDataProto.State.QUASI_CLOSED
+          || state == ContainerDataProto.State.UNHEALTHY)) {
         throw new IllegalStateException(
-            "Only (quasi)closed containers can be exported, but " +
+            "Only (quasi)closed and unhealthy containers can be exported. " +
                 "ContainerId=" + getContainerData().getContainerID() +
                 " is in state " + state);
       }

@@ -38,10 +38,6 @@ public final class HddsConfigKeys {
       "hdds.container.report.interval";
   public static final String HDDS_CONTAINER_REPORT_INTERVAL_DEFAULT =
       "60m";
-  public static final String HDDS_CRL_STATUS_REPORT_INTERVAL =
-      "hdds.crl.status.report.interval";
-  public static final String HDDS_CRL_STATUS_REPORT_INTERVAL_DEFAULT =
-      "60s";
   public static final String HDDS_PIPELINE_REPORT_INTERVAL =
       "hdds.pipeline.report.interval";
   public static final String HDDS_PIPELINE_REPORT_INTERVAL_DEFAULT =
@@ -152,6 +148,11 @@ public final class HddsConfigKeys {
       + ".name";
   public static final String HDDS_PUBLIC_KEY_FILE_NAME_DEFAULT = "public.pem";
 
+  public static final String HDDS_HTTP_SERVER_KEYSTORE_TYPE = "ssl.server.keystore.type";
+  public static final String HDDS_HTTP_SERVER_KEYSTORE_TYPE_DEFAULT = "jks";
+  public static final String HDDS_HTTP_SERVER_TRUSTSTORE_TYPE = "ssl.server.truststore.type";
+  public static final String HDDS_HTTP_SERVER_TRUSTSTORE_TYPE_DEFAULT = "jks";
+
   public static final String HDDS_BLOCK_TOKEN_EXPIRY_TIME =
       "hdds.block.token.expiry.time";
   public static final String HDDS_BLOCK_TOKEN_EXPIRY_TIME_DEFAULT = "1d";
@@ -178,9 +179,6 @@ public final class HddsConfigKeys {
   public static final String HDDS_X509_DIR_NAME_DEFAULT = "certs";
   public static final String HDDS_X509_FILE_NAME = "hdds.x509.file.name";
   public static final String HDDS_X509_FILE_NAME_DEFAULT = "certificate.crt";
-
-  public static final String HDDS_X509_CRL_NAME = "hdds.x509.CRL.name";
-  public static final String HDDS_X509_CRL_NAME_DEFAULT = "scm.crl";
 
   /**
    * Default duration of certificates issued by SCM CA. The formats accepted are
@@ -338,6 +336,9 @@ public final class HddsConfigKeys {
       HDDS_SECURITY_CLIENT_SCM_SECRET_KEY_DATANODE_PROTOCOL_ACL =
       "hdds.security.client.scm.secretkey.datanode.protocol.acl";
 
+  public static final String OZONE_SECURITY_RECONFIGURE_PROTOCOL_ACL =
+      "ozone.security.reconfigure.protocol.acl";
+
   // Determines if the Container Chunk Manager will write user data to disk
   // Set to false only for specific performance tests
   public static final String HDDS_CONTAINER_PERSISTDATA =
@@ -362,10 +363,13 @@ public final class HddsConfigKeys {
       "0.0.0.0";
   public static final String HDDS_DATANODE_CLIENT_PORT_KEY =
       "hdds.datanode.client.port";
-  public static final int HDDS_DATANODE_CLIENT_PORT_DEFAULT = 9864;
+  public static final int HDDS_DATANODE_CLIENT_PORT_DEFAULT = 19864;
   public static final String HDDS_DATANODE_HANDLER_COUNT_KEY =
       "hdds.datanode.handler.count";
-  public static final int HDDS_DATANODE_HANDLER_COUNT_DEFAULT = 1;
+  public static final int HDDS_DATANODE_HANDLER_COUNT_DEFAULT = 10;
+  public static final String HDDS_DATANODE_READ_THREADPOOL_KEY =
+      "hdds.datanode.read.threadpool";
+  public static final int HDDS_DATANODE_READ_THREADPOOL_DEFAULT = 10;
   public static final String HDDS_DATANODE_HTTP_BIND_HOST_DEFAULT = "0.0.0.0";
   public static final int HDDS_DATANODE_HTTP_BIND_PORT_DEFAULT = 9882;
   public static final int HDDS_DATANODE_HTTPS_BIND_PORT_DEFAULT = 9883;
@@ -392,4 +396,9 @@ public final class HddsConfigKeys {
 
   public static final String OZONE_AUDIT_LOG_DEBUG_CMD_LIST_DNAUDIT =
       "ozone.audit.log.debug.cmd.list.dnaudit";
+
+  public static final String HDDS_DATANODE_SLOW_OP_WARNING_THRESHOLD_KEY =
+      "hdds.datanode.slow.op.warning.threshold";
+  public static final String HDDS_DATANODE_SLOW_OP_WARNING_THRESHOLD_DEFAULT =
+      "500ms";
 }

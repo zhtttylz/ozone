@@ -27,6 +27,7 @@ import org.apache.hadoop.hdds.recon.ReconConfig;
 import org.apache.hadoop.hdds.utils.DBCheckpointServlet;
 import org.apache.hadoop.hdds.utils.db.DBCheckpoint;
 import org.apache.hadoop.hdds.utils.db.RDBCheckpointUtils;
+import org.apache.hadoop.hdds.utils.db.RDBStore;
 import org.apache.hadoop.hdds.utils.db.Table;
 import org.apache.hadoop.hdds.utils.db.TableIterator;
 import org.apache.hadoop.ozone.OzoneConsts;
@@ -36,7 +37,8 @@ import org.apache.hadoop.ozone.om.snapshot.OmSnapshotUtils;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.ozone.rocksdiff.RocksDBCheckpointDiffer;
 
-import org.jetbrains.annotations.NotNull;
+import com.google.common.base.Preconditions;
+import jakarta.annotation.Nonnull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -220,47 +222,24 @@ public class OMDBCheckpointServlet extends DBCheckpointServlet {
   }
 
   /**
-   * Pauses rocksdb compaction threads while creating copies of
-   * compaction logs and hard links of sst backups.
+   * Copies compaction logs and hard links of sst backups to tmpDir.
    * @param  tmpdir - Place to create copies/links
    * @param  flush -  Whether to flush the db or not.
    * @return Checkpoint containing snapshot entries expected.
    */
   @Override
-  public DBCheckpoint getCheckpoint(Path tmpdir, boolean flush)
-      throws IOException {
-    DBCheckpoint checkpoint;
-
+  public DBCheckpoint getCheckpoint(Path tmpdir, boolean flush) throws IOException {
     // make tmp directories to contain the copies
     RocksDBCheckpointDiffer differ = getDbStore().getRocksDBCheckpointDiffer();
-    DirectoryData sstBackupDir = new DirectoryData(tmpdir,
-        differ.getSSTBackupDir());
-    DirectoryData compactionLogDir = new DirectoryData(tmpdir,
-        differ.getCompactionLogDir());
+    DirectoryData sstBackupDir = new DirectoryData(tmpdir, differ.getSSTBackupDir());
+    DirectoryData compactionLogDir = new DirectoryData(tmpdir, differ.getCompactionLogDir());
 
-    long startTime = System.currentTimeMillis();
-    long pauseCounter = PAUSE_COUNTER.incrementAndGet();
+    // Create checkpoint and then copy the files so that it has all the compaction entries and files.
+    DBCheckpoint dbCheckpoint = getDbStore().getCheckpoint(flush);
+    FileUtils.copyDirectory(compactionLogDir.getOriginalDir(), compactionLogDir.getTmpDir());
+    OmSnapshotUtils.linkFiles(sstBackupDir.getOriginalDir(), sstBackupDir.getTmpDir());
 
-    // Pause compactions, Copy/link files and get checkpoint.
-    try {
-      LOG.info("Compaction pausing {} started.", pauseCounter);
-      differ.incrementTarballRequestCount();
-      FileUtils.copyDirectory(compactionLogDir.getOriginalDir(),
-          compactionLogDir.getTmpDir());
-      OmSnapshotUtils.linkFiles(sstBackupDir.getOriginalDir(),
-          sstBackupDir.getTmpDir());
-      checkpoint = getDbStore().getCheckpoint(flush);
-    } finally {
-      // Unpause the compaction threads.
-      synchronized (getDbStore().getRocksDBCheckpointDiffer()) {
-        differ.decrementTarballRequestCount();
-        differ.notifyAll();
-        long elapsedTime = System.currentTimeMillis() - startTime;
-        LOG.info("Compaction pausing {} ended. Elapsed ms: {}",
-            pauseCounter, elapsedTime);
-      }
-    }
-    return checkpoint;
+    return dbCheckpoint;
   }
 
 
@@ -320,8 +299,7 @@ public class OMDBCheckpointServlet extends DBCheckpointServlet {
 
     // Get the snapshot files.
     Set<Path> snapshotPaths = waitForSnapshotDirs(checkpoint);
-    Path snapshotDir = Paths.get(OMStorage.getOmDbDir(getConf()).toString(),
-        OM_SNAPSHOT_DIR);
+    Path snapshotDir = getSnapshotDir();
     if (!processDir(snapshotDir, copyFiles, hardLinkFiles, sstFilesToExclude,
         snapshotPaths, excluded, copySize, null)) {
       return false;
@@ -615,7 +593,7 @@ public class OMDBCheckpointServlet extends DBCheckpointServlet {
     }
   }
 
-  @NotNull
+  @Nonnull
   private static Path getMetaDirPath(Path checkpointLocation) {
     // This check is done to take care of findbugs else below getParent()
     // should not be null.
@@ -638,47 +616,59 @@ public class OMDBCheckpointServlet extends DBCheckpointServlet {
         .getConfiguration();
   }
 
+  private Path getSnapshotDir() {
+    OzoneManager om = (OzoneManager) getServletContext().getAttribute(OzoneConsts.OM_CONTEXT_ATTRIBUTE);
+    RDBStore store = (RDBStore) om.getMetadataManager().getStore();
+    // store.getSnapshotsParentDir() returns path to checkpointState (e.g. <om-data-dir>/db.snapshots/checkpointState)
+    // But we need to return path till db.snapshots which contains checkpointState and diffState.
+    // So that whole snapshots and compaction information can be transferred to follower.
+    return Paths.get(store.getSnapshotsParentDir()).getParent();
+  }
+
   @Override
   public BootstrapStateHandler.Lock getBootstrapStateLock() {
     return lock;
   }
 
   static class Lock extends BootstrapStateHandler.Lock {
-    private final BootstrapStateHandler keyDeletingService;
-    private final BootstrapStateHandler sstFilteringService;
-    private final BootstrapStateHandler rocksDbCheckpointDiffer;
-    private final BootstrapStateHandler snapshotDeletingService;
+    private final List<BootstrapStateHandler.Lock> locks;
     private final OzoneManager om;
 
     Lock(OzoneManager om) {
+      Preconditions.checkNotNull(om);
+      Preconditions.checkNotNull(om.getKeyManager());
+      Preconditions.checkNotNull(om.getMetadataManager());
+      Preconditions.checkNotNull(om.getMetadataManager().getStore());
+
       this.om = om;
-      keyDeletingService = om.getKeyManager().getDeletingService();
-      sstFilteringService = om.getKeyManager().getSnapshotSstFilteringService();
-      rocksDbCheckpointDiffer = om.getMetadataManager().getStore()
-          .getRocksDBCheckpointDiffer();
-      snapshotDeletingService = om.getKeyManager().getSnapshotDeletingService();
+
+      locks = Stream.of(
+          om.getKeyManager().getDeletingService(),
+          om.getKeyManager().getSnapshotSstFilteringService(),
+          om.getMetadataManager().getStore().getRocksDBCheckpointDiffer(),
+          om.getKeyManager().getSnapshotDeletingService()
+      )
+          .filter(Objects::nonNull)
+          .map(BootstrapStateHandler::getBootstrapStateLock)
+          .collect(Collectors.toList());
     }
 
     @Override
     public BootstrapStateHandler.Lock lock()
         throws InterruptedException {
       // First lock all the handlers.
-      keyDeletingService.getBootstrapStateLock().lock();
-      sstFilteringService.getBootstrapStateLock().lock();
-      rocksDbCheckpointDiffer.getBootstrapStateLock().lock();
-      snapshotDeletingService.getBootstrapStateLock().lock();
+      for (BootstrapStateHandler.Lock lock : locks) {
+        lock.lock();
+      }
 
       // Then wait for the double buffer to be flushed.
-      om.getOmRatisServer().getOmStateMachine().awaitDoubleBufferFlush();
+      om.awaitDoubleBufferFlush();
       return this;
     }
 
     @Override
     public void unlock() {
-      snapshotDeletingService.getBootstrapStateLock().unlock();
-      rocksDbCheckpointDiffer.getBootstrapStateLock().unlock();
-      sstFilteringService.getBootstrapStateLock().unlock();
-      keyDeletingService.getBootstrapStateLock().unlock();
+      locks.forEach(BootstrapStateHandler.Lock::unlock);
     }
   }
 }

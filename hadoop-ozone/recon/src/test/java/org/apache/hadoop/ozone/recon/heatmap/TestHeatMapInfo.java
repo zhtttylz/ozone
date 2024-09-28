@@ -18,11 +18,10 @@
 
 package org.apache.hadoop.ozone.recon.heatmap;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
+import com.fasterxml.jackson.databind.JsonNode;
+import org.apache.hadoop.hdds.JsonTestUtils;
 import org.apache.hadoop.hdds.scm.server.OzoneStorageContainerManager;
+import org.apache.hadoop.hdds.server.JsonUtils;
 import org.apache.hadoop.ozone.recon.ReconTestInjector;
 import org.apache.hadoop.ozone.recon.api.types.EntityMetaData;
 import org.apache.hadoop.ozone.recon.api.types.EntityReadAccessHeatMapResponse;
@@ -32,19 +31,22 @@ import org.apache.hadoop.ozone.recon.scm.ReconStorageContainerManagerFacade;
 import org.apache.hadoop.ozone.recon.spi.StorageContainerServiceProvider;
 import org.apache.hadoop.ozone.recon.spi.impl.OzoneManagerServiceProviderImpl;
 import org.apache.hadoop.ozone.recon.spi.impl.StorageContainerServiceProviderImpl;
-import org.junit.Before;
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.jupiter.api.Assertions;
-import org.junit.rules.TemporaryFolder;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
 import java.util.stream.Collectors;
 
 import static org.apache.hadoop.ozone.recon.OMMetadataManagerTestUtils.getTestReconOmMetadataManager;
 import static org.apache.hadoop.ozone.recon.OMMetadataManagerTestUtils.initializeNewOmMetadataManager;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.mockito.Mockito.mock;
 
 /**
@@ -53,8 +55,8 @@ import static org.mockito.Mockito.mock;
  */
 public class TestHeatMapInfo {
 
-  @Rule
-  public TemporaryFolder temporaryFolder = new TemporaryFolder();
+  @TempDir
+  private Path temporaryFolder;
 
   private boolean isSetupDone = false;
   private ReconOMMetadataManager reconOMMetadataManager;
@@ -64,11 +66,12 @@ public class TestHeatMapInfo {
   @SuppressWarnings("checkstyle:methodlength")
   private void initializeInjector() throws Exception {
     reconOMMetadataManager = getTestReconOmMetadataManager(
-        initializeNewOmMetadataManager(temporaryFolder.newFolder()),
-        temporaryFolder.newFolder());
+        initializeNewOmMetadataManager(Files.createDirectory(
+            temporaryFolder.resolve("JunitOmDBDir")).toFile()),
+        Files.createDirectory(temporaryFolder.resolve("NewDir")).toFile());
 
     ReconTestInjector reconTestInjector =
-        new ReconTestInjector.Builder(temporaryFolder)
+        new ReconTestInjector.Builder(temporaryFolder.toFile())
             .withReconSqlDb()
             .withReconOm(reconOMMetadataManager)
             .withOmServiceProvider(mock(OzoneManagerServiceProviderImpl.class))
@@ -728,7 +731,7 @@ public class TestHeatMapInfo {
         "}";
   }
 
-  @Before
+  @BeforeEach
   public void setUp() throws Exception {
     // The following setup runs only once
     if (!isSetupDone) {
@@ -741,42 +744,39 @@ public class TestHeatMapInfo {
   public void testHeatMapGeneratedInfo() throws IOException {
     // Setup
     // Run the test
-    JsonElement jsonElement = JsonParser.parseString(auditRespStr);
-    JsonObject jsonObject = jsonElement.getAsJsonObject();
-    JsonElement facets = jsonObject.get("facets");
-    JsonObject facetsBucketsObject =
-        facets.getAsJsonObject().get("resources")
-            .getAsJsonObject();
-    ObjectMapper objectMapper = new ObjectMapper();
+    // Parse the JSON string to JsonNode
+    JsonNode rootNode = JsonUtils.readTree(auditRespStr);
 
+    JsonNode facetsNode = rootNode.path("facets");
+    JsonNode resourcesNode = facetsNode.path("resources");
+
+    // Deserialize the resources node directly if it's not missing
     HeatMapProviderDataResource auditLogFacetsResources =
-        objectMapper.readValue(
-            facetsBucketsObject.toString(), HeatMapProviderDataResource.class);
-    EntityMetaData[] entities = auditLogFacetsResources.getMetaDataList();
-    List<EntityMetaData> entityMetaDataList =
-        Arrays.stream(entities).collect(Collectors.toList());
-    EntityReadAccessHeatMapResponse entityReadAccessHeatMapResponse =
-        heatMapUtil.generateHeatMap(entityMetaDataList);
-    Assertions.assertTrue(
-        entityReadAccessHeatMapResponse.getChildren().size() > 0);
-    Assertions.assertEquals(12,
-        entityReadAccessHeatMapResponse.getChildren().size());
-    Assertions.assertEquals(25600, entityReadAccessHeatMapResponse.
-        getSize());
-    Assertions.assertEquals(2924, entityReadAccessHeatMapResponse.
-        getMinAccessCount());
-    Assertions.assertEquals(155074, entityReadAccessHeatMapResponse.
-        getMaxAccessCount());
-    Assertions.assertEquals("root", entityReadAccessHeatMapResponse.
-        getLabel());
-    Assertions.assertEquals(0.0,
-        entityReadAccessHeatMapResponse.getChildren().get(0).getColor());
-    Assertions.assertEquals(0.442,
-        entityReadAccessHeatMapResponse.getChildren().get(0).getChildren()
-            .get(0).getChildren().get(1).getColor());
-    Assertions.assertEquals(0.058,
-        entityReadAccessHeatMapResponse.getChildren().get(0).getChildren()
-            .get(1).getChildren().get(3).getColor());
+        JsonTestUtils.treeToValue(resourcesNode, HeatMapProviderDataResource.class);
+
+    if (auditLogFacetsResources != null) {
+      EntityMetaData[] entities = auditLogFacetsResources.getMetaDataList();
+      List<EntityMetaData> entityMetaDataList =
+          Arrays.stream(entities).collect(Collectors.toList());
+      EntityReadAccessHeatMapResponse entityReadAccessHeatMapResponse =
+          heatMapUtil.generateHeatMap(entityMetaDataList);
+      assertThat(
+          entityReadAccessHeatMapResponse.getChildren().size()).isGreaterThan(
+          0);
+      assertEquals(12, entityReadAccessHeatMapResponse.getChildren().size());
+      assertEquals(25600, entityReadAccessHeatMapResponse.getSize());
+      assertEquals(2924, entityReadAccessHeatMapResponse.getMinAccessCount());
+      assertEquals(155074, entityReadAccessHeatMapResponse.getMaxAccessCount());
+      assertEquals("root", entityReadAccessHeatMapResponse.getLabel());
+      assertEquals(0.0,
+          entityReadAccessHeatMapResponse.getChildren().get(0).getColor());
+      assertEquals(0.442,
+          entityReadAccessHeatMapResponse.getChildren().get(0).getChildren()
+              .get(0).getChildren().get(1).getColor());
+      assertEquals(0.058,
+          entityReadAccessHeatMapResponse.getChildren().get(0).getChildren()
+              .get(1).getChildren().get(3).getColor());
+    }
   }
 
   @Test
@@ -834,61 +834,51 @@ public class TestHeatMapInfo {
         "    }\n" +
         "  }\n" +
         "}";
-    JsonElement jsonElement =
-        JsonParser.parseString(auditRespStrWithVolumeEntityType);
-    JsonObject jsonObject = jsonElement.getAsJsonObject();
-    JsonElement facets = jsonObject.get("facets");
-    JsonElement resources = facets.getAsJsonObject().get("resources");
-    JsonObject facetsBucketsObject = new JsonObject();
-    if (null != resources) {
-      facetsBucketsObject = resources.getAsJsonObject();
-    }
-    ObjectMapper objectMapper = new ObjectMapper();
+    JsonNode rootNode = JsonUtils.readTree(auditRespStrWithVolumeEntityType);
 
+    JsonNode facetsNode = rootNode.path("facets");
+    JsonNode resourcesNode = facetsNode.path("resources");
+
+    // Deserialize the resources node directly if it's not missing
     HeatMapProviderDataResource auditLogFacetsResources =
-        objectMapper.readValue(
-            facetsBucketsObject.toString(), HeatMapProviderDataResource.class);
-    EntityMetaData[] entities = auditLogFacetsResources.getMetaDataList();
-    if (null != entities && entities.length > 0) {
-      List<EntityMetaData> entityMetaDataList =
-          Arrays.stream(entities).collect(Collectors.toList());
-      // Below heatmap response would be of format like:
-      //{
-      //  "label": "root",
-      //  "path": "/",
-      //  "children": [
-      //    {
-      //      "label": "s3v",
-      //      "path": "s3v",
-      //      "size": 256
-      //    },
-      //    {
-      //      "label": "testnewvol2",
-      //      "path": "testnewvol2",
-      //      "size": 256
-      //    }
-      //  ],
-      //  "size": 512,
-      //  "minAccessCount": 19263
-      //}
-      EntityReadAccessHeatMapResponse entityReadAccessHeatMapResponse =
-          heatMapUtil.generateHeatMap(entityMetaDataList);
-      Assertions.assertTrue(
-          entityReadAccessHeatMapResponse.getChildren().size() > 0);
-      Assertions.assertEquals(2,
-          entityReadAccessHeatMapResponse.getChildren().size());
-      Assertions.assertEquals(512, entityReadAccessHeatMapResponse.
-          getSize());
-      Assertions.assertEquals(8590, entityReadAccessHeatMapResponse.
-          getMinAccessCount());
-      Assertions.assertEquals(19263, entityReadAccessHeatMapResponse.
-          getMaxAccessCount());
-      Assertions.assertEquals(1.0,
-          entityReadAccessHeatMapResponse.getChildren().get(0).getColor());
-      Assertions.assertEquals("root", entityReadAccessHeatMapResponse.
-          getLabel());
-    } else {
-      Assertions.assertNull(entities);
+        JsonTestUtils.treeToValue(resourcesNode, HeatMapProviderDataResource.class);
+
+    if (auditLogFacetsResources != null) {
+      EntityMetaData[] entities = auditLogFacetsResources.getMetaDataList();
+      if (null != entities && entities.length > 0) {
+        List<EntityMetaData> entityMetaDataList =
+            Arrays.stream(entities).collect(Collectors.toList());
+        // Below heatmap response would be of format like:
+        //{
+        //  "label": "root",
+        //  "path": "/",
+        //  "children": [
+        //    {
+        //      "label": "s3v",
+        //      "path": "s3v",
+        //      "size": 256
+        //    },
+        //    {
+        //      "label": "testnewvol2",
+        //      "path": "testnewvol2",
+        //      "size": 256
+        //    }
+        //  ],
+        //  "size": 512,
+        //  "minAccessCount": 19263
+        //}
+        EntityReadAccessHeatMapResponse entityReadAccessHeatMapResponse =
+            heatMapUtil.generateHeatMap(entityMetaDataList);
+        assertThat(entityReadAccessHeatMapResponse.getChildren().size()).isGreaterThan(0);
+        assertEquals(2, entityReadAccessHeatMapResponse.getChildren().size());
+        assertEquals(512, entityReadAccessHeatMapResponse.getSize());
+        assertEquals(8590, entityReadAccessHeatMapResponse.getMinAccessCount());
+        assertEquals(19263, entityReadAccessHeatMapResponse.getMaxAccessCount());
+        assertEquals(1.0, entityReadAccessHeatMapResponse.getChildren().get(0).getColor());
+        assertEquals("root", entityReadAccessHeatMapResponse.getLabel());
+      } else {
+        assertNull(entities);
+      }
     }
   }
 
@@ -975,151 +965,150 @@ public class TestHeatMapInfo {
         "    }\n" +
         "  }\n" +
         "}";
-    JsonElement jsonElement =
-        JsonParser.parseString(auditRespStrWithPathAndBucketEntityType);
-    JsonObject jsonObject = jsonElement.getAsJsonObject();
-    JsonElement facets = jsonObject.get("facets");
-    JsonElement resources = facets.getAsJsonObject().get("resources");
-    JsonObject facetsBucketsObject = new JsonObject();
-    if (null != resources) {
-      facetsBucketsObject = resources.getAsJsonObject();
-    }
-    ObjectMapper objectMapper = new ObjectMapper();
 
-    HeatMapProviderDataResource auditLogFacetsResources =
-        objectMapper.readValue(
-            facetsBucketsObject.toString(), HeatMapProviderDataResource.class);
-    EntityMetaData[] entities = auditLogFacetsResources.getMetaDataList();
-    if (null != entities && entities.length > 0) {
-      List<EntityMetaData> entityMetaDataList =
-          Arrays.stream(entities).collect(Collectors.toList());
-      // Below heatmap response would be of format like:
-      //{
-      //    "label": "root",
-      //    "path": "/",
-      //    "children": [
-      //        {
-      //            "label": "testnewvol2",
-      //            "path": "testnewvol2",
-      //            "children": [
-      //                {
-      //                    "label": "fsobuck11",
-      //                    "path": "/testnewvol2/fsobuck11",
-      //                    "children": [
-      //                        {
-      //                            "label": "",
-      //                            "path": "/testnewvol2/fsobuck11/",
-      //                            "size": 100,
-      //                            "accessCount": 701,
-      //                            "color": 1.0
-      //                        }
-      //                    ],
-      //                    "size": 100,
-      //                    "minAccessCount": 701,
-      //                    "maxAccessCount": 701
-      //                },
-      //                {
-      //                    "label": "fsobuck12",
-      //                    "path": "/testnewvol2/fsobuck12",
-      //                    "children": [
-      //                        {
-      //                            "label": "",
-      //                            "path": "/testnewvol2/fsobuck12/",
-      //                            "size": 100,
-      //                            "accessCount": 701,
-      //                            "color": 1.0
-      //                        }
-      //                    ],
-      //                    "size": 100,
-      //                    "minAccessCount": 701,
-      //                    "maxAccessCount": 701
-      //                },
-      //                {
-      //                    "label": "fsobuck13",
-      //                    "path": "/testnewvol2/fsobuck13",
-      //                    "children": [
-      //                        {
-      //                            "label": "",
-      //                            "path": "/testnewvol2/fsobuck13/",
-      //                            "size": 100,
-      //                            "accessCount": 701,
-      //                            "color": 1.0
-      //                        }
-      //                    ],
-      //                    "size": 100,
-      //                    "minAccessCount": 701,
-      //                    "maxAccessCount": 701
-      //                },
-      //                {
-      //                    "label": "obsbuck11",
-      //                    "path": "/testnewvol2/obsbuck11",
-      //                    "children": [
-      //                        {
-      //                            "label": "",
-      //                            "path": "/testnewvol2/obsbuck11/",
-      //                            "size": 107,
-      //                            "accessCount": 263,
-      //                            "color": 1.0
-      //                        }
-      //                    ],
-      //                    "size": 107,
-      //                    "minAccessCount": 263,
-      //                    "maxAccessCount": 263
-      //                },
-      //                {
-      //                    "label": "obsbuck12",
-      //                    "path": "/testnewvol2/obsbuck12",
-      //                    "children": [
-      //                        {
-      //                            "label": "",
-      //                            "path": "/testnewvol2/obsbuck12/",
-      //                            "size": 100,
-      //                            "accessCount": 200,
-      //                            "color": 1.0
-      //                        }
-      //                    ],
-      //                    "size": 100,
-      //                    "minAccessCount": 200,
-      //                    "maxAccessCount": 200
-      //                },
-      //                {
-      //                    "label": "obsbuck13",
-      //                    "path": "/testnewvol2/obsbuck13",
-      //                    "children": [
-      //                        {
-      //                            "label": "",
-      //                            "path": "/testnewvol2/obsbuck13/",
-      //                            "size": 100,
-      //                            "accessCount": 200,
-      //                            "color": 1.0
-      //                        }
-      //                    ],
-      //                    "size": 100,
-      //                    "minAccessCount": 200,
-      //                    "maxAccessCount": 200
-      //                }
-      //            ],
-      //            "size": 607
-      //        }
-      //    ],
-      //    "size": 607,
-      //    "minAccessCount": 200,
-      //    "maxAccessCount": 701
-      //}
-      EntityReadAccessHeatMapResponse entityReadAccessHeatMapResponse =
-          heatMapUtil.generateHeatMap(entityMetaDataList);
-      Assertions.assertTrue(
-          entityReadAccessHeatMapResponse.getChildren().size() > 0);
-      Assertions.assertEquals(2,
-          entityReadAccessHeatMapResponse.getChildren().size());
-      Assertions.assertEquals(0.0,
-          entityReadAccessHeatMapResponse.getChildren().get(0).getColor());
-      String path =
-          entityReadAccessHeatMapResponse.getChildren().get(1).getChildren()
-              .get(0).getPath();
-      Assertions.assertEquals("/testnewvol2/fsobuck11", path);
-    } else {
-      Assertions.assertNull(entities);
+    JsonNode rootNode = JsonUtils.readTree(auditRespStrWithPathAndBucketEntityType);
+    // Navigate to the nested JSON objects
+    JsonNode facetsNode = rootNode.path("facets");
+    JsonNode resourcesNode = facetsNode.path("resources");
+    // Deserialize the resources node directly if it's not missing
+    HeatMapProviderDataResource auditLogFacetsResources = null;
+    auditLogFacetsResources =
+        JsonTestUtils.treeToValue(resourcesNode, HeatMapProviderDataResource.class);
+
+    if (auditLogFacetsResources != null) {
+      EntityMetaData[] entities = auditLogFacetsResources.getMetaDataList();
+      if (null != entities && entities.length > 0) {
+        List<EntityMetaData> entityMetaDataList =
+            Arrays.stream(entities).collect(Collectors.toList());
+        // Below heatmap response would be of format like:
+        //{
+        //    "label": "root",
+        //    "path": "/",
+        //    "children": [
+        //        {
+        //            "label": "testnewvol2",
+        //            "path": "testnewvol2",
+        //            "children": [
+        //                {
+        //                    "label": "fsobuck11",
+        //                    "path": "/testnewvol2/fsobuck11",
+        //                    "children": [
+        //                        {
+        //                            "label": "",
+        //                            "path": "/testnewvol2/fsobuck11/",
+        //                            "size": 100,
+        //                            "accessCount": 701,
+        //                            "color": 1.0
+        //                        }
+        //                    ],
+        //                    "size": 100,
+        //                    "minAccessCount": 701,
+        //                    "maxAccessCount": 701
+        //                },
+        //                {
+        //                    "label": "fsobuck12",
+        //                    "path": "/testnewvol2/fsobuck12",
+        //                    "children": [
+        //                        {
+        //                            "label": "",
+        //                            "path": "/testnewvol2/fsobuck12/",
+        //                            "size": 100,
+        //                            "accessCount": 701,
+        //                            "color": 1.0
+        //                        }
+        //                    ],
+        //                    "size": 100,
+        //                    "minAccessCount": 701,
+        //                    "maxAccessCount": 701
+        //                },
+        //                {
+        //                    "label": "fsobuck13",
+        //                    "path": "/testnewvol2/fsobuck13",
+        //                    "children": [
+        //                        {
+        //                            "label": "",
+        //                            "path": "/testnewvol2/fsobuck13/",
+        //                            "size": 100,
+        //                            "accessCount": 701,
+        //                            "color": 1.0
+        //                        }
+        //                    ],
+        //                    "size": 100,
+        //                    "minAccessCount": 701,
+        //                    "maxAccessCount": 701
+        //                },
+        //                {
+        //                    "label": "obsbuck11",
+        //                    "path": "/testnewvol2/obsbuck11",
+        //                    "children": [
+        //                        {
+        //                            "label": "",
+        //                            "path": "/testnewvol2/obsbuck11/",
+        //                            "size": 107,
+        //                            "accessCount": 263,
+        //                            "color": 1.0
+        //                        }
+        //                    ],
+        //                    "size": 107,
+        //                    "minAccessCount": 263,
+        //                    "maxAccessCount": 263
+        //                },
+        //                {
+        //                    "label": "obsbuck12",
+        //                    "path": "/testnewvol2/obsbuck12",
+        //                    "children": [
+        //                        {
+        //                            "label": "",
+        //                            "path": "/testnewvol2/obsbuck12/",
+        //                            "size": 100,
+        //                            "accessCount": 200,
+        //                            "color": 1.0
+        //                        }
+        //                    ],
+        //                    "size": 100,
+        //                    "minAccessCount": 200,
+        //                    "maxAccessCount": 200
+        //                },
+        //                {
+        //                    "label": "obsbuck13",
+        //                    "path": "/testnewvol2/obsbuck13",
+        //                    "children": [
+        //                        {
+        //                            "label": "",
+        //                            "path": "/testnewvol2/obsbuck13/",
+        //                            "size": 100,
+        //                            "accessCount": 200,
+        //                            "color": 1.0
+        //                        }
+        //                    ],
+        //                    "size": 100,
+        //                    "minAccessCount": 200,
+        //                    "maxAccessCount": 200
+        //                }
+        //            ],
+        //            "size": 607
+        //        }
+        //    ],
+        //    "size": 607,
+        //    "minAccessCount": 200,
+        //    "maxAccessCount": 701
+        //}
+        EntityReadAccessHeatMapResponse entityReadAccessHeatMapResponse =
+            heatMapUtil.generateHeatMap(entityMetaDataList);
+        assertThat(
+            entityReadAccessHeatMapResponse.getChildren().size()).isGreaterThan(
+            0);
+        assertEquals(2,
+            entityReadAccessHeatMapResponse.getChildren().size());
+        assertEquals(0.0,
+            entityReadAccessHeatMapResponse.getChildren().get(0).getColor());
+        String path =
+            entityReadAccessHeatMapResponse.getChildren().get(1).getChildren()
+                .get(0).getPath();
+        assertEquals("/testnewvol2/fsobuck11", path);
+      } else {
+        assertNull(entities);
+      }
     }
   }
 }

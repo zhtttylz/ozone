@@ -39,6 +39,8 @@ import java.net.MalformedURLException;
 import java.net.URI;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Enumeration;
@@ -49,6 +51,7 @@ import java.util.Properties;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import org.apache.commons.io.FileUtils;
 import org.apache.hadoop.HadoopIllegalArgumentException;
 import org.apache.hadoop.conf.ConfServlet;
 import org.apache.hadoop.conf.Configuration.IntegerRanges;
@@ -64,6 +67,8 @@ import org.apache.hadoop.http.FilterInitializer;
 import org.apache.hadoop.http.lib.StaticUserWebFilter;
 import org.apache.hadoop.jmx.JMXJsonServlet;
 import org.apache.hadoop.log.LogLevel;
+import org.apache.hadoop.ozone.OzoneConfigKeys;
+import org.apache.hadoop.ozone.util.ShutdownHookManager;
 import org.apache.hadoop.security.AuthenticationFilterInitializer;
 import org.apache.hadoop.security.SecurityUtil;
 import org.apache.hadoop.security.UserGroupInformation;
@@ -79,7 +84,6 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
-import com.sun.jersey.spi.container.servlet.ServletContainer;
 import org.eclipse.jetty.http.HttpVersion;
 import org.eclipse.jetty.server.ConnectionFactory;
 import org.eclipse.jetty.server.Connector;
@@ -107,6 +111,8 @@ import org.eclipse.jetty.util.MultiException;
 import org.eclipse.jetty.util.ssl.SslContextFactory;
 import org.eclipse.jetty.util.thread.QueuedThreadPool;
 import org.eclipse.jetty.webapp.WebAppContext;
+import org.glassfish.jersey.server.ResourceConfig;
+import org.glassfish.jersey.servlet.ServletContainer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -129,20 +135,20 @@ import static org.apache.hadoop.security.AuthenticationFilterInitializer.getFilt
 public final class HttpServer2 implements FilterContainer {
   public static final Logger LOG = LoggerFactory.getLogger(HttpServer2.class);
 
-  private static final String HTTP_SCHEME = "http";
-  private static final String HTTPS_SCHEME = "https";
+  public static final String HTTP_SCHEME = "http";
+  public static final String HTTPS_SCHEME = "https";
 
-  private static final String HTTP_MAX_REQUEST_HEADER_SIZE_KEY =
+  public static final String HTTP_MAX_REQUEST_HEADER_SIZE_KEY =
       "hadoop.http.max.request.header.size";
   private static final int HTTP_MAX_REQUEST_HEADER_SIZE_DEFAULT = 65536;
-  private static final String HTTP_MAX_RESPONSE_HEADER_SIZE_KEY =
+  public static final String HTTP_MAX_RESPONSE_HEADER_SIZE_KEY =
       "hadoop.http.max.response.header.size";
   private static final int HTTP_MAX_RESPONSE_HEADER_SIZE_DEFAULT = 65536;
 
   private static final String HTTP_SOCKET_BACKLOG_SIZE_KEY =
       "hadoop.http.socket.backlog.size";
   private static final int HTTP_SOCKET_BACKLOG_SIZE_DEFAULT = 128;
-  private static final String HTTP_MAX_THREADS_KEY = "hadoop.http.max.threads";
+  public static final String HTTP_MAX_THREADS_KEY = "hadoop.http.max.threads";
   private static final String HTTP_ACCEPTOR_COUNT_KEY =
       "hadoop.http.acceptor.count";
   // -1 to use default behavior of setting count based on CPU core count
@@ -152,7 +158,7 @@ public final class HttpServer2 implements FilterContainer {
   // -1 to use default behavior of setting count based on CPU core count
   private static final int HTTP_SELECTOR_COUNT_DEFAULT = -1;
   // idle timeout in milliseconds
-  private static final String HTTP_IDLE_TIMEOUT_MS_KEY =
+  public static final String HTTP_IDLE_TIMEOUT_MS_KEY =
       "hadoop.http.idle_timeout.ms";
 
   /**
@@ -166,12 +172,12 @@ public final class HttpServer2 implements FilterContainer {
   private static final int HTTP_IDLE_TIMEOUT_MS_DEFAULT = 60000;
   private static final String HTTP_TEMP_DIR_KEY = "hadoop.http.temp.dir";
 
-  private static final String FILTER_INITIALIZER_PROPERTY
+  public static final String FILTER_INITIALIZER_PROPERTY
       = "ozone.http.filter.initializers";
 
   // The ServletContext attribute where the daemon Configuration
   // gets stored.
-  private static final String CONF_CONTEXT_ATTRIBUTE = "hadoop.conf";
+  public static final String CONF_CONTEXT_ATTRIBUTE = "hadoop.conf";
   private static final String ADMINS_ACL = "admins.acl";
   private static final String SPNEGO_FILTER = "SpnegoFilter";
   private static final String NO_CACHE_FILTER = "NoCacheFilter";
@@ -831,10 +837,8 @@ public final class HttpServer2 implements FilterContainer {
       final String pathSpec) {
     LOG.info("addJerseyResourcePackage: packageName={}, pathSpec={}",
             packageName, pathSpec);
-    final ServletHolder sh = new ServletHolder(ServletContainer.class);
-    sh.setInitParameter("com.sun.jersey.config.property.resourceConfigClass",
-        "com.sun.jersey.api.core.PackagesResourceConfig");
-    sh.setInitParameter("com.sun.jersey.config.property.packages", packageName);
+    final ResourceConfig config = new ResourceConfig().packages(packageName);
+    final ServletHolder sh = new ServletHolder(new ServletContainer(config));
     webAppContext.addServlet(sh, pathSpec);
   }
 
@@ -1669,8 +1673,7 @@ public final class HttpServer2 implements FilterContainer {
       String path = ((HttpServletRequest) request).getRequestURI();
       ServletContextHandler.Context sContext =
           (ServletContextHandler.Context) config.getServletContext();
-      String mime = sContext.getMimeType(path);
-      return (mime == null) ? null : mime;
+      return sContext.getMimeType(path);
     }
 
     private void initHttpHeaderMap() {
@@ -1757,5 +1760,33 @@ public final class HttpServer2 implements FilterContainer {
   @VisibleForTesting
   protected List<ServerConnector> getListeners() {
     return listeners;
+  }
+
+  /**
+   * Utility method to initialize config key ozone.http.basedir and create a
+   * temporary directory under the current working directory if not set.
+   *
+   * @param ozoneConfiguration current configuration.
+   * @throws IOException if unable to create a temp directory.
+   */
+  public static void setHttpBaseDir(OzoneConfiguration ozoneConfiguration)
+          throws IOException {
+    if (org.apache.commons.lang3.StringUtils.isEmpty(ozoneConfiguration.get(
+            OzoneConfigKeys.OZONE_HTTP_BASEDIR))) {
+      // Setting ozone.http.basedir to cwd if not set so that server setup
+      // doesn't fail.
+      File tmpMetaDir = Files.createTempDirectory(Paths.get(""),
+              "ozone_http_tmp_base_dir").toFile();
+      ShutdownHookManager.get().addShutdownHook(() -> {
+        try {
+          FileUtils.deleteDirectory(tmpMetaDir);
+        } catch (IOException e) {
+          LOG.error("Failed to cleanup temporary metadata directory {}",
+                  tmpMetaDir.getAbsolutePath(), e);
+        }
+      }, 0);
+      ozoneConfiguration.set(OzoneConfigKeys.OZONE_HTTP_BASEDIR,
+              tmpMetaDir.getAbsolutePath());
+    }
   }
 }

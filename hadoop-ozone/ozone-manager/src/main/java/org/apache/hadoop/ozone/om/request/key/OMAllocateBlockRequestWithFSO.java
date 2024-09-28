@@ -20,6 +20,7 @@ package org.apache.hadoop.ozone.om.request.key;
 
 import com.google.common.base.Preconditions;
 import org.apache.hadoop.hdds.client.ReplicationConfig;
+import org.apache.ratis.server.protocol.TermIndex;
 import org.apache.hadoop.ozone.OzoneConsts;
 import org.apache.hadoop.ozone.audit.AuditLogger;
 import org.apache.hadoop.ozone.audit.OMAction;
@@ -33,7 +34,7 @@ import org.apache.hadoop.ozone.om.helpers.OmKeyLocationInfo;
 import org.apache.hadoop.ozone.om.helpers.OzoneFSUtils;
 import org.apache.hadoop.ozone.om.helpers.BucketLayout;
 import org.apache.hadoop.ozone.om.helpers.QuotaUtil;
-import org.apache.hadoop.ozone.om.ratis.utils.OzoneManagerDoubleBufferHelper;
+import org.apache.hadoop.ozone.om.helpers.OmFSOFile;
 import org.apache.hadoop.ozone.om.request.file.OMFileRequest;
 import org.apache.hadoop.ozone.om.request.util.OmResponseUtil;
 import org.apache.hadoop.ozone.om.response.OMClientResponse;
@@ -44,20 +45,18 @@ import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos.Allocat
 import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos.KeyArgs;
 import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos.OMRequest;
 import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos.OMResponse;
-import org.apache.hadoop.ozone.security.acl.IAccessAuthorizer;
-import org.jetbrains.annotations.NotNull;
+import jakarta.annotation.Nonnull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.nio.file.Path;
-import java.nio.file.Paths;
+import java.nio.file.InvalidPathException;
 import java.util.Collections;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 
 import static org.apache.hadoop.ozone.om.exceptions.OMException.ResultCodes.KEY_NOT_FOUND;
+import static org.apache.hadoop.ozone.om.exceptions.OMException.ResultCodes.KEY_UNDER_LEASE_RECOVERY;
 import static org.apache.hadoop.ozone.om.lock.OzoneManagerLock.Resource.BUCKET_LOCK;
 
 /**
@@ -74,8 +73,8 @@ public class OMAllocateBlockRequestWithFSO extends OMAllocateBlockRequest {
   }
 
   @Override
-  public OMClientResponse validateAndUpdateCache(OzoneManager ozoneManager,
-      long trxnLogIndex, OzoneManagerDoubleBufferHelper omDoubleBufferHelper) {
+  public OMClientResponse validateAndUpdateCache(OzoneManager ozoneManager, TermIndex termIndex) {
+    final long trxnLogIndex = termIndex.getIndex();
 
     AllocateBlockRequest allocateBlockRequest =
             getOmRequest().getAllocateBlockRequest();
@@ -108,19 +107,11 @@ public class OMAllocateBlockRequestWithFSO extends OMAllocateBlockRequest {
     OMClientResponse omClientResponse = null;
 
     OmKeyInfo openKeyInfo = null;
-    IOException exception = null;
+    Exception exception = null;
     OmBucketInfo omBucketInfo = null;
     boolean acquiredLock = false;
 
     try {
-      keyArgs = resolveBucketLink(ozoneManager, keyArgs, auditMap);
-      volumeName = keyArgs.getVolumeName();
-      bucketName = keyArgs.getBucketName();
-
-      // check Acl
-      checkKeyAclsInOpenKeyTable(ozoneManager, volumeName, bucketName, keyName,
-          IAccessAuthorizer.ACLType.WRITE, allocateBlockRequest.getClientID());
-
       validateBucketAndVolume(omMetadataManager, volumeName,
           bucketName);
 
@@ -135,12 +126,22 @@ public class OMAllocateBlockRequestWithFSO extends OMAllocateBlockRequest {
         throw new OMException("Open Key not found " + openKeyName,
                 KEY_NOT_FOUND);
       }
-
+      if (openKeyInfo.getMetadata().containsKey(OzoneConsts.LEASE_RECOVERY)) {
+        throw new OMException("Open Key " + openKeyName + " is under lease recovery",
+            KEY_UNDER_LEASE_RECOVERY);
+      }
+      if (openKeyInfo.getMetadata().containsKey(OzoneConsts.DELETED_HSYNC_KEY) ||
+          openKeyInfo.getMetadata().containsKey(OzoneConsts.OVERWRITTEN_HSYNC_KEY)) {
+        throw new OMException("Open Key " + openKeyName + " is already deleted/overwritten",
+            KEY_NOT_FOUND);
+      }
       List<OmKeyLocationInfo> newLocationList = Collections.singletonList(
               OmKeyLocationInfo.getFromProtobuf(blockLocation));
 
-      acquiredLock = omMetadataManager.getLock().acquireWriteLock(BUCKET_LOCK,
-              volumeName, bucketName);
+      mergeOmLockDetails(
+          omMetadataManager.getLock().acquireWriteLock(BUCKET_LOCK,
+              volumeName, bucketName));
+      acquiredLock = getOmLockDetails().isLockAcquired();
       omBucketInfo = getBucketInfo(omMetadataManager, volumeName, bucketName);
       // check bucket and volume quota
       long preAllocatedKeySize = newLocationList.size()
@@ -164,7 +165,7 @@ public class OMAllocateBlockRequestWithFSO extends OMAllocateBlockRequest {
       openKeyInfo.setUpdateID(trxnLogIndex, ozoneManager.isRatisEnabled());
 
       // Add to cache.
-      addOpenTableCacheEntry(trxnLogIndex, omMetadataManager, openKeyName,
+      addOpenTableCacheEntry(trxnLogIndex, omMetadataManager, openKeyName, keyName,
               openKeyInfo);
 
       omResponse.setAllocateBlockResponse(AllocateBlockResponse.newBuilder()
@@ -174,7 +175,7 @@ public class OMAllocateBlockRequestWithFSO extends OMAllocateBlockRequest {
               openKeyInfo, omBucketInfo.copyObject(), volumeId);
       LOG.debug("Allocated block for Volume:{}, Bucket:{}, OpenKey:{}",
               volumeName, bucketName, openKeyName);
-    } catch (IOException ex) {
+    } catch (IOException | InvalidPathException ex) {
       omMetrics.incNumBlockAllocateCallFails();
       exception = ex;
       omClientResponse = new OMAllocateBlockResponseWithFSO(
@@ -182,15 +183,17 @@ public class OMAllocateBlockRequestWithFSO extends OMAllocateBlockRequest {
       LOG.error("Allocate Block failed. Volume:{}, Bucket:{}, OpenKey:{}. " +
               "Exception:{}", volumeName, bucketName, openKeyName, exception);
     } finally {
-      addResponseToDoubleBuffer(trxnLogIndex, omClientResponse,
-              omDoubleBufferHelper);
       if (acquiredLock) {
-        omMetadataManager.getLock().releaseWriteLock(BUCKET_LOCK, volumeName,
-                bucketName);
+        mergeOmLockDetails(
+            omMetadataManager.getLock().releaseWriteLock(
+                BUCKET_LOCK, volumeName, bucketName));
+      }
+      if (omClientResponse != null) {
+        omClientResponse.setOmLockDetails(getOmLockDetails());
       }
     }
 
-    auditLog(auditLogger, buildAuditMessage(OMAction.ALLOCATE_BLOCK, auditMap,
+    markForAudit(auditLogger, buildAuditMessage(OMAction.ALLOCATE_BLOCK, auditMap,
             exception, getOmRequest().getUserInfo()));
 
     return omClientResponse;
@@ -207,26 +210,24 @@ public class OMAllocateBlockRequestWithFSO extends OMAllocateBlockRequest {
       String keyName, long clientID, OzoneManager ozoneManager)
           throws IOException {
     OMMetadataManager omMetadataManager = ozoneManager.getMetadataManager();
-    final long volumeId = omMetadataManager.getVolumeId(volumeName);
-    final long bucketId = omMetadataManager.getBucketId(
-            volumeName, bucketName);
-    String fileName = OzoneFSUtils.getFileName(keyName);
-    Iterator<Path> pathComponents = Paths.get(keyName).iterator();
-    long parentID = OMFileRequest.getParentID(volumeId, bucketId,
-            pathComponents, keyName, omMetadataManager);
-    return omMetadataManager.getOpenFileName(volumeId, bucketId, parentID,
-            fileName, clientID);
+
+    return new OmFSOFile.Builder()
+          .setVolumeName(volumeName)
+          .setBucketName(bucketName)
+          .setKeyName(keyName)
+          .setOmMetadataManager(omMetadataManager)
+          .build().getOpenFileName(clientID);
   }
 
   private void addOpenTableCacheEntry(long trxnLogIndex,
-      OMMetadataManager omMetadataManager, String openKeyName,
+      OMMetadataManager omMetadataManager, String openKeyName, String keyName,
       OmKeyInfo openKeyInfo) {
     String fileName = openKeyInfo.getFileName();
     OMFileRequest.addOpenFileTableCacheEntry(omMetadataManager, openKeyName,
-            openKeyInfo, fileName, trxnLogIndex);
+            openKeyInfo, fileName, keyName, trxnLogIndex);
   }
 
-  @NotNull
+  @Nonnull
   private OMClientResponse getOmClientResponse(long clientID,
       OMResponse.Builder omResponse, OmKeyInfo openKeyInfo,
       OmBucketInfo omBucketInfo, long volumeId) {

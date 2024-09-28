@@ -17,7 +17,6 @@
  */
 package org.apache.hadoop.hdds.scm;
 
-import java.io.Closeable;
 import java.io.IOException;
 
 import org.apache.hadoop.hdds.scm.pipeline.Pipeline;
@@ -25,15 +24,59 @@ import org.apache.hadoop.hdds.scm.pipeline.Pipeline;
 /**
  * Interface to provide XceiverClient when needed.
  */
-public interface XceiverClientFactory extends Closeable {
+public interface XceiverClientFactory extends AutoCloseable {
 
+  /**
+   * Acquires a XceiverClientSpi connected to a container capable of
+   * storing the specified key. It does not consider the topology
+   * of the datanodes in the pipeline (e.g. closest datanode to the
+   * client)
+   *
+   * @param pipeline the container pipeline for the client connection
+   * @return XceiverClientSpi connected to a container
+   * @throws IOException if a XceiverClientSpi cannot be acquired
+   */
   XceiverClientSpi acquireClient(Pipeline pipeline) throws IOException;
 
-  void releaseClient(XceiverClientSpi xceiverClient, boolean invalidateClient);
+  /**
+   * Releases a XceiverClientSpi after use.
+   *
+   * @param client client to release
+   * @param invalidateClient if true, invalidates the client in cache
+   */
+  void releaseClient(XceiverClientSpi client, boolean invalidateClient);
 
+  /**
+   * Acquires a XceiverClientSpi connected to a container for read.
+   *
+   * @param pipeline the container pipeline for the client connection
+   * @return XceiverClientSpi connected to a container
+   * @throws IOException if a XceiverClientSpi cannot be acquired
+   */
   XceiverClientSpi acquireClientForReadData(Pipeline pipeline)
       throws IOException;
 
-  void releaseClientForReadData(XceiverClientSpi xceiverClient, boolean b);
+  /**
+   * Releases a read XceiverClientSpi after use.
+   *
+   * @param client client to release
+   * @param invalidateClient if true, invalidates the client in cache
+   */
+  void releaseClientForReadData(XceiverClientSpi client,
+                                boolean invalidateClient);
+
+  /**
+   * Acquires a XceiverClientSpi connected to a container capable of
+   * storing the specified key.
+   *
+   * @param pipeline the container pipeline for the client connection
+   * @return XceiverClientSpi connected to a container
+   * @throws IOException if a XceiverClientSpi cannot be acquired
+   */
+  XceiverClientSpi acquireClient(Pipeline pipeline, boolean topologyAware)
+      throws IOException;
+
+  void releaseClient(XceiverClientSpi xceiverClient, boolean invalidateClient,
+                     boolean topologyAware);
 
 }

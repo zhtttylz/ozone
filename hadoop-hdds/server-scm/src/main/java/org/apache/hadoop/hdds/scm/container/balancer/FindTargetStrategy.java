@@ -22,10 +22,10 @@ import org.apache.hadoop.hdds.protocol.DatanodeDetails;
 import org.apache.hadoop.hdds.scm.container.ContainerID;
 import org.apache.hadoop.hdds.scm.node.DatanodeUsageInfo;
 
-import javax.annotation.Nonnull;
+import jakarta.annotation.Nonnull;
 import java.util.Collection;
 import java.util.List;
-import java.util.Set;
+import java.util.Map;
 
 /**
  * This interface can be used to implement strategies to find a target for a
@@ -40,7 +40,7 @@ public interface FindTargetStrategy {
    * enter a potential target.
    *
    * @param source Datanode to find a target for
-   * @param candidateContainers Set of candidate containers satisfying
+   * @param candidateContainer candidate containers satisfying
    *                            selection criteria
    *                            {@link ContainerBalancerSelectionCriteria}
    * (DatanodeDetails, Long) method returns true if the size specified in the
@@ -49,7 +49,7 @@ public interface FindTargetStrategy {
    * selected container
    */
   ContainerMoveSelection findTargetForContainerMove(
-      DatanodeDetails source, Set<ContainerID> candidateContainers);
+      DatanodeDetails source, ContainerID candidateContainer);
 
   /**
    * increase the Entering size of a candidate target data node.
@@ -69,4 +69,6 @@ public interface FindTargetStrategy {
    *               that containers can be moved to
    */
   void resetPotentialTargets(@Nonnull Collection<DatanodeDetails> targets);
+
+  Map<DatanodeDetails, Long> getSizeEnteringNodes();
 }

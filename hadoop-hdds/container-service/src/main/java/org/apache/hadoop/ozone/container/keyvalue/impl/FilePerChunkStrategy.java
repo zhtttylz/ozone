@@ -20,14 +20,12 @@ package org.apache.hadoop.ozone.container.keyvalue.impl;
 
 import com.google.common.base.Preconditions;
 
-import com.google.common.collect.Lists;
 import org.apache.hadoop.fs.FileUtil;
 import org.apache.hadoop.hdds.client.BlockID;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos;
 import org.apache.hadoop.hdds.scm.container.common.helpers.StorageContainerException;
 import org.apache.hadoop.ozone.OzoneConsts;
 import org.apache.hadoop.ozone.common.ChunkBuffer;
-import org.apache.hadoop.ozone.common.utils.BufferUtils;
 import org.apache.hadoop.ozone.container.common.helpers.BlockData;
 import org.apache.hadoop.ozone.container.common.helpers.ChunkInfo;
 import org.apache.hadoop.ozone.container.common.transport.server.ratis.DispatcherContext;
@@ -48,7 +46,6 @@ import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.io.IOException;
-import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
@@ -68,7 +65,10 @@ public class FilePerChunkStrategy implements ChunkManager {
 
   private final boolean doSyncWrite;
   private final BlockManager blockManager;
-  private final long defaultReadBufferCapacity;
+  private final int defaultReadBufferCapacity;
+  private final int readMappedBufferThreshold;
+  private final int readMappedBufferMaxCount;
+  private final MappedBufferManager mappedBufferManager;
   private final VolumeSet volumeSet;
 
   public FilePerChunkStrategy(boolean sync, BlockManager manager,
@@ -77,7 +77,17 @@ public class FilePerChunkStrategy implements ChunkManager {
     blockManager = manager;
     this.defaultReadBufferCapacity = manager == null ? 0 :
         manager.getDefaultReadBufferCapacity();
+    this.readMappedBufferThreshold = manager == null ? 0
+        : manager.getReadMappedBufferThreshold();
+    this.readMappedBufferMaxCount = manager == null ? 0
+        : manager.getReadMappedBufferMaxCount();
+    LOG.info("ozone.chunk.read.mapped.buffer.max.count is load with {}", readMappedBufferMaxCount);
     this.volumeSet = volSet;
+    if (this.readMappedBufferMaxCount > 0) {
+      mappedBufferManager = new MappedBufferManager(this.readMappedBufferMaxCount);
+    } else {
+      mappedBufferManager = null;
+    }
   }
 
   private static void checkLayoutVersion(Container container) {
@@ -222,19 +232,16 @@ public class FilePerChunkStrategy implements ChunkManager {
 
     List<File> possibleFiles = new ArrayList<>();
     possibleFiles.add(finalChunkFile);
-    if (dispatcherContext != null && dispatcherContext.isReadFromTmpFile()) {
+    if (DispatcherContext.op(dispatcherContext).readFromTmpFile()) {
       possibleFiles.add(getTmpChunkFile(finalChunkFile, dispatcherContext));
       // HDDS-2372. Read finalChunkFile after tmpChunkFile to solve race
       // condition between read and commit.
       possibleFiles.add(finalChunkFile);
     }
 
-    long len = info.getLen();
-    long bufferCapacity = ChunkManager.getBufferCapacityForChunkRead(info,
+    final long len = info.getLen();
+    int bufferCapacity = ChunkManager.getBufferCapacityForChunkRead(info,
         defaultReadBufferCapacity);
-
-    ByteBuffer[] dataBuffers = BufferUtils.assignByteBuffers(len,
-        bufferCapacity);
 
     long chunkFileOffset = 0;
     if (info.getOffset() != 0) {
@@ -267,8 +274,8 @@ public class FilePerChunkStrategy implements ChunkManager {
         if (file.exists()) {
           long offset = info.getOffset() - chunkFileOffset;
           Preconditions.checkState(offset >= 0);
-          ChunkUtils.readData(file, dataBuffers, offset, len, volume);
-          return ChunkBuffer.wrap(Lists.newArrayList(dataBuffers));
+          return ChunkUtils.readData(len, bufferCapacity, file, offset, volume,
+              readMappedBufferThreshold, readMappedBufferMaxCount > 0, mappedBufferManager);
         }
       } catch (StorageContainerException ex) {
         //UNABLE TO FIND chunk is not a problem as we will try with the
@@ -276,7 +283,6 @@ public class FilePerChunkStrategy implements ChunkManager {
         if (ex.getResult() != UNABLE_TO_FIND_CHUNK) {
           throw ex;
         }
-        BufferUtils.clearBuffers(dataBuffers);
       }
     }
     throw new StorageContainerException(
@@ -346,8 +352,7 @@ public class FilePerChunkStrategy implements ChunkManager {
 
   private static File getChunkFile(KeyValueContainer container, BlockID blockID,
       ChunkInfo info) throws StorageContainerException {
-    return FILE_PER_CHUNK.getChunkFile(container.getContainerData(), blockID,
-        info);
+    return FILE_PER_CHUNK.getChunkFile(container.getContainerData(), blockID, info.getChunkName());
   }
 
   /**

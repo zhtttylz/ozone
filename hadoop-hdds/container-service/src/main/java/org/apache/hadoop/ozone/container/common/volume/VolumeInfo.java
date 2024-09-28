@@ -20,22 +20,16 @@ package org.apache.hadoop.ozone.container.common.volume;
 
 import java.io.File;
 import java.io.IOException;
-import java.util.Collection;
 
 import org.apache.hadoop.fs.StorageType;
 import org.apache.hadoop.hdds.conf.ConfigurationSource;
-import org.apache.hadoop.hdds.conf.StorageSize;
 import org.apache.hadoop.hdds.fs.SpaceUsageCheckFactory;
 import org.apache.hadoop.hdds.fs.SpaceUsageCheckParams;
 
 import com.google.common.annotations.VisibleForTesting;
+import org.apache.hadoop.hdds.fs.SpaceUsageSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import static org.apache.hadoop.ozone.container.common.volume.VolumeUsage.PrecomputedVolumeSpace;
-import static org.apache.hadoop.hdds.scm.ScmConfigKeys.HDDS_DATANODE_DIR_DU_RESERVED;
-import static org.apache.hadoop.hdds.scm.ScmConfigKeys.HDDS_DATANODE_DIR_DU_RESERVED_PERCENT;
-import static org.apache.hadoop.hdds.scm.ScmConfigKeys.HDDS_DATANODE_DIR_DU_RESERVED_PERCENT_DEFAULT;
 
 /**
  * Stores information about a disk/volume.
@@ -52,15 +46,17 @@ import static org.apache.hadoop.hdds.scm.ScmConfigKeys.HDDS_DATANODE_DIR_DU_RESE
  * - fsCapacity: reported total capacity from local fs.
  * - minVolumeFreeSpace (mvfs) : determines the free space for closing
      containers.This is like adding a few reserved bytes to reserved space.
-     Dn's will send close container action to SCM at this limit & it is
+     Dn's will send close container action to SCM at this limit, and it is
      configurable.
 
  *
- *
+ * <pre>
+ * {@code
  * |----used----|   (avail)   |++mvfs++|++++reserved+++++++|
  * |<-     capacity                  ->|
  *              |     fsAvail      |-------other-----------|
  * |<-                   fsCapacity                      ->|
+ * }</pre>
  *
  * What we could directly get from local fs:
  *     fsCapacity, fsAvail, (fsUsed = fsCapacity - fsAvail)
@@ -84,10 +80,12 @@ import static org.apache.hadoop.hdds.scm.ScmConfigKeys.HDDS_DATANODE_DIR_DU_RESE
  * then we should use DedicatedDiskSpaceUsage for
  * `hdds.datanode.du.factory.classname`,
  * Then it is much simpler, since we don't care about other usage:
- *
+ * <pre>
+ * {@code
  *  |----used----|             (avail)/fsAvail              |
  *  |<-              capacity/fsCapacity                  ->|
- *
+ *  }
+ * </pre>
  *  We have avail == fsAvail.
  */
 public final class VolumeInfo {
@@ -100,13 +98,6 @@ public final class VolumeInfo {
   // Space usage calculator
   private final VolumeUsage usage;
 
-  // Capacity configured. This is useful when we want to
-  // limit the visible capacity for tests. If negative, then we just
-  // query from the filesystem.
-  private long configuredCapacity;
-
-  private long reservedInBytes;
-
   /**
    * Builder for VolumeInfo.
    */
@@ -115,7 +106,6 @@ public final class VolumeInfo {
     private final String rootDir;
     private SpaceUsageCheckFactory usageCheckFactory;
     private StorageType storageType;
-    private long configuredCapacity;
 
     public Builder(String root, ConfigurationSource config) {
       this.rootDir = root;
@@ -127,11 +117,6 @@ public final class VolumeInfo {
       return this;
     }
 
-    public Builder configuredCapacity(long capacity) {
-      this.configuredCapacity = capacity;
-      return this;
-    }
-
     public Builder usageCheckFactory(SpaceUsageCheckFactory factory) {
       this.usageCheckFactory = factory;
       return this;
@@ -140,55 +125,6 @@ public final class VolumeInfo {
     public VolumeInfo build() throws IOException {
       return new VolumeInfo(this);
     }
-  }
-
-  private long getReserved(ConfigurationSource conf) {
-    if (conf.isConfigured(HDDS_DATANODE_DIR_DU_RESERVED_PERCENT)
-        && conf.isConfigured(HDDS_DATANODE_DIR_DU_RESERVED)) {
-      LOG.error("Both {} and {} are set. Set either one, not both. If the " +
-          "volume matches with volume parameter in former config, it is set " +
-          "as reserved space. If not it fall backs to the latter config.",
-          HDDS_DATANODE_DIR_DU_RESERVED, HDDS_DATANODE_DIR_DU_RESERVED_PERCENT);
-    }
-
-    // 1. If hdds.datanode.dir.du.reserved is set for a volume then make it
-    // as the reserved bytes.
-    Collection<String> reserveList = conf.getTrimmedStringCollection(
-        HDDS_DATANODE_DIR_DU_RESERVED);
-    for (String reserve : reserveList) {
-      String[] words = reserve.split(":");
-      if (words.length < 2) {
-        LOG.error("Reserved space should config in pair, but current is {}",
-            reserve);
-        continue;
-      }
-
-      if (words[0].trim().equals(rootDir)) {
-        try {
-          StorageSize size = StorageSize.parse(words[1].trim());
-          return (long) size.getUnit().toBytes(size.getValue());
-        } catch (Exception e) {
-          LOG.error("Failed to parse StorageSize: {}", words[1].trim(), e);
-          break;
-        }
-      }
-    }
-
-    // 2. If hdds.datanode.dir.du.reserved not set and
-    // hdds.datanode.dir.du.reserved.percent is set, fall back to this config.
-    if (conf.isConfigured(HDDS_DATANODE_DIR_DU_RESERVED_PERCENT)) {
-      float percentage = conf.getFloat(HDDS_DATANODE_DIR_DU_RESERVED_PERCENT,
-          HDDS_DATANODE_DIR_DU_RESERVED_PERCENT_DEFAULT);
-      if (0 <= percentage && percentage <= 1) {
-        return (long) Math.ceil(this.usage.getCapacity() * percentage);
-      }
-      //If it comes here then the percentage is not between 0-1.
-      LOG.error("The value of {} should be between 0 to 1. Defaulting to 0.",
-          HDDS_DATANODE_DIR_DU_RESERVED_PERCENT);
-    }
-
-    //Both configs are not set, return 0.
-    return 0;
   }
 
   private VolumeInfo(Builder b) throws IOException {
@@ -206,9 +142,6 @@ public final class VolumeInfo {
     this.storageType = (b.storageType != null ?
         b.storageType : StorageType.DEFAULT);
 
-    this.configuredCapacity = (b.configuredCapacity != 0 ?
-        b.configuredCapacity : -1);
-
     SpaceUsageCheckFactory usageCheckFactory = b.usageCheckFactory;
     if (usageCheckFactory == null) {
       usageCheckFactory = SpaceUsageCheckFactory.create(b.conf);
@@ -216,37 +149,29 @@ public final class VolumeInfo {
     SpaceUsageCheckParams checkParams =
         usageCheckFactory.paramsFor(root);
 
-    this.usage = new VolumeUsage(checkParams);
-    this.reservedInBytes = getReserved(b.conf);
-    this.usage.setReserved(reservedInBytes);
+    usage = new VolumeUsage(checkParams, b.conf);
   }
 
   public long getCapacity() {
-    if (configuredCapacity < 0) {
-      return Math.max(usage.getCapacity() - reservedInBytes, 0);
-    }
-    return configuredCapacity;
+    return usage.getCapacity();
   }
 
   /**
    * Calculate available space use method A.
+   * <pre>
+   * {@code
    * |----used----|   (avail)   |++++++++reserved++++++++|
    * |<-     capacity         ->|
-   *
+   * }
+   *</pre>
    * A) avail = capacity - used
    */
   public long getAvailable() {
-    long avail = getCapacity() - usage.getUsedSpace();
-    return Math.max(Math.min(avail, usage.getAvailable()), 0);
+    return usage.getAvailable();
   }
 
-  public long getAvailable(PrecomputedVolumeSpace precomputedValues) {
-    long avail = precomputedValues.getCapacity() - usage.getUsedSpace();
-    return Math.max(Math.min(avail, usage.getAvailable(precomputedValues)), 0);
-  }
-
-  public PrecomputedVolumeSpace getPrecomputedVolumeSpace() {
-    return usage.getPrecomputedVolumeSpace();
+  public SpaceUsageSource getCurrentUsage() {
+    return usage.getCurrentUsage();
   }
 
   public void incrementUsedSpace(long usedSpace) {
@@ -285,8 +210,7 @@ public final class VolumeInfo {
     return usage;
   }
 
-  @VisibleForTesting
   public long getReservedInBytes() {
-    return reservedInBytes;
+    return usage.getReservedBytes();
   }
 }

@@ -24,6 +24,7 @@ import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ContainerC
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.PutSmallFileRequestProto;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.Type;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.WriteChunkRequestProto;
+import org.apache.hadoop.ozone.ClientVersion;
 import org.apache.hadoop.ozone.common.Checksum;
 
 import org.apache.ratis.protocol.Message;
@@ -43,6 +44,9 @@ public final class ContainerCommandRequestMessage implements Message {
         = ContainerCommandRequestProto.newBuilder(request);
     if (traceId != null) {
       b.setTraceID(traceId);
+    }
+    if (!request.hasVersion()) {
+      b.setVersion(ClientVersion.CURRENT.toProtoValue());
     }
 
     ByteString data = ByteString.EMPTY;
@@ -66,11 +70,18 @@ public final class ContainerCommandRequestMessage implements Message {
     final ContainerCommandRequestProto header
         = ContainerCommandRequestProto
         .parseFrom(bytes.substring(Integer.BYTES, i));
-    // TODO: setting pipeline id can be avoided if the client is sending it.
-    //       In such case, just have to validate the pipeline id.
     final ContainerCommandRequestProto.Builder b = header.toBuilder();
     if (groupId != null) {
-      b.setPipelineID(groupId.getUuid().toString());
+      final String gidString = groupId.getUuid().toString();
+      if (header.hasPipelineID()) {
+        final String pid = header.getPipelineID();
+        if (!gidString.equals(pid)) {
+          throw new InvalidProtocolBufferException("ID mismatched: PipelineID " + pid
+              + " does not match the groupId " + gidString);
+        }
+      } else {
+        b.setPipelineID(groupId.getUuid().toString());
+      }
     }
     final ByteString data = bytes.substring(i);
     if (header.getCmdType() == Type.WriteChunk) {

@@ -24,15 +24,18 @@ import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.protocol.DatanodeDetails;
 import org.apache.hadoop.hdds.scm.container.MockNodeManager;
 import org.apache.hadoop.hdds.scm.container.placement.algorithms.SCMContainerPlacementCapacity;
+import org.apache.hadoop.hdds.scm.container.placement.algorithms.SCMContainerPlacementMetrics;
 import org.apache.hadoop.hdds.scm.container.placement.algorithms.SCMContainerPlacementRandom;
 import org.apache.hadoop.hdds.scm.exceptions.SCMException;
 import org.apache.hadoop.hdds.scm.node.NodeManager;
 import org.apache.hadoop.hdds.scm.node.NodeStatus;
 import org.apache.hadoop.ozone.OzoneConsts;
 import org.apache.commons.math3.stat.descriptive.DescriptiveStatistics;
-import org.junit.jupiter.api.Assertions;
-import static org.junit.jupiter.api.Assertions.assertEquals;
 import org.junit.jupiter.api.Test;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.mockito.Mockito.mock;
 
 /**
  * Asserts that allocation strategy works as expected.
@@ -73,16 +76,15 @@ public class TestContainerPlacement {
     DescriptiveStatistics beforeRandom = computeStatistics(nodeManagerRandom);
 
     //Assert that our initial layout of clusters are similar.
-    assertEquals(beforeCapacity.getStandardDeviation(), beforeRandom
-        .getStandardDeviation(), 0.001);
+    assertEquals(beforeCapacity.getStandardDeviation(), beforeRandom.getStandardDeviation(), 0.001);
 
     SCMContainerPlacementCapacity capacityPlacer = new
         SCMContainerPlacementCapacity(nodeManagerCapacity,
         new OzoneConfiguration(),
-        null, true, null);
+        null, true, mock(SCMContainerPlacementMetrics.class));
     SCMContainerPlacementRandom randomPlacer = new
         SCMContainerPlacementRandom(nodeManagerRandom, new OzoneConfiguration(),
-        null, true, null);
+        null, true, mock(SCMContainerPlacementMetrics.class));
 
     for (int x = 0; x < opsCount; x++) {
       long containerSize = random.nextInt(10) * OzoneConsts.GB;
@@ -111,15 +113,14 @@ public class TestContainerPlacement {
     // This is a very bold claim, and needs large number of I/O operations.
     // The claim in this assertion is that we improved the data distribution
     // of this cluster in relation to the start state of the cluster.
-    Assertions.assertTrue(beforeCapacity.getStandardDeviation() >
-        postCapacity.getStandardDeviation());
+    assertThat(beforeCapacity.getStandardDeviation())
+        .isGreaterThan(postCapacity.getStandardDeviation());
 
     // This asserts that Capacity placement yields a better placement
     // algorithm than random placement, since both cluster started at an
     // identical state.
-
-    Assertions.assertTrue(postRandom.getStandardDeviation() >
-        postCapacity.getStandardDeviation());
+    assertThat(postRandom.getStandardDeviation())
+        .isGreaterThan(postCapacity.getStandardDeviation());
   }
 
   private void deleteContainer(MockNodeManager nodeManager,

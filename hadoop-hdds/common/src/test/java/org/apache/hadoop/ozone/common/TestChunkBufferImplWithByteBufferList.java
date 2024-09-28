@@ -36,7 +36,7 @@ public class TestChunkBufferImplWithByteBufferList {
   @Test
   public void rejectsNullList() {
     List<ByteBuffer> list = null;
-    assertThrows(IllegalArgumentException.class, () -> ChunkBuffer.wrap(list));
+    assertThrows(NullPointerException.class, () -> ChunkBuffer.wrap(list));
   }
 
   @Test
@@ -65,6 +65,76 @@ public class TestChunkBufferImplWithByteBufferList {
     b2.position(0);
     b3.position(1);
     assertThrows(IllegalArgumentException.class, () -> ChunkBuffer.wrap(list));
+  }
+
+  @Test
+  public void testIterateSmallerOverSingleChunk() {
+    ChunkBuffer subject = ChunkBuffer.wrap(ImmutableList.of(ByteBuffer.allocate(100)));
+
+    assertEquals(0, subject.position());
+    assertEquals(100, subject.remaining());
+    assertEquals(100, subject.limit());
+
+    subject.iterate(25).forEach(buffer -> assertEquals(25, buffer.remaining()));
+
+    assertEquals(100, subject.position());
+    assertEquals(0, subject.remaining());
+    assertEquals(100, subject.limit());
+  }
+
+  @Test
+  public void testIterateOverMultipleChunksFitChunkSize() {
+    ByteBuffer b1 = ByteBuffer.allocate(100);
+    ByteBuffer b2 = ByteBuffer.allocate(100);
+    ByteBuffer b3 = ByteBuffer.allocate(100);
+    ChunkBuffer subject = ChunkBuffer.wrap(ImmutableList.of(b1, b2, b3));
+
+    assertEquals(0, subject.position());
+    assertEquals(300, subject.remaining());
+    assertEquals(300, subject.limit());
+
+    subject.iterate(100).forEach(buffer -> assertEquals(100, buffer.remaining()));
+
+    assertEquals(300, subject.position());
+    assertEquals(0, subject.remaining());
+    assertEquals(300, subject.limit());
+  }
+
+  @Test
+  public void testIterateOverMultipleChunksSmallerChunks() {
+    ByteBuffer b1 = ByteBuffer.allocate(100);
+    ByteBuffer b2 = ByteBuffer.allocate(100);
+    ByteBuffer b3 = ByteBuffer.allocate(100);
+    ChunkBuffer subject = ChunkBuffer.wrap(ImmutableList.of(b1, b2, b3));
+
+    assertEquals(0, subject.position());
+    assertEquals(300, subject.remaining());
+    assertEquals(300, subject.limit());
+
+    subject.iterate(50).forEach(buffer -> assertEquals(50, buffer.remaining()));
+
+    assertEquals(300, subject.position());
+    assertEquals(0, subject.remaining());
+    assertEquals(300, subject.limit());
+  }
+
+  @Test
+  public void testIterateOverMultipleChunksBiggerChunks() {
+    ByteBuffer b1 = ByteBuffer.allocate(100);
+    ByteBuffer b2 = ByteBuffer.allocate(100);
+    ByteBuffer b3 = ByteBuffer.allocate(100);
+    ByteBuffer b4 = ByteBuffer.allocate(100);
+    ChunkBuffer subject = ChunkBuffer.wrap(ImmutableList.of(b1, b2, b3, b4));
+
+    assertEquals(0, subject.position());
+    assertEquals(400, subject.remaining());
+    assertEquals(400, subject.limit());
+
+    subject.iterate(200).forEach(buffer -> assertEquals(200, buffer.remaining()));
+
+    assertEquals(400, subject.position());
+    assertEquals(0, subject.remaining());
+    assertEquals(400, subject.limit());
   }
 
   private static void assertEmpty(ChunkBuffer subject) {

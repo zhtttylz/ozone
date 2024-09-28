@@ -19,6 +19,7 @@
 package org.apache.hadoop.hdds.utils;
 
 import com.google.common.annotations.VisibleForTesting;
+import org.apache.commons.lang3.tuple.Pair;
 import org.apache.hadoop.ozone.util.ShutdownHookManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -28,10 +29,14 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+
+import static org.apache.hadoop.hdds.utils.NativeConstants.ROCKS_TOOLS_NATIVE_LIBRARY_NAME;
 
 /**
  * Class to load Native Libraries.
@@ -62,6 +67,10 @@ public class NativeLibraryLoader {
       initNewInstance();
     }
     return instance;
+  }
+
+  public static String getJniLibraryFileName() {
+    return appendLibOsSuffix("lib" + ROCKS_TOOLS_NATIVE_LIBRARY_NAME);
   }
 
   public static String getJniLibraryFileName(String libraryName) {
@@ -96,12 +105,15 @@ public class NativeLibraryLoader {
     return libraryFileName + getLibOsSuffix();
   }
 
-  public static boolean isLibraryLoaded(final String libraryName) {
-    return getInstance().librariesLoaded
-        .getOrDefault(libraryName, false);
+  public static boolean isLibraryLoaded() {
+    return isLibraryLoaded(ROCKS_TOOLS_NATIVE_LIBRARY_NAME);
   }
 
-  public synchronized boolean loadLibrary(final String libraryName) {
+  public static boolean isLibraryLoaded(final String libraryName) {
+    return getInstance().librariesLoaded.getOrDefault(libraryName, false);
+  }
+
+  public synchronized boolean loadLibrary(final String libraryName, final List<String> dependentFiles) {
     if (isLibraryLoaded(libraryName)) {
       return true;
     }
@@ -116,9 +128,9 @@ public class NativeLibraryLoader {
 
       }
       if (!loaded) {
-        Optional<File> file = copyResourceFromJarToTemp(libraryName);
-        if (file.isPresent()) {
-          System.load(file.get().getAbsolutePath());
+        Pair<Optional<File>, List<File>> files = copyResourceFromJarToTemp(libraryName, dependentFiles);
+        if (files.getKey().isPresent()) {
+          System.load(files.getKey().get().getAbsolutePath());
           loaded = true;
         }
       }
@@ -137,19 +149,20 @@ public class NativeLibraryLoader {
 
   // Added function to make this testable
   @VisibleForTesting
-  static InputStream getResourceStream(String libraryFileName) {
+  static InputStream getResourceStream(String libraryFileName) throws IOException {
     return NativeLibraryLoader.class.getClassLoader()
         .getResourceAsStream(libraryFileName);
   }
 
-  private Optional<File> copyResourceFromJarToTemp(final String libraryName)
+  private Pair<Optional<File>, List<File>> copyResourceFromJarToTemp(final String libraryName,
+                                                                     final List<String> dependentFileNames)
       throws IOException {
     final String libraryFileName = getJniLibraryFileName(libraryName);
     InputStream is = null;
     try {
       is = getResourceStream(libraryFileName);
       if (is == null) {
-        return Optional.empty();
+        return Pair.of(Optional.empty(), null);
       }
 
       final String nativeLibDir =
@@ -160,15 +173,28 @@ public class NativeLibraryLoader {
       // create a temporary file to copy the library to
       final File temp = File.createTempFile(libraryName, getLibOsSuffix(), dir);
       if (!temp.exists()) {
-        return Optional.empty();
+        return Pair.of(Optional.empty(), null);
       } else {
         temp.deleteOnExit();
       }
 
       Files.copy(is, temp.toPath(), StandardCopyOption.REPLACE_EXISTING);
+      List<File> dependentFiles = new ArrayList<>();
+      for (String fileName : dependentFileNames) {
+        if (is != null) {
+          is.close();
+        }
+        is = getResourceStream(fileName);
+        File file = new File(dir, fileName);
+        Files.copy(is, file.toPath(), StandardCopyOption.REPLACE_EXISTING);
+        if (file.exists()) {
+          file.deleteOnExit();
+        }
+        dependentFiles.add(file);
+      }
       ShutdownHookManager.get().addShutdownHook(temp::delete,
           LIBRARY_SHUTDOWN_HOOK_PRIORITY);
-      return Optional.of(temp);
+      return Pair.of(Optional.of(temp), dependentFiles);
     } finally {
       if (is != null) {
         is.close();

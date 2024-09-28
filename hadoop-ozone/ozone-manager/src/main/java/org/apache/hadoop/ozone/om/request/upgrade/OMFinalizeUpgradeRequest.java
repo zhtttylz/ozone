@@ -20,14 +20,18 @@ package org.apache.hadoop.ozone.om.request.upgrade;
 import static org.apache.hadoop.ozone.OzoneConsts.LAYOUT_VERSION_KEY;
 import static org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos.Type.FinalizeUpgrade;
 
+import java.util.HashMap;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos
     .UpgradeFinalizationStatus;
+import org.apache.hadoop.ozone.audit.AuditLogger;
+import org.apache.hadoop.ozone.audit.OMAction;
+import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos;
+import org.apache.ratis.server.protocol.TermIndex;
 import org.apache.hadoop.hdds.utils.db.cache.CacheKey;
 import org.apache.hadoop.hdds.utils.db.cache.CacheValue;
 import org.apache.hadoop.ozone.om.OMMetadataManager;
 import org.apache.hadoop.ozone.om.OzoneManager;
 import org.apache.hadoop.ozone.om.exceptions.OMException;
-import org.apache.hadoop.ozone.om.ratis.utils.OzoneManagerDoubleBufferHelper;
 import org.apache.hadoop.ozone.om.request.OMClientRequest;
 import org.apache.hadoop.ozone.om.request.util.OmResponseUtil;
 import org.apache.hadoop.ozone.om.response.OMClientResponse;
@@ -56,14 +60,15 @@ public class OMFinalizeUpgradeRequest extends OMClientRequest {
   }
 
   @Override
-  public OMClientResponse validateAndUpdateCache(
-      OzoneManager ozoneManager, long transactionLogIndex,
-      OzoneManagerDoubleBufferHelper ozoneManagerDoubleBufferHelper) {
+  public OMClientResponse validateAndUpdateCache(OzoneManager ozoneManager, TermIndex termIndex) {
     LOG.trace("Request: {}", getOmRequest());
+    AuditLogger auditLogger = ozoneManager.getAuditLogger();
+    OzoneManagerProtocolProtos.UserInfo userInfo = getOmRequest().getUserInfo();
     OMResponse.Builder responseBuilder =
         OmResponseUtil.getOMResponseBuilder(getOmRequest());
     responseBuilder.setCmdType(FinalizeUpgrade);
     OMClientResponse response = null;
+    Exception exception = null;
 
     try {
       if (ozoneManager.getAclsEnabled()) {
@@ -94,7 +99,7 @@ public class OMFinalizeUpgradeRequest extends OMClientRequest {
       int lV = ozoneManager.getVersionManager().getMetadataLayoutVersion();
       omMetadataManager.getMetaTable().addCacheEntry(
           new CacheKey<>(LAYOUT_VERSION_KEY),
-          CacheValue.get(transactionLogIndex, String.valueOf(lV)));
+          CacheValue.get(termIndex.getIndex(), String.valueOf(lV)));
 
       FinalizeUpgradeResponse omResponse =
           FinalizeUpgradeResponse.newBuilder()
@@ -105,12 +110,13 @@ public class OMFinalizeUpgradeRequest extends OMClientRequest {
           ozoneManager.getVersionManager().getMetadataLayoutVersion());
       LOG.trace("Returning response: {}", response);
     } catch (IOException e) {
+      exception = e;
       response = new OMFinalizeUpgradeResponse(
           createErrorOMResponse(responseBuilder, e), -1);
-    } finally {
-      addResponseToDoubleBuffer(transactionLogIndex, response,
-          ozoneManagerDoubleBufferHelper);
     }
+
+    markForAudit(auditLogger, buildAuditMessage(OMAction.UPGRADE_FINALIZE,
+        new HashMap<>(), exception, userInfo));
     return response;
   }
 

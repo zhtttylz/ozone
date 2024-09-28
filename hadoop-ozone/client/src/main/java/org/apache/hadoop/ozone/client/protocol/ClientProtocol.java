@@ -23,7 +23,7 @@ import java.net.URI;
 import java.util.List;
 import java.util.Map;
 
-import javax.annotation.Nonnull;
+import jakarta.annotation.Nonnull;
 import org.apache.hadoop.crypto.key.KeyProvider;
 import org.apache.hadoop.hdds.client.ReplicationConfig;
 import org.apache.hadoop.hdds.client.ReplicationFactor;
@@ -32,6 +32,7 @@ import org.apache.hadoop.hdds.protocol.DatanodeDetails;
 import org.apache.hadoop.hdds.protocol.StorageType;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.ozone.OzoneAcl;
+import org.apache.hadoop.ozone.OzoneFsServerDefaults;
 import org.apache.hadoop.ozone.client.BucketArgs;
 import org.apache.hadoop.ozone.client.OzoneBucket;
 import org.apache.hadoop.ozone.client.OzoneKey;
@@ -49,12 +50,15 @@ import org.apache.hadoop.ozone.client.io.OzoneOutputStream;
 import org.apache.hadoop.ozone.om.OMConfigKeys;
 import org.apache.hadoop.ozone.om.exceptions.OMException;
 import org.apache.hadoop.ozone.om.helpers.DeleteTenantState;
+import org.apache.hadoop.ozone.om.helpers.ErrorInfo;
+import org.apache.hadoop.ozone.om.helpers.LeaseKeyInfo;
+import org.apache.hadoop.ozone.om.helpers.OmKeyArgs;
 import org.apache.hadoop.ozone.om.helpers.OmKeyLocationInfo;
 import org.apache.hadoop.ozone.om.helpers.OmMultipartInfo;
 import org.apache.hadoop.ozone.om.helpers.OmMultipartUploadCompleteInfo;
 import org.apache.hadoop.ozone.om.helpers.OmVolumeArgs;
 import org.apache.hadoop.ozone.om.helpers.OzoneFileStatus;
-import org.apache.hadoop.ozone.om.helpers.RepeatedOmKeyInfo;
+import org.apache.hadoop.ozone.om.helpers.OzoneFileStatusLight;
 import org.apache.hadoop.ozone.om.helpers.S3SecretValue;
 import org.apache.hadoop.ozone.om.helpers.S3VolumeContext;
 import org.apache.hadoop.ozone.om.helpers.TenantStateList;
@@ -66,6 +70,7 @@ import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos.OMRoleI
 import org.apache.hadoop.ozone.security.OzoneTokenIdentifier;
 import org.apache.hadoop.ozone.security.acl.OzoneObj;
 import org.apache.hadoop.ozone.snapshot.CancelSnapshotDiffResponse;
+import org.apache.hadoop.ozone.snapshot.ListSnapshotResponse;
 import org.apache.hadoop.ozone.snapshot.SnapshotDiffResponse;
 import org.apache.hadoop.security.KerberosInfo;
 import org.apache.hadoop.security.token.Token;
@@ -159,6 +164,18 @@ public interface ClientProtocol {
    * @throws IOException
    */
   OzoneKeyDetails getS3KeyDetails(String bucketName, String keyName)
+      throws IOException;
+
+  /**
+   * Get OzoneKey in S3 context.
+   * @param bucketName Name of the Bucket
+   * @param keyName Key name
+   * @param partNumber Multipart-upload part number
+   * @return {@link OzoneKey}
+   * @throws IOException
+   */
+  OzoneKeyDetails getS3KeyDetails(String bucketName, String keyName,
+                                  int partNumber)
       throws IOException;
 
   OzoneVolume buildOzoneVolume(OmVolumeArgs volume);
@@ -314,9 +331,9 @@ public interface ClientProtocol {
    * @param bucketName Name of the Bucket
    * @param keyName Name of the Key
    * @param size Size of the data
-   * @param metadata custom key value metadata
+   * @param metadata Custom key value metadata
    * @return {@link OzoneOutputStream}
-   *
+   * @deprecated Use {@link ClientProtocol#createKey(String, String, String, long, ReplicationConfig, Map)} instead.
    */
   @Deprecated
   OzoneOutputStream createKey(String volumeName, String bucketName,
@@ -331,13 +348,52 @@ public interface ClientProtocol {
    * @param bucketName Name of the Bucket
    * @param keyName Name of the Key
    * @param size Size of the data
-   * @param metadata custom key value metadata
+   * @param metadata Custom key value metadata
    * @return {@link OzoneOutputStream}
    *
    */
   OzoneOutputStream createKey(String volumeName, String bucketName,
       String keyName, long size, ReplicationConfig replicationConfig,
       Map<String, String> metadata)
+      throws IOException;
+
+  /**
+   * This API allows to atomically update an existing key. The key read before invoking this API
+   * should remain unchanged for this key to be written. This is controlled by the generation
+   * field in the existing Key param. If the key is replaced or updated the generation will change. If the
+   * generation has changed since the existing Key was read, either the initial key create will fail,
+   * or the key will fail to commit after the data has been written as the checks are carried out
+   * both at key open and commit time.
+   *
+   * @param volumeName Name of the Volume
+   * @param bucketName Name of the Bucket
+   * @param keyName Existing key to rewrite. This must exist in the bucket.
+   * @param size The size of the new key
+   * @param existingKeyGeneration The generation of the existing key which is checked for changes at key create
+   *                              and commit time.
+   * @param replicationConfig The replication configuration for the key to be rewritten.
+   * @param metadata custom key value metadata
+   * @return {@link OzoneOutputStream}
+   * @throws IOException
+   */
+  OzoneOutputStream rewriteKey(String volumeName, String bucketName, String keyName,
+      long size, long existingKeyGeneration, ReplicationConfig replicationConfig,
+       Map<String, String> metadata) throws IOException;
+
+  /**
+   * Writes a key in an existing bucket.
+   * @param volumeName Name of the Volume
+   * @param bucketName Name of the Bucket
+   * @param keyName Name of the Key
+   * @param size Size of the data
+   * @param metadata Custom key value metadata
+   * @param tags Tags used for S3 object tags
+   * @return {@link OzoneOutputStream}
+   *
+   */
+  OzoneOutputStream createKey(String volumeName, String bucketName,
+      String keyName, long size, ReplicationConfig replicationConfig,
+      Map<String, String> metadata, Map<String, String> tags)
       throws IOException;
 
   /**
@@ -353,6 +409,22 @@ public interface ClientProtocol {
   OzoneDataStreamOutput createStreamKey(String volumeName, String bucketName,
       String keyName, long size, ReplicationConfig replicationConfig,
       Map<String, String> metadata)
+      throws IOException;
+
+  /**
+   * Writes a key in an existing bucket.
+   * @param volumeName Name of the Volume
+   * @param bucketName Name of the Bucket
+   * @param keyName Name of the Key
+   * @param size Size of the data
+   * @param metadata custom key value metadata
+   * @param tags Tags used for S3 object tags
+   * @return {@link OzoneDataStreamOutput}
+   *
+   */
+  OzoneDataStreamOutput createStreamKey(String volumeName, String bucketName,
+      String keyName, long size, ReplicationConfig replicationConfig,
+      Map<String, String> metadata, Map<String, String> tags)
       throws IOException;
 
   /**
@@ -389,6 +461,18 @@ public interface ClientProtocol {
    */
   void deleteKeys(String volumeName, String bucketName,
                   List<String> keyNameList)
+      throws IOException;
+
+  /**
+   * Deletes keys through the list.
+   * @param volumeName Name of the Volume
+   * @param bucketName Name of the Bucket
+   * @param keyNameList List of the Key
+   * @param quiet flag to not throw exception if delete fails
+   * @throws IOException
+   */
+  Map<String, ErrorInfo> deleteKeys(String volumeName, String bucketName,
+                                    List<String> keyNameList, boolean quiet)
       throws IOException;
 
   /**
@@ -430,39 +514,6 @@ public interface ClientProtocol {
       throws IOException;
 
   /**
-   * List trash allows the user to list the keys that were marked as deleted,
-   * but not actually deleted by Ozone Manager. This allows a user to recover
-   * keys within a configurable window.
-   * @param volumeName - The volume name, which can also be a wild card
-   *                   using '*'.
-   * @param bucketName - The bucket name, which can also be a wild card
-   *                   using '*'.
-   * @param startKeyName - List keys from a specific key name.
-   * @param keyPrefix - List keys using a specific prefix.
-   * @param maxKeys - The number of keys to be returned. This must be below
-   *                the cluster level set by admins.
-   * @return The list of keys that are deleted from the deleted table.
-   * @throws IOException
-   */
-  List<RepeatedOmKeyInfo> listTrash(String volumeName, String bucketName,
-                                    String startKeyName, String keyPrefix,
-                                    int maxKeys)
-      throws IOException;
-
-  /**
-   * Recover trash allows the user to recover keys that were marked as deleted,
-   * but not actually deleted by Ozone Manager.
-   * @param volumeName - The volume name.
-   * @param bucketName - The bucket name.
-   * @param keyName - The key user want to recover.
-   * @param destinationBucket - The bucket user want to recover to.
-   * @return The result of recovering operation is success or not.
-   * @throws IOException
-   */
-  boolean recoverTrash(String volumeName, String bucketName, String keyName,
-      String destinationBucket) throws IOException;
-
-  /**
    * Get OzoneKey.
    * @param volumeName Name of the Volume
    * @param bucketName Name of the Bucket
@@ -496,15 +547,46 @@ public interface ClientProtocol {
 
   /**
    * Initiate Multipart upload.
-   * @param volumeName
-   * @param bucketName
-   * @param keyName
-   * @param replicationConfig
+   * @param volumeName Name of the Volume
+   * @param bucketName Name of the Bucket
+   * @param keyName Name of the Key
+   * @param replicationConfig Replication Config
    * @return {@link OmMultipartInfo}
    * @throws IOException
    */
   OmMultipartInfo initiateMultipartUpload(String volumeName, String
       bucketName, String keyName, ReplicationConfig replicationConfig)
+      throws IOException;
+
+  /**
+   * Initiate Multipart upload.
+   * @param volumeName Name of the Volume
+   * @param bucketName Name of the Bucket
+   * @param keyName Name of the Key
+   * @param replicationConfig Replication config
+   * @param metadata Custom key value metadata
+   * @return {@link OmMultipartInfo}
+   * @throws IOException
+   */
+  OmMultipartInfo initiateMultipartUpload(String volumeName, String
+      bucketName, String keyName, ReplicationConfig replicationConfig,
+      Map<String, String> metadata)
+      throws IOException;
+
+  /**
+   * Initiate Multipart upload.
+   * @param volumeName Name of the Volume
+   * @param bucketName Name of the Bucket
+   * @param keyName Name of the Key
+   * @param replicationConfig Replication config
+   * @param metadata Custom key value metadata
+   * @param tags Tags used for S3 object tags
+   * @return {@link OmMultipartInfo}
+   * @throws IOException
+   */
+  OmMultipartInfo initiateMultipartUpload(String volumeName, String
+      bucketName, String keyName, ReplicationConfig replicationConfig,
+      Map<String, String> metadata, Map<String, String> tags)
       throws IOException;
 
   /**
@@ -744,6 +826,13 @@ public interface ClientProtocol {
   TenantStateList listTenant() throws IOException;
 
   /**
+   * Get server default values for a number of configuration params.
+   * @return Default configuration from the server.
+   * @throws IOException
+   */
+  OzoneFsServerDefaults getServerDefaults() throws IOException;
+
+  /**
    * Get KMS client provider.
    * @return KMS client provider.
    * @throws IOException
@@ -881,7 +970,6 @@ public interface ClientProtocol {
       String keyName, boolean recursive, String startKey, long numEntries)
       throws IOException;
 
-
   /**
    * List the status for a file or a directory and its contents.
    *
@@ -899,6 +987,25 @@ public interface ClientProtocol {
    */
   List<OzoneFileStatus> listStatus(String volumeName, String bucketName,
       String keyName, boolean recursive, String startKey,
+      long numEntries, boolean allowPartialPrefixes) throws IOException;
+
+  /**
+   * Lightweight listStatus API.
+   *
+   * @param volumeName Volume name
+   * @param bucketName Bucket name
+   * @param keyName    Absolute path of the entry to be listed
+   * @param recursive  For a directory if true all the descendants of a
+   *                   particular directory are listed
+   * @param startKey   Key from which listing needs to start. If startKey exists
+   *                   its status is included in the final list.
+   * @param numEntries Number of entries to list from the start key
+   * @param allowPartialPrefixes if partial prefixes should be allowed,
+   *                             this is needed in context of ListKeys
+   * @return list of file status
+   */
+  List<OzoneFileStatusLight> listStatusLight(String volumeName,
+      String bucketName, String keyName, boolean recursive, String startKey,
       long numEntries, boolean allowPartialPrefixes) throws IOException;
 
   /**
@@ -967,6 +1074,24 @@ public interface ClientProtocol {
       ReplicationConfig replicationConfig) throws IOException;
 
   /**
+   * Set Bucket Encryption Key (BEK).
+   *
+   * @param volumeName
+   * @param bucketName
+   * @param bekName
+   * @throws IOException
+   * @deprecated This functionality is deprecated as it is not intended for
+   * users to reset bucket encryption under normal circumstances and may be
+   * removed in the future. Users are advised to exercise caution and consider
+   * alternative approaches for managing bucket encryption unless HDDS-7449 or
+   * HDDS-7526 is encountered. As a result, the setter methods for this
+   * functionality have been marked as deprecated.
+   */
+  @Deprecated
+  void setEncryptionKey(String volumeName, String bucketName,
+                        String bekName) throws IOException;
+
+  /**
    * Returns OzoneKey that contains the application generated/visible
    * metadata for an Ozone Object.
    *
@@ -988,6 +1113,9 @@ public interface ClientProtocol {
    * @param s3Auth authentication information for each S3 API call.
    */
   void setThreadLocalS3Auth(S3Auth s3Auth);
+
+
+  void setIsS3Request(boolean isS3Request);
 
   /**
    * Gets the S3 Authentication information that is attached to the thread.
@@ -1041,6 +1169,19 @@ public interface ClientProtocol {
       String bucketName, String snapshotName) throws IOException;
 
   /**
+   * Rename snapshot.
+   *
+   * @param volumeName Vol to be used
+   * @param bucketName Bucket to be used
+   * @param snapshotOldName Old name of the snapshot
+   * @param snapshotNewName New name of the snapshot
+   *
+   * @throws IOException
+   */
+  void renameSnapshot(String volumeName,
+      String bucketName, String snapshotOldName, String snapshotNewName) throws IOException;
+
+  /**
    * Delete snapshot.
    * @param volumeName vol to be used
    * @param bucketName bucket to be used
@@ -1049,6 +1190,18 @@ public interface ClientProtocol {
    */
   void deleteSnapshot(String volumeName,
       String bucketName, String snapshotName) throws IOException;
+
+  /**
+   * Returns snapshot info for volume/bucket snapshot path.
+   * @param volumeName volume name
+   * @param bucketName bucket name
+   * @param snapshotName snapshot name
+   * @return snapshot info for volume/bucket snapshot path.
+   * @throws IOException
+   */
+  OzoneSnapshot getSnapshotInfo(String volumeName,
+                                String bucketName,
+                                String snapshotName) throws IOException;
 
   /**
    * Create an image of the current compaction log DAG in the OM.
@@ -1065,12 +1218,12 @@ public interface ClientProtocol {
    * @param volumeName     volume name
    * @param bucketName     bucket name
    * @param snapshotPrefix snapshot prefix to match
-   * @param prevSnapshot   start of the list, this snapshot is excluded
-   * @param maxListResult  max numbet of snapshots to return
-   * @return list of snapshots for volume/bucket snapshotpath.
+   * @param prevSnapshot   snapshots will be listed after this snapshot name
+   * @param maxListResult  max number of snapshots to return
+   * @return list of snapshots for volume/bucket path.
    * @throws IOException
    */
-  List<OzoneSnapshot> listSnapshot(
+  ListSnapshotResponse listSnapshot(
       String volumeName, String bucketName, String snapshotPrefix,
       String prevSnapshot, int maxListResult) throws IOException;
 
@@ -1136,4 +1289,26 @@ public interface ClientProtocol {
    * */
   void setTimes(OzoneObj obj, String keyName, long mtime, long atime)
       throws IOException;
+
+  /**
+   * Start the lease recovery of a file.
+   *
+   * @param volumeName - The volume name.
+   * @param bucketName - The bucket name.
+   * @param keyName - The key user want to recover.
+   * @param force - force recover the file.
+   * @return LeaseKeyInfo KeyInfo of file under recovery
+   * @throws IOException if an error occurs
+   */
+  LeaseKeyInfo recoverLease(String volumeName, String bucketName, String keyName, boolean force) throws IOException;
+
+  /**
+   * Recovery and commit a key. This will make the change from the client visible. The client
+   * is identified by the clientID.
+   *
+   * @param args the key to commit
+   * @param clientID the client identification
+   * @throws IOException
+   */
+  void recoverKey(OmKeyArgs args, long clientID) throws IOException;
 }

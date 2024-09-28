@@ -23,10 +23,6 @@ import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.security.exception.SCMSecurityException;
 import org.apache.hadoop.hdds.security.SecurityConfig;
 import org.apache.hadoop.hdds.security.x509.keys.HDDSKeyGenerator;
-import org.bouncycastle.asn1.x509.Extension;
-import org.bouncycastle.cert.X509CertificateHolder;
-import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
-import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -44,11 +40,20 @@ import java.util.Date;
 import java.util.UUID;
 
 import static org.apache.hadoop.hdds.HddsConfigKeys.OZONE_METADATA_DIRS;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * Test Class for Root Certificate generation.
  */
 public class TestRootCertificate {
+  private static final String BASIC_CONSTRAINTS_EXTENSION_OID = "2.5.29.19";
+
   private SecurityConfig securityConfig;
 
   @BeforeEach
@@ -79,44 +84,34 @@ public class TestRootCertificate {
             .setKey(keyPair)
             .setConfiguration(securityConfig);
 
-    X509CertificateHolder certificateHolder = builder.build();
+    X509Certificate certificate = builder.build();
 
-    //Assert that we indeed have a self signed certificate.
-    Assertions.assertEquals(certificateHolder.getIssuer(),
-        certificateHolder.getSubject());
+    //Assert that we indeed have a self-signed certificate.
+    assertEquals(certificate.getIssuerDN(), certificate.getSubjectDN());
 
 
     // Make sure that NotBefore is before the current Date
     Date invalidDate = Date.from(
         notBefore.minusDays(1).atZone(ZoneId.systemDefault()).toInstant());
-    Assertions.assertFalse(
-        certificateHolder.getNotBefore()
-            .before(invalidDate));
+    assertFalse(certificate.getNotBefore().before(invalidDate));
 
     //Make sure the end date is honored.
     invalidDate = Date.from(
         notAfter.plusDays(1).atZone(ZoneId.systemDefault()).toInstant());
-    Assertions.assertFalse(
-        certificateHolder.getNotAfter()
-            .after(invalidDate));
+    assertFalse(certificate.getNotAfter().after(invalidDate));
 
     // Check the Subject Name and Issuer Name is in the expected format.
-    String dnName = String.format(SelfSignedCertificate.getNameFormat(),
-        subject, scmID, clusterID);
-    Assertions.assertEquals(dnName, certificateHolder.getIssuer().toString());
-    Assertions.assertEquals(dnName, certificateHolder.getSubject().toString());
+    // Note that the X500Principal class correctly applies RFC-4512 on distinguished names, and returns the RDNs in
+    // reverse order as defined in 2.1 in RFC-4512.
+    String dnName = String.format("SERIALNUMBER=%s, O=%s, OU=%s, CN=%s",
+        certificate.getSerialNumber(), clusterID, scmID, subject);
+    assertEquals(dnName, certificate.getIssuerDN().toString());
+    assertEquals(dnName, certificate.getSubjectDN().toString());
 
-    // We did not ask for this Certificate to be a CertificateServer
-    // certificate, hence that
-    // extension should be null.
-    Assertions.assertNull(
-        certificateHolder.getExtension(Extension.basicConstraints));
+    assertEquals(-1, certificate.getBasicConstraints(), "Non-CA cert contains the CA flag in BasicConstraints.");
 
-    // Extract the Certificate and verify that certificate matches the public
-    // key.
-    X509Certificate cert =
-        new JcaX509CertificateConverter().getCertificate(certificateHolder);
-    cert.verify(keyPair.getPublic());
+    // Extract the Certificate and verify that certificate matches the public key.
+    certificate.verify(keyPair.getPublic());
   }
 
   @Test
@@ -130,7 +125,7 @@ public class TestRootCertificate {
         new HDDSKeyGenerator(securityConfig);
     KeyPair keyPair = keyGen.generateKey();
 
-    X509CertificateHolder certificateHolder =
+    X509Certificate certificate =
         SelfSignedCertificate.newBuilder()
             .setBeginDate(notBefore)
             .setEndDate(notAfter)
@@ -143,30 +138,22 @@ public class TestRootCertificate {
             .addInetAddresses()
             .build();
 
-    // This time we asked for a CertificateServer Certificate, make sure that
-    // extension is
-    // present and valid.
-    Extension basicExt =
-        certificateHolder.getExtension(Extension.basicConstraints);
-
-    Assertions.assertNotNull(basicExt);
-    Assertions.assertTrue(basicExt.isCritical());
+    assertNotEquals(-1, certificate.getBasicConstraints(), "CA cert does not contain the CA flag in BasicConstraints.");
+    assertTrue(certificate.getCriticalExtensionOIDs().contains(BASIC_CONSTRAINTS_EXTENSION_OID));
 
     // Since this code assigns ONE for the root certificate, we check if the
     // serial number is the expected number.
-    Assertions.assertEquals(BigInteger.ONE,
-        certificateHolder.getSerialNumber());
+    assertEquals(BigInteger.ONE, certificate.getSerialNumber());
 
     CertificateCodec codec = new CertificateCodec(securityConfig, "scm");
-    String pemString = CertificateCodec.getPEMEncodedString(certificateHolder);
+    String pemString = CertificateCodec.getPEMEncodedString(certificate);
 
     codec.writeCertificate(basePath, "pemcertificate.crt",
         pemString);
 
-    X509CertificateHolder loadedCert =
-        codec.getTargetCertHolder(basePath, "pemcertificate.crt");
-    Assertions.assertNotNull(loadedCert);
-    Assertions.assertEquals(certificateHolder.getSerialNumber(),
+    X509Certificate loadedCert = codec.getTargetCert(basePath, "pemcertificate.crt");
+    assertNotNull(loadedCert);
+    assertEquals(certificate.getSerialNumber(),
         loadedCert.getSerialNumber());
   }
 
@@ -194,66 +181,54 @@ public class TestRootCertificate {
     try {
       builder.setKey(null);
       builder.build();
-      Assertions.fail("Null Key should have failed.");
+      fail("Null Key should have failed.");
     } catch (NullPointerException | IllegalArgumentException e) {
       builder.setKey(keyPair);
     }
 
     // Now try with Blank Subject.
-    try {
+    assertThrows(IllegalArgumentException.class, () -> {
       builder.setSubject("");
       builder.build();
-      Assertions.fail("Null/Blank Subject should have thrown.");
-    } catch (IllegalArgumentException e) {
-      builder.setSubject(subject);
-    }
+    });
+    builder.setSubject(subject);
 
     // Now try with blank/null SCM ID
-    try {
+    assertThrows(IllegalArgumentException.class, () -> {
       builder.setScmID(null);
       builder.build();
-      Assertions.fail("Null/Blank SCM ID should have thrown.");
-    } catch (IllegalArgumentException e) {
-      builder.setScmID(scmID);
-    }
-
+    });
+    builder.setScmID(scmID);
 
     // Now try with blank/null SCM ID
-    try {
+    assertThrows(IllegalArgumentException.class, () -> {
       builder.setClusterID(null);
       builder.build();
-      Assertions.fail("Null/Blank Cluster ID should have thrown.");
-    } catch (IllegalArgumentException e) {
-      builder.setClusterID(clusterID);
-    }
-
+    });
+    builder.setClusterID(clusterID);
 
     // Swap the Begin and End Date and verify that we cannot create a
     // certificate like that.
-    try {
+    assertThrows(IllegalArgumentException.class, () -> {
       builder.setBeginDate(notAfter);
       builder.setEndDate(notBefore);
       builder.build();
-      Assertions.fail("Illegal dates should have thrown.");
-    } catch (IllegalArgumentException e) {
-      builder.setBeginDate(notBefore);
-      builder.setEndDate(notAfter);
-    }
+    });
+    builder.setBeginDate(notBefore);
+    builder.setEndDate(notAfter);
 
     try {
       KeyPair newKey = keyGen.generateKey();
       KeyPair wrongKey = new KeyPair(newKey.getPublic(), keyPair.getPrivate());
       builder.setKey(wrongKey);
-      X509CertificateHolder certificateHolder = builder.build();
-      X509Certificate cert =
-          new JcaX509CertificateConverter().getCertificate(certificateHolder);
+      X509Certificate cert = builder.build();
       cert.verify(wrongKey.getPublic());
-      Assertions.fail("Invalid Key, should have thrown.");
+      fail("Invalid Key, should have thrown.");
     } catch (SCMSecurityException | CertificateException
         | SignatureException | InvalidKeyException e) {
       builder.setKey(keyPair);
     }
     // Assert that we can create a certificate with all sane params.
-    Assertions.assertNotNull(builder.build());
+    assertNotNull(builder.build());
   }
 }

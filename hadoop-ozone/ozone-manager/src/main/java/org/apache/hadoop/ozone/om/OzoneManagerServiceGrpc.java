@@ -28,13 +28,11 @@ import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos.OMRespo
 import org.apache.hadoop.ozone.protocol.proto.OzoneManagerServiceGrpc.OzoneManagerServiceImplBase;
 import org.apache.hadoop.ozone.protocolPB.OzoneManagerProtocolServerSideTranslatorPB;
 import org.apache.hadoop.ozone.security.OzoneDelegationTokenSecretManager;
-import org.apache.hadoop.util.UUIDUtil;
+import org.apache.hadoop.ozone.util.UUIDUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -98,11 +96,7 @@ public class OzoneManagerServiceGrpc extends OzoneManagerServiceImplBase {
   }
 
   private static byte[] getClientId() {
-    UUID uuid = UUIDUtil.randomUUID();
-    ByteBuffer buf = ByteBuffer.wrap(new byte[16]);
-    buf.putLong(uuid.getMostSignificantBits());
-    buf.putLong(uuid.getLeastSignificantBits());
-    return buf.array();
+    return UUIDUtil.randomUUIDBytes();
   }
 
 }

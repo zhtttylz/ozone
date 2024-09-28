@@ -24,10 +24,11 @@ import org.apache.hadoop.ozone.OzoneAcl;
 import org.apache.hadoop.ozone.security.acl.IAccessAuthorizer;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.util.Time;
-import org.junit.Assert;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 import static org.apache.hadoop.ozone.OzoneAcl.AclScope.ACCESS;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 
 /**
  * Class to test {@link OmVolumeArgs}.
@@ -45,43 +46,43 @@ public class TestOmVolumeArgs {
         .addMetadata("key1", "value1").addMetadata("key2", "value2")
         .addOzoneAcls(
             new OzoneAcl(IAccessAuthorizer.ACLIdentityType.USER, "user1",
-                IAccessAuthorizer.ACLType.READ, ACCESS)).build();
+                ACCESS, IAccessAuthorizer.ACLType.READ)).build();
 
     OmVolumeArgs cloneVolumeArgs = omVolumeArgs.copyObject();
 
-    Assert.assertEquals(omVolumeArgs, cloneVolumeArgs);
+    assertEquals(omVolumeArgs, cloneVolumeArgs);
 
     // add user acl to write.
     omVolumeArgs.addAcl(new OzoneAcl(
         IAccessAuthorizer.ACLIdentityType.USER, "user1",
-        IAccessAuthorizer.ACLType.WRITE, ACCESS));
+        ACCESS, IAccessAuthorizer.ACLType.WRITE));
 
     // Now check clone acl
-    Assert.assertNotEquals(cloneVolumeArgs.getAcls().get(0),
+    assertNotEquals(cloneVolumeArgs.getAcls().get(0),
         omVolumeArgs.getAcls().get(0));
 
     // Set user acl to Write_ACL.
     omVolumeArgs.setAcls(Collections.singletonList(new OzoneAcl(
         IAccessAuthorizer.ACLIdentityType.USER, "user1",
-        IAccessAuthorizer.ACLType.WRITE_ACL, ACCESS)));
+        ACCESS, IAccessAuthorizer.ACLType.WRITE_ACL)));
 
-    Assert.assertNotEquals(cloneVolumeArgs.getAcls().get(0),
+    assertNotEquals(cloneVolumeArgs.getAcls().get(0),
         omVolumeArgs.getAcls().get(0));
 
     // Now clone and check. It should have same as original acl.
     cloneVolumeArgs = (OmVolumeArgs) omVolumeArgs.copyObject();
 
-    Assert.assertEquals(omVolumeArgs, cloneVolumeArgs);
-    Assert.assertEquals(cloneVolumeArgs.getAcls().get(0),
+    assertEquals(omVolumeArgs, cloneVolumeArgs);
+    assertEquals(cloneVolumeArgs.getAcls().get(0),
         omVolumeArgs.getAcls().get(0));
 
     omVolumeArgs.removeAcl(new OzoneAcl(
         IAccessAuthorizer.ACLIdentityType.USER, "user1",
-        IAccessAuthorizer.ACLType.WRITE_ACL, ACCESS));
+        ACCESS, IAccessAuthorizer.ACLType.WRITE_ACL));
 
     // Removing acl, in original omVolumeArgs it should have no acls.
-    Assert.assertEquals(0, omVolumeArgs.getAcls().size());
-    Assert.assertEquals(1, cloneVolumeArgs.getAcls().size());
+    assertEquals(0, omVolumeArgs.getAcls().size());
+    assertEquals(1, cloneVolumeArgs.getAcls().size());
 
   }
 }

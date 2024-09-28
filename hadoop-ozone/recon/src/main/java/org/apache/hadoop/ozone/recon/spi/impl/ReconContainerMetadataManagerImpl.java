@@ -58,7 +58,7 @@ import org.apache.hadoop.hdds.utils.db.Table.KeyValue;
 import org.apache.hadoop.hdds.utils.db.TableIterator;
 import org.hadoop.ozone.recon.schema.tables.daos.GlobalStatsDao;
 import org.hadoop.ozone.recon.schema.tables.pojos.GlobalStats;
-import org.jetbrains.annotations.NotNull;
+import jakarta.annotation.Nonnull;
 import org.jooq.Configuration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -421,7 +421,7 @@ public class ReconContainerMetadataManagerImpl
    * only for the given limit from the given start key. The start containerID
    * is skipped from the result.
    *
-   * Return all the containers if limit < 0.
+   * Return all the containers if limit &lt; 0.
    *
    * @param limit No of containers to get.
    * @param prevContainer containerID after which the
@@ -483,7 +483,7 @@ public class ReconContainerMetadataManagerImpl
     return containers;
   }
 
-  @NotNull
+  @Nonnull
   private List<Pipeline> getPipelines(ContainerKeyPrefix containerKeyPrefix)
       throws IOException {
     OmKeyInfo omKeyInfo = omMetadataManager.getKeyTable(BucketLayout.LEGACY)
@@ -518,6 +518,10 @@ public class ReconContainerMetadataManagerImpl
                                           ContainerKeyPrefix containerKeyPrefix)
       throws IOException {
     containerKeyTable.deleteWithBatch(batch, containerKeyPrefix);
+    if (!StringUtils.isEmpty(containerKeyPrefix.getKeyPrefix())) {
+      keyContainerTable.deleteWithBatch(batch,
+          containerKeyPrefix.toKeyPrefixContainer());
+    }
   }
 
   /**
@@ -542,6 +546,11 @@ public class ReconContainerMetadataManagerImpl
   @Override
   public TableIterator getKeyContainerTableIterator() throws IOException {
     return keyContainerTable.iterator();
+  }
+
+  @Override
+  public Table<KeyPrefixContainer, Integer> getKeyContainerTable() {
+    return keyContainerTable;
   }
 
   /**

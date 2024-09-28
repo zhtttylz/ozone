@@ -19,18 +19,18 @@
 @progress-gray: #d0d0d0;
 @progress-blue: #1890ff;
 @progress-green: #52c41a;
+@progress-dark-grey: #424242;
 
 .storage-cell-container {
   position: relative;
   .capacity-bar {
     .ant-progress-text {
-      font-size: 0.8em;
+      font-size: 1em;
     }
     .ant-progress-inner {
       background-color: @progress-gray;
     }
     position: absolute;
-    bottom: -12px;
   }
 }
 
@@ -44,4 +44,8 @@
 
 .remaining-bg {
   color: @progress-gray;
+}
+
+.committed-bg {
+  color: @progress-dark-grey;
 }

@@ -30,13 +30,16 @@ import java.net.URL;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Enumeration;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.SortedSet;
 import java.util.TreeSet;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 import org.apache.hadoop.conf.Configuration;
@@ -46,6 +49,7 @@ import org.apache.hadoop.hdds.scm.ScmConfigKeys;
 import org.apache.hadoop.hdds.utils.LegacyHadoopConfigurationSource;
 
 import com.google.common.base.Preconditions;
+import org.apache.hadoop.ozone.OzoneConfigKeys;
 import org.apache.ratis.server.RaftServerConfigKeys;
 
 import static java.util.Collections.unmodifiableSortedSet;
@@ -98,16 +102,6 @@ public class OzoneConfiguration extends Configuration
   public static <T> T newInstanceOf(Class<T> configurationClass) {
     OzoneConfiguration conf = new OzoneConfiguration();
     return conf.getObject(configurationClass);
-  }
-
-  /**
-   * @return a new {@code OzoneConfiguration} instance set from the given
-   * {@code configObject}
-   */
-  public static <T> OzoneConfiguration fromObject(T configObject) {
-    OzoneConfiguration conf = new OzoneConfiguration();
-    conf.setFromObject(configObject);
-    return conf;
   }
 
   public OzoneConfiguration() {
@@ -171,15 +165,11 @@ public class OzoneConfiguration extends Configuration
     }
 
     public XMLConfiguration(List<Property> properties) {
-      this.properties = properties;
+      this.properties = new ArrayList<>(properties);
     }
 
     public List<Property> getProperties() {
-      return properties;
-    }
-
-    public void setProperties(List<Property> properties) {
-      this.properties = properties;
+      return Collections.unmodifiableList(properties);
     }
   }
 
@@ -332,7 +322,138 @@ public class OzoneConfiguration extends Configuration
         new DeprecationDelta("ozone.scm.chunk.layout",
             ScmConfigKeys.OZONE_SCM_CONTAINER_LAYOUT_KEY),
         new DeprecationDelta("hdds.datanode.replication.work.dir",
-            OZONE_CONTAINER_COPY_WORKDIR)
+            OZONE_CONTAINER_COPY_WORKDIR),
+        new DeprecationDelta("dfs.container.chunk.write.sync",
+            OzoneConfigKeys.HDDS_CONTAINER_CHUNK_WRITE_SYNC_KEY),
+        new DeprecationDelta("dfs.container.ipc",
+            OzoneConfigKeys.HDDS_CONTAINER_IPC_PORT),
+        new DeprecationDelta("dfs.container.ipc.random.port",
+            OzoneConfigKeys.HDDS_CONTAINER_IPC_RANDOM_PORT),
+        new DeprecationDelta("dfs.container.ratis.admin.port",
+            OzoneConfigKeys.HDDS_CONTAINER_RATIS_ADMIN_PORT),
+        new DeprecationDelta("dfs.container.ratis.datanode.storage.dir",
+            OzoneConfigKeys.HDDS_CONTAINER_RATIS_DATANODE_STORAGE_DIR),
+        new DeprecationDelta("dfs.container.ratis.datastream.enabled",
+            OzoneConfigKeys.HDDS_CONTAINER_RATIS_DATASTREAM_ENABLED),
+        new DeprecationDelta("dfs.container.ratis.datastream.port",
+            OzoneConfigKeys.HDDS_CONTAINER_RATIS_DATASTREAM_PORT),
+        new DeprecationDelta("dfs.container.ratis.datastream.random.port",
+            OzoneConfigKeys.HDDS_CONTAINER_RATIS_DATASTREAM_RANDOM_PORT),
+        new DeprecationDelta("dfs.container.ratis.enabled",
+            ScmConfigKeys.HDDS_CONTAINER_RATIS_ENABLED_KEY),
+        new DeprecationDelta("dfs.container.ratis.ipc",
+            OzoneConfigKeys.HDDS_CONTAINER_RATIS_IPC_PORT),
+        new DeprecationDelta("dfs.container.ratis.ipc.random.port",
+            OzoneConfigKeys.HDDS_CONTAINER_RATIS_IPC_RANDOM_PORT),
+        new DeprecationDelta("dfs.container.ratis.leader.pending.bytes.limit",
+            ScmConfigKeys.HDDS_CONTAINER_RATIS_LEADER_PENDING_BYTES_LIMIT),
+        new DeprecationDelta("dfs.container.ratis.log.appender.queue.byte-limit",
+            ScmConfigKeys.HDDS_CONTAINER_RATIS_LOG_APPENDER_QUEUE_BYTE_LIMIT),
+        new DeprecationDelta("dfs.container.ratis.log.appender.queue.num-elements",
+            ScmConfigKeys.HDDS_CONTAINER_RATIS_LOG_APPENDER_QUEUE_NUM_ELEMENTS),
+        new DeprecationDelta("dfs.container.ratis.log.purge.gap",
+            ScmConfigKeys.HDDS_CONTAINER_RATIS_LOG_PURGE_GAP),
+        new DeprecationDelta("dfs.container.ratis.log.queue.byte-limit",
+            ScmConfigKeys.HDDS_CONTAINER_RATIS_LOG_QUEUE_BYTE_LIMIT),
+        new DeprecationDelta("dfs.container.ratis.log.queue.num-elements",
+            ScmConfigKeys.HDDS_CONTAINER_RATIS_LOG_QUEUE_NUM_ELEMENTS),
+        new DeprecationDelta("dfs.container.ratis.num.container.op.executors",
+            ScmConfigKeys.HDDS_CONTAINER_RATIS_NUM_CONTAINER_OP_EXECUTORS_KEY),
+        new DeprecationDelta("dfs.container.ratis.num.write.chunk.threads.per.volume",
+            ScmConfigKeys.HDDS_CONTAINER_RATIS_NUM_WRITE_CHUNK_THREADS_PER_VOLUME),
+        new DeprecationDelta("dfs.container.ratis.replication.level",
+            ScmConfigKeys.HDDS_CONTAINER_RATIS_REPLICATION_LEVEL_KEY),
+        new DeprecationDelta("dfs.container.ratis.rpc.type",
+            ScmConfigKeys.HDDS_CONTAINER_RATIS_RPC_TYPE_KEY),
+        new DeprecationDelta("dfs.container.ratis.segment.preallocated.size",
+            ScmConfigKeys.HDDS_CONTAINER_RATIS_SEGMENT_PREALLOCATED_SIZE_KEY),
+        new DeprecationDelta("dfs.container.ratis.segment.size",
+            ScmConfigKeys.HDDS_CONTAINER_RATIS_SEGMENT_SIZE_KEY),
+        new DeprecationDelta("dfs.container.ratis.server.port",
+            OzoneConfigKeys.HDDS_CONTAINER_RATIS_SERVER_PORT),
+        new DeprecationDelta("dfs.container.ratis.statemachinedata.sync.retries",
+            ScmConfigKeys.HDDS_CONTAINER_RATIS_STATEMACHINEDATA_SYNC_RETRIES),
+        new DeprecationDelta("dfs.container.ratis.statemachinedata.sync.timeout",
+            ScmConfigKeys.HDDS_CONTAINER_RATIS_STATEMACHINEDATA_SYNC_TIMEOUT),
+        new DeprecationDelta("dfs.container.ratis.statemachine.max.pending.apply-transactions",
+            ScmConfigKeys.HDDS_CONTAINER_RATIS_STATEMACHINE_MAX_PENDING_APPLY_TXNS),
+        new DeprecationDelta("dfs.ratis.leader.election.minimum.timeout.duration",
+            ScmConfigKeys.HDDS_RATIS_LEADER_ELECTION_MINIMUM_TIMEOUT_DURATION_KEY),
+        new DeprecationDelta("dfs.ratis.server.retry-cache.timeout.duration",
+            ScmConfigKeys.HDDS_RATIS_SERVER_RETRY_CACHE_TIMEOUT_DURATION_KEY),
+        new DeprecationDelta("dfs.ratis.snapshot.threshold",
+            ScmConfigKeys.HDDS_RATIS_SNAPSHOT_THRESHOLD_KEY)
     });
+  }
+
+  /**
+   * Gets backwards-compatible configuration property values.
+   * @param name Primary configuration attribute key name.
+   * @param fallbackName The key name of the configuration property that needs
+   *                     to be backward compatible.
+   * @param defaultValue The default value to be returned.
+   */
+  public int getInt(String name, String fallbackName, int defaultValue,
+      Consumer<String> log) {
+    String value = this.getTrimmed(name);
+    if (value == null) {
+      value = this.getTrimmed(fallbackName);
+      if (log != null) {
+        log.accept(name + " is not set.  Fallback to " + fallbackName +
+            ", which is set to " + value);
+      }
+    }
+    if (value == null) {
+      return defaultValue;
+    }
+    return Integer.parseInt(value);
+  }
+
+  private Properties delegatingProps;
+
+  @Override
+  public synchronized void reloadConfiguration() {
+    super.reloadConfiguration();
+    delegatingProps = null;
+  }
+
+  @Override
+  protected final synchronized Properties getProps() {
+    if (delegatingProps == null) {
+      String complianceMode = getPropertyUnsafe(OzoneConfigKeys.OZONE_SECURITY_CRYPTO_COMPLIANCE_MODE,
+          OzoneConfigKeys.OZONE_SECURITY_CRYPTO_COMPLIANCE_MODE_UNRESTRICTED);
+      Properties cryptoProperties = getCryptoProperties();
+      delegatingProps = new DelegatingProperties(super.getProps(), complianceMode, cryptoProperties);
+    }
+    return delegatingProps;
+  }
+
+  /**
+   * Get a property value without the compliance check. It's needed to get the compliance
+   * mode from the configuration.
+   *
+   * @param key property name
+   * @param defaultValue default value
+   * @return property value, without compliance check
+   */
+  private String getPropertyUnsafe(String key, String defaultValue) {
+    return super.getProps().getProperty(key, defaultValue);
+  }
+
+  private Properties getCryptoProperties() {
+    try {
+      return super.getAllPropertiesByTag(ConfigTag.CRYPTO_COMPLIANCE.toString());
+    } catch (NoSuchMethodError e) {
+      // We need to handle NoSuchMethodError, because in Hadoop 2 we don't have the
+      // getAllPropertiesByTag method. We won't be supporting the compliance mode with
+      // that version, so we are safe to catch the exception and return a new Properties object.
+      return new Properties();
+    }
+  }
+
+  @Override
+  public Iterator<Map.Entry<String, String>> iterator() {
+    DelegatingProperties properties = (DelegatingProperties) getProps();
+    return properties.iterator();
   }
 }

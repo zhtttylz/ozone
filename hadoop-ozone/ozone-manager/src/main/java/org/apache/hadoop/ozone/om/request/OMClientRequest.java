@@ -21,13 +21,15 @@ package org.apache.hadoop.ozone.om.request;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.hadoop.hdds.utils.TransactionInfo;
+import org.apache.hadoop.ozone.om.helpers.OMAuditLogger;
+import org.apache.ratis.server.protocol.TermIndex;
 import org.apache.hadoop.ipc.ProtobufRpcEngine;
 import org.apache.hadoop.ozone.OmUtils;
 import org.apache.hadoop.ozone.OzoneConsts;
 import org.apache.hadoop.ozone.audit.AuditAction;
 import org.apache.hadoop.ozone.audit.AuditEventStatus;
 import org.apache.hadoop.ozone.audit.AuditLogger;
-import org.apache.hadoop.ozone.audit.AuditMessage;
 import org.apache.hadoop.ozone.om.IOmMetadataReader;
 import org.apache.hadoop.ozone.om.OmMetadataReader;
 import org.apache.hadoop.ozone.om.OzoneAclUtils;
@@ -35,11 +37,11 @@ import org.apache.hadoop.ozone.om.OzoneManager;
 import org.apache.hadoop.ozone.om.OzonePrefixPathImpl;
 import org.apache.hadoop.ozone.om.exceptions.OMException;
 import org.apache.hadoop.ozone.om.helpers.BucketLayout;
-import org.apache.hadoop.ozone.om.ratis.utils.OzoneManagerDoubleBufferHelper;
+import org.apache.hadoop.ozone.om.lock.OMLockDetails;
+import org.apache.hadoop.ozone.om.protocolPB.grpc.GrpcClientConstants;
 import org.apache.hadoop.ozone.om.ratis.utils.OzoneManagerRatisUtils;
 import org.apache.hadoop.ozone.om.response.OMClientResponse;
 import org.apache.hadoop.ozone.om.snapshot.ReferenceCounted;
-import org.apache.hadoop.ozone.om.snapshot.SnapshotCache;
 import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos;
 import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos.LayoutVersion;
 import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos.OMRequest;
@@ -53,9 +55,10 @@ import org.apache.hadoop.security.authentication.client.AuthenticationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import javax.annotation.Nonnull;
+import jakarta.annotation.Nonnull;
 import java.io.IOException;
 import java.net.InetAddress;
+import java.nio.file.InvalidPathException;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -75,6 +78,12 @@ public abstract class OMClientRequest implements RequestAuditor {
 
   private UserGroupInformation userGroupInformation;
   private InetAddress inetAddress;
+  private final OMLockDetails omLockDetails = new OMLockDetails();
+  private final OMAuditLogger.Builder auditBuilder = OMAuditLogger.newBuilder();
+
+  public OMAuditLogger.Builder getAuditBuilder() {
+    return auditBuilder;
+  }
 
   /**
    * Stores the result of request execution in
@@ -89,6 +98,7 @@ public abstract class OMClientRequest implements RequestAuditor {
   public OMClientRequest(OMRequest omRequest) {
     Preconditions.checkNotNull(omRequest);
     this.omRequest = omRequest;
+    this.omLockDetails.clear();
   }
   /**
    * Perform pre-execute steps on a OMRequest.
@@ -130,9 +140,13 @@ public abstract class OMClientRequest implements RequestAuditor {
    *
    * @return the response that will be returned to the client.
    */
-  public abstract OMClientResponse validateAndUpdateCache(
-      OzoneManager ozoneManager, long transactionLogIndex,
-      OzoneManagerDoubleBufferHelper ozoneManagerDoubleBufferHelper);
+  public abstract OMClientResponse validateAndUpdateCache(OzoneManager ozoneManager, TermIndex termIndex);
+
+  /** For testing only. */
+  @VisibleForTesting
+  public OMClientResponse validateAndUpdateCache(OzoneManager ozoneManager, long transactionLogIndex) {
+    return validateAndUpdateCache(ozoneManager, TransactionInfo.getTermIndex(transactionLogIndex));
+  }
 
   @VisibleForTesting
   public OMRequest getOmRequest() {
@@ -164,9 +178,17 @@ public abstract class OMClientRequest implements RequestAuditor {
       userInfo.setUserName(omRequest.getUserInfo().getUserName());
     }
 
+    String grpcContextClientIpAddress =
+        GrpcClientConstants.CLIENT_IP_ADDRESS_CTX_KEY.get();
+    String grpcContextClientHostname =
+        GrpcClientConstants.CLIENT_HOSTNAME_CTX_KEY.get();
     if (remoteAddress != null) {
       userInfo.setHostName(remoteAddress.getHostName());
       userInfo.setRemoteAddress(remoteAddress.getHostAddress()).build();
+    } else if (grpcContextClientHostname != null
+        && grpcContextClientIpAddress != null) {
+      userInfo.setHostName(grpcContextClientHostname);
+      userInfo.setRemoteAddress(grpcContextClientIpAddress);
     }
 
     return userInfo.build();
@@ -277,7 +299,7 @@ public abstract class OMClientRequest implements RequestAuditor {
         contextBuilder.setOwnerName(bucketOwner);
       }
 
-      try (ReferenceCounted<IOmMetadataReader, SnapshotCache> rcMetadataReader =
+      try (ReferenceCounted<IOmMetadataReader> rcMetadataReader =
           ozoneManager.getOmMetadataReader()) {
         OmMetadataReader omMetadataReader =
             (OmMetadataReader) rcMetadataReader.get();
@@ -343,7 +365,7 @@ public abstract class OMClientRequest implements RequestAuditor {
       String bucketOwner)
       throws IOException {
 
-    try (ReferenceCounted<IOmMetadataReader, SnapshotCache> rcMetadataReader =
+    try (ReferenceCounted<IOmMetadataReader> rcMetadataReader =
         ozoneManager.getOmMetadataReader()) {
       OzoneAclUtils.checkAllAcls((OmMetadataReader) rcMetadataReader.get(),
           resType, storeType, aclType,
@@ -416,7 +438,6 @@ public abstract class OMClientRequest implements RequestAuditor {
    * Return String created from OMRequest userInfo. If userInfo is not
    * set, returns null.
    * @return String
-   * @throws IOException
    */
   @VisibleForTesting
   public String getHostName() {
@@ -434,7 +455,7 @@ public abstract class OMClientRequest implements RequestAuditor {
    * @return error response need to be returned to client - OMResponse.
    */
   protected OMResponse createErrorOMResponse(
-      @Nonnull OMResponse.Builder omResponse, @Nonnull IOException ex) {
+      @Nonnull OMResponse.Builder omResponse, @Nonnull Exception ex) {
 
     omResponse.setSuccess(false);
     String errorMsg = exceptionErrorMessage(ex);
@@ -445,23 +466,8 @@ public abstract class OMClientRequest implements RequestAuditor {
     return omResponse.build();
   }
 
-  /**
-   * Add the client response to double buffer and set the flush future.
-   * @param trxIndex
-   * @param omClientResponse
-   * @param omDoubleBufferHelper
-   */
-  protected void addResponseToDoubleBuffer(long trxIndex,
-      OMClientResponse omClientResponse,
-      OzoneManagerDoubleBufferHelper omDoubleBufferHelper) {
-    if (omClientResponse != null) {
-      omClientResponse.setFlushFuture(
-          omDoubleBufferHelper.add(omClientResponse, trxIndex));
-    }
-  }
-
-  private String exceptionErrorMessage(IOException ex) {
-    if (ex instanceof OMException) {
+  private String exceptionErrorMessage(Exception ex) {
+    if (ex instanceof OMException || ex instanceof InvalidPathException) {
       return ex.getMessage();
     } else {
       return org.apache.hadoop.util.StringUtils.stringifyException(ex);
@@ -469,27 +475,29 @@ public abstract class OMClientRequest implements RequestAuditor {
   }
 
   /**
-   * Log the auditMessage.
+   * Mark ready for log audit.
    * @param auditLogger
-   * @param auditMessage
+   * @param builder
    */
-  protected void auditLog(AuditLogger auditLogger, AuditMessage auditMessage) {
-    auditLogger.logWrite(auditMessage);
+  protected void markForAudit(AuditLogger auditLogger, OMAuditLogger.Builder builder) {
+    builder.setLog(true);
+    builder.setAuditLogger(auditLogger);
   }
 
   @Override
-  public AuditMessage buildAuditMessage(AuditAction op,
+  public OMAuditLogger.Builder buildAuditMessage(AuditAction op,
       Map< String, String > auditMap, Throwable throwable,
       OzoneManagerProtocolProtos.UserInfo userInfo) {
-    return new AuditMessage.Builder()
+    auditBuilder.getMessageBuilder()
         .setUser(userInfo != null ? userInfo.getUserName() : null)
         .atIp(userInfo != null ? userInfo.getRemoteAddress() : null)
         .forOperation(op)
         .withParams(auditMap)
         .withResult(throwable != null ? AuditEventStatus.FAILURE :
             AuditEventStatus.SUCCESS)
-        .withException(throwable)
-        .build();
+        .withException(throwable);
+    auditBuilder.setAuditMap(auditMap);
+    return auditBuilder;
   }
 
   @Override
@@ -569,5 +577,13 @@ public abstract class OMClientRequest implements RequestAuditor {
     } else {
       throw new OMException("Invalid KeyPath " + path, INVALID_KEY_NAME);
     }
+  }
+
+  public OMLockDetails getOmLockDetails() {
+    return omLockDetails;
+  }
+
+  public void mergeOmLockDetails(OMLockDetails details) {
+    omLockDetails.merge(details);
   }
 }

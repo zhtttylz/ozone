@@ -17,7 +17,6 @@
  */
 package org.apache.hadoop.ozone.s3.endpoint;
 
-import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.hdds.client.ReplicationType;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
@@ -29,6 +28,7 @@ import org.apache.hadoop.ozone.client.OzoneMultipartUploadList;
 import org.apache.hadoop.ozone.client.OzoneVolume;
 import org.apache.hadoop.ozone.om.exceptions.OMException;
 import org.apache.hadoop.ozone.om.exceptions.OMException.ResultCodes;
+import org.apache.hadoop.ozone.om.helpers.ErrorInfo;
 import org.apache.hadoop.ozone.om.helpers.OzoneAclUtil;
 import org.apache.hadoop.ozone.s3.commontypes.EncodingTypeObject;
 import org.apache.hadoop.ozone.s3.commontypes.KeyMetadata;
@@ -64,12 +64,16 @@ import javax.ws.rs.core.Response;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
-import java.util.BitSet;
+import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
+import static org.apache.hadoop.ozone.OzoneConsts.ETAG;
+import static org.apache.hadoop.ozone.audit.AuditLogger.PerformanceStringBuilder;
 import static org.apache.hadoop.ozone.OzoneAcl.AclScope.ACCESS;
 import static org.apache.hadoop.ozone.OzoneConsts.OZONE_URI_DELIMITER;
 import static org.apache.hadoop.ozone.s3.S3GatewayConfigKeys.OZONE_S3G_LIST_KEYS_SHALLOW_ENABLED;
@@ -99,7 +103,6 @@ public class BucketEndpoint extends EndpointBase {
    * for more details.
    */
   @GET
-  @SuppressFBWarnings
   @SuppressWarnings({"parameternumber", "methodlength"})
   public Response get(
       @PathParam("bucket") String bucketName,
@@ -115,9 +118,12 @@ public class BucketEndpoint extends EndpointBase {
       @Context HttpHeaders hh) throws OS3Exception, IOException {
     long startNanos = Time.monotonicNowNanos();
     S3GAction s3GAction = S3GAction.GET_BUCKET;
-    Iterator<? extends OzoneKey> ozoneKeyIterator;
+    PerformanceStringBuilder perf = new PerformanceStringBuilder();
+
+    Iterator<? extends OzoneKey> ozoneKeyIterator = null;
     ContinueToken decodedToken =
         ContinueToken.decodeFromString(continueToken);
+    OzoneBucket bucket = null;
 
     try {
       if (aclMarker != null) {
@@ -153,7 +159,7 @@ public class BucketEndpoint extends EndpointBase {
       boolean shallow = listKeysShallowEnabled
           && OZONE_URI_DELIMITER.equals(delimiter);
 
-      OzoneBucket bucket = getBucket(bucketName);
+      bucket = getBucket(bucketName);
       ozoneKeyIterator = bucket.listKeys(prefix, prevKey, shallow);
 
     } catch (OMException ex) {
@@ -162,6 +168,9 @@ public class BucketEndpoint extends EndpointBase {
       getMetrics().updateGetBucketFailureStats(startNanos);
       if (isAccessDenied(ex)) {
         throw newError(S3ErrorTable.ACCESS_DENIED, bucketName, ex);
+      } else if (ex.getResult() == ResultCodes.FILE_NOT_FOUND) {
+        // File not found, continue and send normal response with 0 keyCount
+        LOG.debug("Key Not found prefix: {}", prefix);
       } else {
         throw ex;
       }
@@ -204,8 +213,18 @@ public class BucketEndpoint extends EndpointBase {
     }
     String lastKey = null;
     int count = 0;
-    while (ozoneKeyIterator.hasNext()) {
+    while (ozoneKeyIterator != null && ozoneKeyIterator.hasNext()) {
       OzoneKey next = ozoneKeyIterator.next();
+      if (bucket != null && bucket.getBucketLayout().isFileSystemOptimized() &&
+          StringUtils.isNotEmpty(prefix) &&
+          !next.getName().startsWith(prefix)) {
+        // prefix has delimiter but key don't have
+        // example prefix: dir1/ key: dir123
+        continue;
+      }
+      if (startAfter != null && count == 0 && Objects.equals(startAfter, next.getName())) {
+        continue;
+      }
       String relativeKeyName = next.getName().substring(prefix.length());
 
       int depth = StringUtils.countMatches(relativeKeyName, delimiter);
@@ -258,12 +277,15 @@ public class BucketEndpoint extends EndpointBase {
       response.setTruncated(false);
     }
 
-    AUDIT.logReadSuccess(buildAuditMessageForSuccess(s3GAction,
-        getAuditParameters()));
     int keyCount =
         response.getCommonPrefixes().size() + response.getContents().size();
-    getMetrics().updateGetBucketSuccessStats(startNanos);
+    long opLatencyNs =
+        getMetrics().updateGetBucketSuccessStats(startNanos);
     getMetrics().incListKeyCount(keyCount);
+    perf.appendCount(keyCount);
+    perf.appendOpLatencyNanos(opLatencyNs);
+    AUDIT.logReadSuccess(buildAuditMessageForSuccess(s3GAction,
+        getAuditParameters(), perf));
     response.setKeyCount(keyCount);
     return Response.ok(response).build();
   }
@@ -429,47 +451,48 @@ public class BucketEndpoint extends EndpointBase {
 
     OzoneBucket bucket = getBucket(bucketName);
     MultiDeleteResponse result = new MultiDeleteResponse();
-    if (request.getObjects() != null) {
-      for (DeleteObject keyToDelete : request.getObjects()) {
-        long startNanos = Time.monotonicNowNanos();
-        try {
-          bucket.deleteKey(keyToDelete.getKey());
-          getMetrics().updateDeleteKeySuccessStats(startNanos);
+    List<String> deleteKeys = new ArrayList<>();
 
-          if (!request.isQuiet()) {
-            result.addDeleted(new DeletedObject(keyToDelete.getKey()));
-          }
-        } catch (OMException ex) {
-          if (isAccessDenied(ex)) {
-            getMetrics().updateDeleteKeyFailureStats(startNanos);
-            result.addError(
-                new Error(keyToDelete.getKey(), "PermissionDenied",
-                    ex.getMessage()));
-          } else if (ex.getResult() != ResultCodes.KEY_NOT_FOUND) {
-            getMetrics().updateDeleteKeyFailureStats(startNanos);
-            result.addError(
-                new Error(keyToDelete.getKey(), "InternalError",
-                    ex.getMessage()));
-          } else {
+    if (request.getObjects() != null) {
+      Map<String, ErrorInfo> undeletedKeyResultMap;
+      for (DeleteObject keyToDelete : request.getObjects()) {
+        deleteKeys.add(keyToDelete.getKey());
+      }
+      long startNanos = Time.monotonicNowNanos();
+      try {
+        undeletedKeyResultMap = bucket.deleteKeys(deleteKeys, true);
+        for (DeleteObject d : request.getObjects()) {
+          ErrorInfo error = undeletedKeyResultMap.get(d.getKey());
+          boolean deleted = error == null ||
+              // if the key is not found, it is assumed to be successfully deleted
+              ResultCodes.KEY_NOT_FOUND.name().equals(error.getCode());
+          if (deleted) {
+            deleteKeys.remove(d.getKey());
             if (!request.isQuiet()) {
-              result.addDeleted(new DeletedObject(keyToDelete.getKey()));
+              result.addDeleted(new DeletedObject(d.getKey()));
             }
-            getMetrics().updateDeleteKeySuccessStats(startNanos);
+          } else {
+            result.addError(new Error(d.getKey(), error.getCode(), error.getMessage()));
           }
-        } catch (Exception ex) {
-          getMetrics().updateDeleteKeyFailureStats(startNanos);
-          result.addError(
-              new Error(keyToDelete.getKey(), "InternalError",
-                  ex.getMessage()));
         }
+        getMetrics().updateDeleteKeySuccessStats(startNanos);
+      } catch (IOException ex) {
+        LOG.error("Delete key failed: {}", ex.getMessage());
+        getMetrics().updateDeleteKeyFailureStats(startNanos);
+        result.addError(
+            new Error("ALL", "InternalError",
+                ex.getMessage()));
       }
     }
+
+    Map<String, String> auditMap = getAuditParameters();
+    auditMap.put("failedDeletes", deleteKeys.toString());
     if (result.getErrors().size() != 0) {
       AUDIT.logWriteFailure(buildAuditMessageForFailure(s3GAction,
-          getAuditParameters(), new Exception("MultiDelete Exception")));
+          auditMap, new Exception("MultiDelete Exception")));
     } else {
       AUDIT.logWriteSuccess(
-          buildAuditMessageForSuccess(s3GAction, getAuditParameters()));
+          buildAuditMessageForSuccess(s3GAction, auditMap));
     }
     return result;
   }
@@ -650,14 +673,11 @@ public class BucketEndpoint extends EndpointBase {
         throw newError(NOT_IMPLEMENTED, part[0]);
       }
       // Build ACL on Bucket
-      BitSet aclsOnBucket =
-          S3Acl.getOzoneAclOnBucketFromS3Permission(permission);
+      EnumSet<IAccessAuthorizer.ACLType> aclsOnBucket = S3Acl.getOzoneAclOnBucketFromS3Permission(permission);
       OzoneAcl defaultOzoneAcl = new OzoneAcl(
-          IAccessAuthorizer.ACLIdentityType.USER, part[1], aclsOnBucket,
-          OzoneAcl.AclScope.DEFAULT);
-      OzoneAcl accessOzoneAcl = new OzoneAcl(
-          IAccessAuthorizer.ACLIdentityType.USER, part[1], aclsOnBucket,
-          ACCESS);
+          IAccessAuthorizer.ACLIdentityType.USER, part[1], OzoneAcl.AclScope.DEFAULT, aclsOnBucket
+      );
+      OzoneAcl accessOzoneAcl = new OzoneAcl(IAccessAuthorizer.ACLIdentityType.USER, part[1], ACCESS, aclsOnBucket);
       ozoneAclList.add(defaultOzoneAcl);
       ozoneAclList.add(accessOzoneAcl);
     }
@@ -684,11 +704,9 @@ public class BucketEndpoint extends EndpointBase {
         throw newError(NOT_IMPLEMENTED, part[0]);
       }
       // Build ACL on Volume
-      BitSet aclsOnVolume =
+      EnumSet<IAccessAuthorizer.ACLType> aclsOnVolume =
           S3Acl.getOzoneAclOnVolumeFromS3Permission(permission);
-      OzoneAcl accessOzoneAcl = new OzoneAcl(
-          IAccessAuthorizer.ACLIdentityType.USER, part[1], aclsOnVolume,
-          ACCESS);
+      OzoneAcl accessOzoneAcl = new OzoneAcl(IAccessAuthorizer.ACLIdentityType.USER, part[1], ACCESS, aclsOnVolume);
       ozoneAclList.add(accessOzoneAcl);
     }
     return ozoneAclList;
@@ -699,7 +717,10 @@ public class BucketEndpoint extends EndpointBase {
     keyMetadata.setKey(EncodingTypeObject.createNullable(next.getName(),
         response.getEncodingType()));
     keyMetadata.setSize(next.getDataSize());
-    keyMetadata.setETag("" + next.getModificationTime());
+    String eTag = next.getMetadata().get(ETAG);
+    if (eTag != null) {
+      keyMetadata.setETag(ObjectEndpoint.wrapInQuotes(eTag));
+    }
     if (next.getReplicationType().toString().equals(ReplicationType
         .STAND_ALONE.toString())) {
       keyMetadata.setStorageClass(S3StorageType.REDUCED_REDUNDANCY.toString());
@@ -707,6 +728,10 @@ public class BucketEndpoint extends EndpointBase {
       keyMetadata.setStorageClass(S3StorageType.STANDARD.toString());
     }
     keyMetadata.setLastModified(next.getModificationTime());
+    String ownerName = next.getOwner();
+    String displayName = ownerName;
+    // Use ownerName to fill displayName
+    keyMetadata.setOwner(new S3Owner(ownerName, displayName));
     response.addKey(keyMetadata);
   }
 

@@ -21,7 +21,6 @@ package org.apache.hadoop.ozone.om.ratis;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Maps;
-import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.ServiceException;
 
 import java.io.File;
@@ -31,18 +30,21 @@ import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
 import org.apache.hadoop.hdds.HddsUtils;
 import org.apache.hadoop.hdds.conf.ConfigurationSource;
+import org.apache.hadoop.hdds.conf.RatisConfUtils;
 import org.apache.hadoop.hdds.conf.StorageUnit;
 import org.apache.hadoop.hdds.ratis.RatisHelper;
 import org.apache.hadoop.hdds.security.SecurityConfig;
@@ -50,6 +52,7 @@ import org.apache.hadoop.hdds.security.x509.certificate.client.CertificateClient
 import org.apache.hadoop.hdds.tracing.TracingUtil;
 import org.apache.hadoop.ipc.ProtobufRpcEngine.Server;
 import org.apache.hadoop.ozone.om.OMConfigKeys;
+import org.apache.hadoop.ozone.om.OMPerformanceMetrics;
 import org.apache.hadoop.ozone.om.OzoneManager;
 import org.apache.hadoop.ozone.om.exceptions.OMException;
 import org.apache.hadoop.ozone.om.exceptions.OMLeaderNotReadyException;
@@ -70,6 +73,7 @@ import org.apache.ratis.netty.NettyConfigKeys;
 import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.SetConfigurationRequest;
 import org.apache.ratis.protocol.exceptions.LeaderNotReadyException;
+import org.apache.ratis.protocol.exceptions.LeaderSteppingDownException;
 import org.apache.ratis.protocol.exceptions.NotLeaderException;
 import org.apache.ratis.protocol.exceptions.StateMachineException;
 import org.apache.ratis.protocol.Message;
@@ -84,8 +88,9 @@ import org.apache.ratis.rpc.SupportedRpcType;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.RaftServerConfigKeys;
 import org.apache.ratis.server.protocol.TermIndex;
-import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
+import org.apache.ratis.server.storage.RaftStorage;
 import org.apache.ratis.util.LifeCycle;
+import org.apache.ratis.util.MemoizedSupplier;
 import org.apache.ratis.util.SizeInBytes;
 import org.apache.ratis.util.StringUtils;
 import org.apache.ratis.util.TimeDuration;
@@ -96,17 +101,17 @@ import static org.apache.hadoop.ipc.RpcConstants.DUMMY_CLIENT_ID;
 import static org.apache.hadoop.ipc.RpcConstants.INVALID_CALL_ID;
 import static org.apache.hadoop.ozone.om.OMConfigKeys.OZONE_OM_HA_PREFIX;
 import static org.apache.hadoop.ozone.om.ratis.utils.OzoneManagerRatisUtils.createServerTlsConfig;
+import static org.apache.hadoop.ozone.util.MetricUtil.captureLatencyNs;
 
 /**
  * Creates a Ratis server endpoint for OM.
  */
 public final class OzoneManagerRatisServer {
-  private static final Logger LOG = LoggerFactory
-      .getLogger(OzoneManagerRatisServer.class);
+  private static final Logger LOG = LoggerFactory.getLogger(OzoneManagerRatisServer.class);
 
   private final int port;
-  private final InetSocketAddress omRatisAddress;
   private final RaftServer server;
+  private final Supplier<RaftServer.Division> serverDivision;
   private final RaftGroupId raftGroupId;
   private final RaftGroup raftGroup;
   private final RaftPeerId raftPeerId;
@@ -115,6 +120,7 @@ public final class OzoneManagerRatisServer {
   private final OzoneManager ozoneManager;
   private final OzoneManagerStateMachine omStateMachine;
   private final String ratisStorageDir;
+  private final OMPerformanceMetrics perfMetrics;
 
   private final ClientId clientId = ClientId.randomId();
   private static final AtomicLong CALL_ID_COUNTER = new AtomicLong();
@@ -140,7 +146,6 @@ public final class OzoneManagerRatisServer {
       SecurityConfig secConfig, CertificateClient certClient)
       throws IOException {
     this.ozoneManager = om;
-    this.omRatisAddress = addr;
     this.port = addr.getPort();
     this.ratisStorageDir = OzoneManagerRatisUtils.getOMRatisDirectory(conf);
     final RaftProperties serverProperties = newRaftProperties(
@@ -162,7 +167,7 @@ public final class OzoneManagerRatisServer {
         raftPeersStr.append(", ").append(peer.getAddress());
       }
       LOG.info("Instantiating OM Ratis server with groupID: {} and peers: {}",
-          raftGroupIdStr, raftPeersStr.toString().substring(2));
+          raftGroupIdStr, raftPeersStr.substring(2));
     }
     this.omStateMachine = getStateMachine(conf);
 
@@ -173,7 +178,16 @@ public final class OzoneManagerRatisServer {
         .setProperties(serverProperties)
         .setParameters(parameters)
         .setStateMachine(omStateMachine)
+        .setOption(RaftStorage.StartupOption.RECOVER)
         .build();
+    this.serverDivision = MemoizedSupplier.valueOf(() -> {
+      try {
+        return server.getDivision(raftGroupId);
+      } catch (IOException e) {
+        throw new IllegalStateException("Failed to getDivision for " + raftGroupId, e);
+      }
+    });
+    this.perfMetrics = om.getPerfMetrics();
   }
 
   /**
@@ -246,11 +260,9 @@ public final class OzoneManagerRatisServer {
     // In prepare mode, only prepare and cancel requests are allowed to go
     // through.
     if (ozoneManager.getPrepareState().requestAllowed(omRequest.getCmdType())) {
-      RaftClientRequest raftClientRequest =
-          createWriteRaftClientRequest(omRequest);
+      RaftClientRequest raftClientRequest = createRaftRequest(omRequest);
       RaftClientReply raftClientReply = submitRequestToRatis(raftClientRequest);
-
-      return processReply(omRequest, raftClientReply);
+      return createOmResponse(omRequest, raftClientReply);
     } else {
       LOG.info("Rejecting write request on OM {} because it is in prepare " +
           "mode: {}", ozoneManager.getOMNodeId(),
@@ -268,21 +280,50 @@ public final class OzoneManagerRatisServer {
     }
   }
 
-  /**
-   * API used internally from OzoneManager Server when requests needs to be
-   * submitted to ratis, where the crafted RaftClientRequest is passed along.
-   * @param omRequest
-   * @param raftClientRequest
-   * @return OMResponse
-   * @throws ServiceException
-   */
-  public OMResponse submitRequest(OMRequest omRequest,
-      RaftClientRequest raftClientRequest) throws ServiceException {
-    RaftClientReply raftClientReply = submitRequestToRatis(raftClientRequest);
-    return processReply(omRequest, raftClientReply);
+  private OMResponse createOmResponse(OMRequest omRequest,
+      RaftClientReply raftClientReply) throws ServiceException {
+    return captureLatencyNs(
+        perfMetrics.getCreateOmResponseLatencyNs(),
+        () -> createOmResponseImpl(omRequest, raftClientReply));
   }
 
   private RaftClientReply submitRequestToRatis(
+      RaftClientRequest raftClientRequest) throws ServiceException {
+    return captureLatencyNs(
+        perfMetrics.getSubmitToRatisLatencyNs(),
+        () -> submitRequestToRatisImpl(raftClientRequest));
+  }
+
+  private RaftClientRequest createRaftRequest(OMRequest omRequest) {
+    return captureLatencyNs(
+        perfMetrics.getCreateRatisRequestLatencyNs(),
+        () -> createRaftRequestImpl(omRequest));
+  }
+
+  /**
+   * API used internally from OzoneManager Server when requests need to be submitted.
+   * @param omRequest
+   * @param cliId
+   * @param callId
+   * @return OMResponse
+   * @throws ServiceException
+   */
+  public OMResponse submitRequest(OMRequest omRequest, ClientId cliId, long callId) throws ServiceException {
+    RaftClientRequest raftClientRequest = RaftClientRequest.newBuilder()
+        .setClientId(cliId)
+        .setServerId(getRaftPeerId())
+        .setGroupId(getRaftGroupId())
+        .setCallId(callId)
+        .setMessage(Message.valueOf(
+            OMRatisHelper.convertRequestToByteString(omRequest)))
+        .setType(RaftClientRequest.writeRequestType())
+        .build();
+    RaftClientReply raftClientReply =
+        submitRequestToRatis(raftClientRequest);
+    return createOmResponse(omRequest, raftClientReply);
+  }
+
+  private RaftClientReply submitRequestToRatisImpl(
       RaftClientRequest raftClientRequest) throws ServiceException {
     try {
       return server.submitClientRequestAsync(raftClientRequest)
@@ -315,8 +356,7 @@ public final class OzoneManagerRatisServer {
             " new OM peer {} to the Ratis group {}", ozoneManager.getOMNodeId(),
         newRaftPeer, raftGroup);
 
-    List<RaftPeer> newPeersList = new ArrayList<>();
-    newPeersList.addAll(raftPeerMap.values());
+    final List<RaftPeer> newPeersList = new ArrayList<>(raftPeerMap.values());
     newPeersList.add(newRaftPeer);
 
     checkLeaderStatus();
@@ -347,9 +387,10 @@ public final class OzoneManagerRatisServer {
             "remove OM peer {} from Ratis group {}", ozoneManager.getOMNodeId(),
         removeNodeId, raftGroup);
 
-    List<RaftPeer> newPeersList = new ArrayList<>();
-    newPeersList.addAll(raftPeerMap.values());
-    newPeersList.remove(raftPeerMap.get(removeNodeId));
+    final List<RaftPeer> newPeersList = raftPeerMap.entrySet().stream()
+        .filter(e -> !e.getKey().equals(removeNodeId))
+        .map(Map.Entry::getValue)
+        .collect(Collectors.toList());
 
     checkLeaderStatus();
     SetConfigurationRequest request = new SetConfigurationRequest(clientId,
@@ -371,10 +412,8 @@ public final class OzoneManagerRatisServer {
   /**
    * Return a list of peer NodeIds.
    */
-  public List<String> getPeerIds() {
-    List<String> peerIds = new ArrayList<>();
-    peerIds.addAll(raftPeerMap.keySet());
-    return peerIds;
+  public Set<String> getPeerIds() {
+    return Collections.unmodifiableSet(raftPeerMap.keySet());
   }
 
   /**
@@ -420,7 +459,7 @@ public final class OzoneManagerRatisServer {
    * @return RaftClientRequest - Raft Client request which is submitted to
    * ratis server.
    */
-  private RaftClientRequest createWriteRaftClientRequest(OMRequest omRequest) {
+  private RaftClientRequest createRaftRequestImpl(OMRequest omRequest) {
     if (!ozoneManager.isTestSecureOmFlag()) {
       Preconditions.checkArgument(Server.getClientId() != DUMMY_CLIENT_ID);
       Preconditions.checkArgument(Server.getCallId() != INVALID_CALL_ID);
@@ -445,8 +484,8 @@ public final class OzoneManagerRatisServer {
    * @return OMResponse - response which is returned to client.
    * @throws ServiceException
    */
-  private OMResponse processReply(OMRequest omRequest, RaftClientReply reply)
-      throws ServiceException {
+  private OMResponse createOmResponseImpl(OMRequest omRequest,
+      RaftClientReply reply) throws ServiceException {
     // NotLeader exception is thrown only when the raft server to which the
     // request is submitted is not the leader. This can happen first time
     // when client is submitting request to OM.
@@ -464,6 +503,11 @@ public final class OzoneManagerRatisServer {
       if (leaderNotReadyException != null) {
         throw new ServiceException(new OMLeaderNotReadyException(
             leaderNotReadyException.getMessage()));
+      }
+
+      LeaderSteppingDownException leaderSteppingDownException = reply.getLeaderSteppingDownException();
+      if (leaderSteppingDownException != null) {
+        throw new ServiceException(new OMNotLeaderException(leaderSteppingDownException.getMessage()));
       }
 
       StateMachineException stateMachineException =
@@ -496,7 +540,7 @@ public final class OzoneManagerRatisServer {
 
     try {
       return OMRatisHelper.getOMResponseFromRaftClientReply(reply);
-    } catch (InvalidProtocolBufferException ex) {
+    } catch (IOException ex) {
       if (ex.getMessage() != null) {
         throw new ServiceException(ex.getMessage(), ex);
       } else {
@@ -529,8 +573,8 @@ public final class OzoneManagerRatisServer {
   }
 
   @VisibleForTesting
-  public RaftServer getServer() {
-    return server;
+  public RaftServer.Division getServerDivision() {
+    return serverDivision.get();
   }
 
   /**
@@ -562,23 +606,21 @@ public final class OzoneManagerRatisServer {
   }
 
   public void stop() {
+    LOG.info("Stopping {} at port {}", this, port);
     try {
+      // Ratis will also close the state machine
       server.close();
-      omStateMachine.close();
     } catch (IOException e) {
       throw new RuntimeException(e);
     }
   }
 
-  //TODO simplify it to make it shorter
-  @SuppressWarnings("methodlength")
   public static RaftProperties newRaftProperties(ConfigurationSource conf,
       int port, String ratisStorageDir) {
     // Set RPC type
-    final String rpcType = conf.get(
+    final RpcType rpc = SupportedRpcType.valueOfIgnoreCase(conf.get(
         OMConfigKeys.OZONE_OM_RATIS_RPC_TYPE_KEY,
-        OMConfigKeys.OZONE_OM_RATIS_RPC_TYPE_DEFAULT);
-    final RpcType rpc = SupportedRpcType.valueOfIgnoreCase(rpcType);
+        OMConfigKeys.OZONE_OM_RATIS_RPC_TYPE_DEFAULT));
     final RaftProperties properties = RatisHelper.newRaftProperties(rpc);
 
     // Set the ratis port number
@@ -589,127 +631,116 @@ public final class OzoneManagerRatisServer {
     }
 
     // Set Ratis storage directory
-    RaftServerConfigKeys.setStorageDir(properties,
-        Collections.singletonList(new File(ratisStorageDir)));
-    // Disable/enable the pre vote feature in Ratis
-    RaftServerConfigKeys.LeaderElection.setPreVote(properties,
-        conf.getBoolean(OMConfigKeys.OZONE_OM_RATIS_SERVER_ELECTION_PRE_VOTE,
-            OMConfigKeys.OZONE_OM_RATIS_SERVER_ELECTION_PRE_VOTE_DEFAULT));
+    RaftServerConfigKeys.setStorageDir(properties, Collections.singletonList(new File(ratisStorageDir)));
 
+    final int logAppenderBufferByteLimit = (int) conf.getStorageSize(
+        OMConfigKeys.OZONE_OM_RATIS_LOG_APPENDER_QUEUE_BYTE_LIMIT,
+        OMConfigKeys.OZONE_OM_RATIS_LOG_APPENDER_QUEUE_BYTE_LIMIT_DEFAULT, StorageUnit.BYTES);
+    setRaftLogProperties(properties, logAppenderBufferByteLimit, conf);
+
+    // For grpc config
+    RatisConfUtils.Grpc.setMessageSizeMax(properties, logAppenderBufferByteLimit);
+
+    setRaftLeaderElectionProperties(properties, conf);
+
+    setRaftRpcProperties(properties, conf);
+
+    setRaftRetryCacheProperties(properties, conf);
+
+    setRaftSnapshotProperties(properties, conf);
+
+    setRaftCloseThreshold(properties, conf);
+
+    getOMHAConfigs(conf).forEach(properties::set);
+    return properties;
+  }
+
+  private static void setRaftLeaderElectionProperties(RaftProperties properties, ConfigurationSource conf) {
+    // Disable/enable the pre vote feature in Ratis
+    RaftServerConfigKeys.LeaderElection.setPreVote(properties, conf.getBoolean(
+        OMConfigKeys.OZONE_OM_RATIS_SERVER_ELECTION_PRE_VOTE,
+        OMConfigKeys.OZONE_OM_RATIS_SERVER_ELECTION_PRE_VOTE_DEFAULT));
+  }
+
+  private static void setRaftLogProperties(RaftProperties properties,
+      int logAppenderQueueByteLimit, ConfigurationSource conf) {
     // Set RAFT segment size
-    final long raftSegmentSize = (long) conf.getStorageSize(
+    RaftServerConfigKeys.Log.setSegmentSizeMax(properties, SizeInBytes.valueOf((long) conf.getStorageSize(
         OMConfigKeys.OZONE_OM_RATIS_SEGMENT_SIZE_KEY,
-        OMConfigKeys.OZONE_OM_RATIS_SEGMENT_SIZE_DEFAULT,
-        StorageUnit.BYTES);
-    RaftServerConfigKeys.Log.setSegmentSizeMax(properties,
-        SizeInBytes.valueOf(raftSegmentSize));
+        OMConfigKeys.OZONE_OM_RATIS_SEGMENT_SIZE_DEFAULT, StorageUnit.BYTES)));
 
     // Set to enable RAFT to purge logs up to Snapshot Index
-    RaftServerConfigKeys.Log.setPurgeUptoSnapshotIndex(properties,
-        conf.getBoolean(
-          OMConfigKeys.OZONE_OM_RATIS_LOG_PURGE_UPTO_SNAPSHOT_INDEX,
-          OMConfigKeys.OZONE_OM_RATIS_LOG_PURGE_UPTO_SNAPSHOT_INDEX_DEFAULT
-        )
-    );
+    RaftServerConfigKeys.Log.setPurgeUptoSnapshotIndex(properties, conf.getBoolean(
+        OMConfigKeys.OZONE_OM_RATIS_LOG_PURGE_UPTO_SNAPSHOT_INDEX,
+        OMConfigKeys.OZONE_OM_RATIS_LOG_PURGE_UPTO_SNAPSHOT_INDEX_DEFAULT));
+
     // Set number of last RAFT logs to not be purged
-    RaftServerConfigKeys.Log.setPurgePreservationLogNum(properties,
-        conf.getLong(
-          OMConfigKeys.OZONE_OM_RATIS_LOG_PURGE_PRESERVATION_LOG_NUM,
-          OMConfigKeys.OZONE_OM_RATIS_LOG_PURGE_PRESERVATION_LOG_NUM_DEFAULT
-        )
-    );
+    RaftServerConfigKeys.Log.setPurgePreservationLogNum(properties, conf.getLong(
+        OMConfigKeys.OZONE_OM_RATIS_LOG_PURGE_PRESERVATION_LOG_NUM,
+        OMConfigKeys.OZONE_OM_RATIS_LOG_PURGE_PRESERVATION_LOG_NUM_DEFAULT));
 
     // Set RAFT segment pre-allocated size
-    final long raftSegmentPreallocatedSize = (long) conf.getStorageSize(
+    RaftServerConfigKeys.Log.setPreallocatedSize(properties, SizeInBytes.valueOf((long) conf.getStorageSize(
         OMConfigKeys.OZONE_OM_RATIS_SEGMENT_PREALLOCATED_SIZE_KEY,
-        OMConfigKeys.OZONE_OM_RATIS_SEGMENT_PREALLOCATED_SIZE_DEFAULT,
-        StorageUnit.BYTES);
-    int logAppenderQueueNumElements = conf.getInt(
+        OMConfigKeys.OZONE_OM_RATIS_SEGMENT_PREALLOCATED_SIZE_DEFAULT, StorageUnit.BYTES)));
+
+    // Set RAFT buffer element limit
+    RaftServerConfigKeys.Log.Appender.setBufferElementLimit(properties, conf.getInt(
         OMConfigKeys.OZONE_OM_RATIS_LOG_APPENDER_QUEUE_NUM_ELEMENTS,
-        OMConfigKeys.OZONE_OM_RATIS_LOG_APPENDER_QUEUE_NUM_ELEMENTS_DEFAULT);
-    final int logAppenderQueueByteLimit = (int) conf.getStorageSize(
-        OMConfigKeys.OZONE_OM_RATIS_LOG_APPENDER_QUEUE_BYTE_LIMIT,
-        OMConfigKeys.OZONE_OM_RATIS_LOG_APPENDER_QUEUE_BYTE_LIMIT_DEFAULT,
-        StorageUnit.BYTES);
-    RaftServerConfigKeys.Log.Appender.setBufferElementLimit(properties,
-        logAppenderQueueNumElements);
-    RaftServerConfigKeys.Log.Appender.setBufferByteLimit(properties,
-        SizeInBytes.valueOf(logAppenderQueueByteLimit));
-    RaftServerConfigKeys.Log.setPreallocatedSize(properties,
-        SizeInBytes.valueOf(raftSegmentPreallocatedSize));
-    RaftServerConfigKeys.Log.Appender.setInstallSnapshotEnabled(properties,
-        false);
-    final int logPurgeGap = conf.getInt(
+        OMConfigKeys.OZONE_OM_RATIS_LOG_APPENDER_QUEUE_NUM_ELEMENTS_DEFAULT));
+
+    RaftServerConfigKeys.Log.Appender.setBufferByteLimit(properties, SizeInBytes.valueOf(logAppenderQueueByteLimit));
+    RaftServerConfigKeys.Log.setWriteBufferSize(properties, SizeInBytes.valueOf(logAppenderQueueByteLimit + 8));
+    RaftServerConfigKeys.Log.Appender.setInstallSnapshotEnabled(properties, false);
+
+    RaftServerConfigKeys.Log.setPurgeGap(properties, conf.getInt(
         OMConfigKeys.OZONE_OM_RATIS_LOG_PURGE_GAP,
-        OMConfigKeys.OZONE_OM_RATIS_LOG_PURGE_GAP_DEFAULT);
-    RaftServerConfigKeys.Log.setPurgeGap(properties, logPurgeGap);
-
-    // For grpc set the maximum message size
-    // TODO: calculate the optimal max message size
-    GrpcConfigKeys.setMessageSizeMax(properties,
-        SizeInBytes.valueOf(logAppenderQueueByteLimit));
-
-    // Set the server request timeout
-    TimeUnit serverRequestTimeoutUnit =
-        OMConfigKeys.OZONE_OM_RATIS_SERVER_REQUEST_TIMEOUT_DEFAULT.getUnit();
-    long serverRequestTimeoutDuration = conf.getTimeDuration(
-        OMConfigKeys.OZONE_OM_RATIS_SERVER_REQUEST_TIMEOUT_KEY,
-        OMConfigKeys.OZONE_OM_RATIS_SERVER_REQUEST_TIMEOUT_DEFAULT
-            .getDuration(), serverRequestTimeoutUnit);
-    final TimeDuration serverRequestTimeout = TimeDuration.valueOf(
-        serverRequestTimeoutDuration, serverRequestTimeoutUnit);
-    RaftServerConfigKeys.Rpc.setRequestTimeout(properties,
-        serverRequestTimeout);
-
-    // Set timeout for server retry cache entry
-    TimeUnit retryCacheTimeoutUnit = OMConfigKeys
-        .OZONE_OM_RATIS_SERVER_RETRY_CACHE_TIMEOUT_DEFAULT.getUnit();
-    long retryCacheTimeoutDuration = conf.getTimeDuration(
-        OMConfigKeys.OZONE_OM_RATIS_SERVER_RETRY_CACHE_TIMEOUT_KEY,
-        OMConfigKeys.OZONE_OM_RATIS_SERVER_RETRY_CACHE_TIMEOUT_DEFAULT
-            .getDuration(), retryCacheTimeoutUnit);
-    final TimeDuration retryCacheTimeout = TimeDuration.valueOf(
-        retryCacheTimeoutDuration, retryCacheTimeoutUnit);
-    RaftServerConfigKeys.RetryCache.setExpiryTime(properties,
-        retryCacheTimeout);
-
-    // Set the server min and max timeout
-    TimeUnit serverMinTimeoutUnit =
-        OMConfigKeys.OZONE_OM_RATIS_MINIMUM_TIMEOUT_DEFAULT.getUnit();
-    long serverMinTimeoutDuration = conf.getTimeDuration(
-        OMConfigKeys.OZONE_OM_RATIS_MINIMUM_TIMEOUT_KEY,
-        OMConfigKeys.OZONE_OM_RATIS_MINIMUM_TIMEOUT_DEFAULT
-            .getDuration(), serverMinTimeoutUnit);
-    final TimeDuration serverMinTimeout = TimeDuration.valueOf(
-        serverMinTimeoutDuration, serverMinTimeoutUnit);
-    long serverMaxTimeoutDuration =
-        serverMinTimeout.toLong(TimeUnit.MILLISECONDS) + 200;
-    final TimeDuration serverMaxTimeout = TimeDuration.valueOf(
-        serverMaxTimeoutDuration, TimeUnit.MILLISECONDS);
-    RaftServerConfigKeys.Rpc.setTimeoutMin(properties,
-        serverMinTimeout);
-    RaftServerConfigKeys.Rpc.setTimeoutMax(properties,
-        serverMaxTimeout);
+        OMConfigKeys.OZONE_OM_RATIS_LOG_PURGE_GAP_DEFAULT));
 
     // Set the number of maximum cached segments
     RaftServerConfigKeys.Log.setSegmentCacheNumMax(properties, 2);
+  }
 
-    // TODO: set max write buffer size
+  private static void setRaftRpcProperties(RaftProperties properties, ConfigurationSource conf) {
+    // Set the server request timeout
+    TimeUnit serverRequestTimeoutUnit = OMConfigKeys.OZONE_OM_RATIS_SERVER_REQUEST_TIMEOUT_DEFAULT.getUnit();
+    final TimeDuration serverRequestTimeout = TimeDuration.valueOf(conf.getTimeDuration(
+        OMConfigKeys.OZONE_OM_RATIS_SERVER_REQUEST_TIMEOUT_KEY,
+        OMConfigKeys.OZONE_OM_RATIS_SERVER_REQUEST_TIMEOUT_DEFAULT.getDuration(), serverRequestTimeoutUnit),
+        serverRequestTimeoutUnit);
+    RaftServerConfigKeys.Rpc.setRequestTimeout(properties, serverRequestTimeout);
 
-    TimeUnit nodeFailureTimeoutUnit =
-        OMConfigKeys.OZONE_OM_RATIS_SERVER_FAILURE_TIMEOUT_DURATION_DEFAULT
-            .getUnit();
-    long nodeFailureTimeoutDuration = conf.getTimeDuration(
+    // Set the server min and max timeout
+    TimeUnit serverMinTimeoutUnit = OMConfigKeys.OZONE_OM_RATIS_MINIMUM_TIMEOUT_DEFAULT.getUnit();
+    final TimeDuration serverMinTimeout = TimeDuration.valueOf(conf.getTimeDuration(
+        OMConfigKeys.OZONE_OM_RATIS_MINIMUM_TIMEOUT_KEY,
+        OMConfigKeys.OZONE_OM_RATIS_MINIMUM_TIMEOUT_DEFAULT.getDuration(), serverMinTimeoutUnit),
+        serverMinTimeoutUnit);
+    final TimeDuration serverMaxTimeout = serverMinTimeout.add(200, TimeUnit.MILLISECONDS);
+    RaftServerConfigKeys.Rpc.setTimeoutMin(properties, serverMinTimeout);
+    RaftServerConfigKeys.Rpc.setTimeoutMax(properties, serverMaxTimeout);
+
+    // Set the server Rpc slowness timeout and Notification noLeader timeout
+    TimeUnit nodeFailureTimeoutUnit = OMConfigKeys.OZONE_OM_RATIS_SERVER_FAILURE_TIMEOUT_DURATION_DEFAULT.getUnit();
+    final TimeDuration nodeFailureTimeout = TimeDuration.valueOf(conf.getTimeDuration(
         OMConfigKeys.OZONE_OM_RATIS_SERVER_FAILURE_TIMEOUT_DURATION_KEY,
-        OMConfigKeys.OZONE_OM_RATIS_SERVER_FAILURE_TIMEOUT_DURATION_DEFAULT
-            .getDuration(), nodeFailureTimeoutUnit);
-    final TimeDuration nodeFailureTimeout = TimeDuration.valueOf(
-        nodeFailureTimeoutDuration, nodeFailureTimeoutUnit);
-    RaftServerConfigKeys.Notification.setNoLeaderTimeout(properties,
-        nodeFailureTimeout);
-    RaftServerConfigKeys.Rpc.setSlownessTimeout(properties,
-        nodeFailureTimeout);
+        OMConfigKeys.OZONE_OM_RATIS_SERVER_FAILURE_TIMEOUT_DURATION_DEFAULT.getDuration(), nodeFailureTimeoutUnit),
+        nodeFailureTimeoutUnit);
+    RaftServerConfigKeys.Notification.setNoLeaderTimeout(properties, nodeFailureTimeout);
+    RaftServerConfigKeys.Rpc.setSlownessTimeout(properties, nodeFailureTimeout);
+  }
 
+  private static void setRaftRetryCacheProperties(RaftProperties properties, ConfigurationSource conf) {
+    // Set timeout for server retry cache entry
+    TimeUnit retryCacheTimeoutUnit = OMConfigKeys.OZONE_OM_RATIS_SERVER_RETRY_CACHE_TIMEOUT_DEFAULT.getUnit();
+    final TimeDuration retryCacheTimeout = TimeDuration.valueOf(conf.getTimeDuration(
+        OMConfigKeys.OZONE_OM_RATIS_SERVER_RETRY_CACHE_TIMEOUT_KEY,
+        OMConfigKeys.OZONE_OM_RATIS_SERVER_RETRY_CACHE_TIMEOUT_DEFAULT.getDuration(), retryCacheTimeoutUnit),
+        retryCacheTimeoutUnit);
+    RaftServerConfigKeys.RetryCache.setExpiryTime(properties, retryCacheTimeout);
+  }
+
+  private static void setRaftSnapshotProperties(RaftProperties properties, ConfigurationSource conf) {
     // Set auto trigger snapshot. We don't need to configure auto trigger
     // threshold in OM, as last applied index is flushed during double buffer
     // flush automatically. (But added this property internally, so that this
@@ -719,18 +750,22 @@ public final class OzoneManagerRatisServer {
     // The transaction info value in OM DB is used as
     // snapshot value after restart.
 
-    RaftServerConfigKeys.Snapshot.setAutoTriggerEnabled(
-        properties, true);
+    RaftServerConfigKeys.Snapshot.setAutoTriggerEnabled(properties, true);
 
-    long snapshotAutoTriggerThreshold = conf.getLong(
+    RaftServerConfigKeys.Snapshot.setAutoTriggerThreshold(properties, conf.getLong(
         OMConfigKeys.OZONE_OM_RATIS_SNAPSHOT_AUTO_TRIGGER_THRESHOLD_KEY,
-        OMConfigKeys.OZONE_OM_RATIS_SNAPSHOT_AUTO_TRIGGER_THRESHOLD_DEFAULT);
+        OMConfigKeys.OZONE_OM_RATIS_SNAPSHOT_AUTO_TRIGGER_THRESHOLD_DEFAULT));
+  }
 
-    RaftServerConfigKeys.Snapshot.setAutoTriggerThreshold(properties,
-        snapshotAutoTriggerThreshold);
-
-    getOMHAConfigs(conf).forEach(properties::set);
-    return properties;
+  private static void setRaftCloseThreshold(RaftProperties properties, ConfigurationSource conf) {
+    // Set RAFT server close threshold
+    TimeUnit closeThresholdUnit = OMConfigKeys.OZONE_OM_RATIS_SERVER_CLOSE_THRESHOLD_DEFAULT.getUnit();
+    final int closeThreshold = (int) TimeDuration.valueOf(conf.getTimeDuration(
+        OMConfigKeys.OZONE_OM_RATIS_SERVER_CLOSE_THRESHOLD_KEY,
+        OMConfigKeys.OZONE_OM_RATIS_SERVER_CLOSE_THRESHOLD_DEFAULT.getDuration(), closeThresholdUnit),
+        closeThresholdUnit).toLong(TimeUnit.SECONDS);
+    // TODO: update to new api setCloseThreshold(RaftProperties, TimeDuration) if available
+    RaftServerConfigKeys.setCloseThreshold(properties, closeThreshold);
   }
 
   private static Map<String, String> getOMHAConfigs(
@@ -739,25 +774,18 @@ public final class OzoneManagerRatisServer {
         .getPropsMatchPrefixAndTrimPrefix(OZONE_OM_HA_PREFIX + ".");
   }
 
-  public RaftPeer getLeader() {
-    try {
-      RaftServer.Division division = server.getDivision(raftGroupId);
-      if (division != null) {
-        if (division.getInfo().isLeader()) {
-          return division.getPeer();
-        } else {
-          ByteString leaderId = division.getInfo().getRoleInfoProto()
-                  .getFollowerInfo().getLeaderInfo().getId().getId();
-          return leaderId.isEmpty() ? null :
-                  division.getRaftConf().getPeer(RaftPeerId.valueOf(leaderId));
-        }
-      }
-    } catch (IOException e) {
-      // In this case we return not a leader.
-      LOG.error("Fail to get RaftServer impl and therefore it's not clear " +
-          "whether it's leader. ", e);
+  public RaftPeerId getLeaderId() {
+    return getServerDivision().getInfo().getLeaderId();
+  }
+
+  public OMNotLeaderException newOMNotLeaderException() {
+    final RaftPeerId leaderId = getLeaderId();
+    final RaftPeer leader = leaderId == null ? null : getServerDivision().getRaftConf().getPeer(leaderId);
+    if (leader == null) {
+      return new OMNotLeaderException(raftPeerId);
     }
-    return null;
+    final String leaderAddress = getRaftLeaderAddress(leader);
+    return new OMNotLeaderException(raftPeerId, leader.getId(), leaderAddress);
   }
 
   /**
@@ -775,40 +803,15 @@ public final class OzoneManagerRatisServer {
    * @return RaftServerStatus.
    */
   public RaftServerStatus checkLeaderStatus() {
-    try {
-      RaftServer.Division division = server.getDivision(raftGroupId);
-      if (division != null) {
-        if (!division.getInfo().isLeader()) {
-          return RaftServerStatus.NOT_LEADER;
-        } else if (division.getInfo().isLeaderReady()) {
-          return RaftServerStatus.LEADER_AND_READY;
-        } else {
-          return RaftServerStatus.LEADER_AND_NOT_READY;
-        }
-      }
-    } catch (IOException ioe) {
-      // In this case we return not a leader.
-      LOG.error("Fail to get RaftServer impl and therefore it's not clear " +
-          "whether it's leader. ", ioe);
-    }
-    return RaftServerStatus.NOT_LEADER;
-  }
-
-  /**
-   * Get list of peer NodeIds from Ratis.
-   * @return List of Peer NodeId's.
-   */
-  @VisibleForTesting
-  public List<String> getCurrentPeersFromRaftConf() throws IOException {
-    try {
-      Collection<RaftPeer> currentPeers =
-          server.getDivision(raftGroupId).getRaftConf().getCurrentPeers();
-      List<String> currentPeerList = new ArrayList<>();
-      currentPeers.forEach(e -> currentPeerList.add(e.getId().toString()));
-      return currentPeerList;
-    } catch (IOException e) {
-      // In this case we return not a leader.
-      throw new IOException("Failed to get peer information from Ratis.", e);
+    final RaftServer.Division division = getServerDivision();
+    if (division == null) {
+      return RaftServerStatus.NOT_LEADER;
+    } else if (!division.getInfo().isLeader()) {
+      return RaftServerStatus.NOT_LEADER;
+    } else if (division.getInfo().isLeaderReady()) {
+      return RaftServerStatus.LEADER_AND_READY;
+    } else {
+      return RaftServerStatus.LEADER_AND_NOT_READY;
     }
   }
 
@@ -827,16 +830,7 @@ public final class OzoneManagerRatisServer {
   }
 
   @VisibleForTesting
-  public RaftPeerId getRaftLeaderId() {
-    return this.getLeader() == null ? null : this.getLeader().getId();
-  }
-
-  @VisibleForTesting
-  public String getRaftLeaderAddress() {
-    RaftPeer leaderPeer = getLeader();
-    if (leaderPeer == null) {
-      return null;
-    }
+  public String getRaftLeaderAddress(RaftPeer leaderPeer) {
     InetAddress leaderInetAddress = null;
     try {
       Optional<String> hostname =

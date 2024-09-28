@@ -43,7 +43,7 @@ read and write these blocks directly.
 
  2. SCM keeps track of all the block
 replicas. If there is a loss of data node or a disk, SCM
-detects it and instructs data nodes make copies of the
+detects it and instructs data nodes to make copies of the
 missing blocks to ensure high availability.
 
  3. **SCM's Certificate Authority** is in
@@ -84,7 +84,7 @@ The following data is persisted in Storage Container Manager side in a specific 
    * Containers are the replication units. Data is required to act in case of data under/over replicated.
  * Deleted blocks
    * Block data is deleted in the background. Need a list to follow the progress.
- * Valid cert, Revoked certs
+ * Valid cert
   * Used by the internal Certificate Authority to authorize other Ozone services
 
 ## Notable configurations

@@ -19,37 +19,45 @@ package org.apache.hadoop.ozone.container.common.utils;
 
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.scm.ScmConfigKeys;
+import org.apache.hadoop.hdfs.server.datanode.checker.VolumeCheckResult;
 import org.apache.hadoop.ozone.OzoneConfigKeys;
 import org.apache.hadoop.ozone.container.common.ContainerTestUtils;
 import org.apache.hadoop.ozone.container.common.volume.DbVolume;
 import org.apache.hadoop.ozone.container.common.volume.HddsVolume;
 import org.apache.hadoop.ozone.container.common.volume.MutableVolumeSet;
 import org.apache.hadoop.ozone.container.common.volume.StorageVolume;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.rules.TemporaryFolder;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNotEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrowsExactly;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mockStatic;
+
+import org.mockito.MockedStatic;
+import org.mockito.Mockito;
+
 
 /**
  * Test for {@link HddsVolumeUtil}.
  */
 public class TestHddsVolumeUtil {
-  @Rule
-  public final TemporaryFolder tempDir = new TemporaryFolder();
+  @TempDir
+  private Path tempDir;
 
   private final String datanodeId = UUID.randomUUID().toString();
   private final String clusterId = UUID.randomUUID().toString();
@@ -58,7 +66,7 @@ public class TestHddsVolumeUtil {
   private MutableVolumeSet hddsVolumeSet;
   private MutableVolumeSet dbVolumeSet;
 
-  @Before
+  @BeforeEach
   public void setup() throws Exception {
     ContainerTestUtils.enableSchemaV3(conf);
 
@@ -66,7 +74,8 @@ public class TestHddsVolumeUtil {
     File[] hddsVolumeDirs = new File[VOLUMNE_NUM];
     StringBuilder hddsDirs = new StringBuilder();
     for (int i = 0; i < VOLUMNE_NUM; i++) {
-      hddsVolumeDirs[i] = tempDir.newFolder();
+      hddsVolumeDirs[i] =
+          Files.createDirectory(tempDir.resolve("volumeDir" + i)).toFile();
       hddsDirs.append(hddsVolumeDirs[i]).append(",");
     }
     conf.set(ScmConfigKeys.HDDS_DATANODE_DIR_KEY, hddsDirs.toString());
@@ -77,7 +86,8 @@ public class TestHddsVolumeUtil {
     File[] dbVolumeDirs = new File[VOLUMNE_NUM];
     StringBuilder dbDirs = new StringBuilder();
     for (int i = 0; i < VOLUMNE_NUM; i++) {
-      dbVolumeDirs[i] = tempDir.newFolder();
+      dbVolumeDirs[i] =
+          Files.createDirectory(tempDir.resolve("dbVolumeDir" + i)).toFile();
       dbDirs.append(dbVolumeDirs[i]).append(",");
     }
     conf.set(OzoneConfigKeys.HDDS_DATANODE_CONTAINER_DB_DIR,
@@ -86,10 +96,38 @@ public class TestHddsVolumeUtil {
         StorageVolume.VolumeType.DB_VOLUME, null);
   }
 
-  @After
+  @AfterEach
   public void teardown() {
     hddsVolumeSet.shutdown();
     dbVolumeSet.shutdown();
+  }
+
+  @Test
+  public void testLoadHDDVolumeWithInitDBException()
+      throws Exception {
+    // Create db instances for all HDDsVolumes.
+    for (HddsVolume hddsVolume : StorageVolumeUtil.getHddsVolumesList(
+        hddsVolumeSet.getVolumesList())) {
+      hddsVolume.format(clusterId);
+      hddsVolume.createWorkingDir(clusterId, null);
+    }
+
+    try (MockedStatic<HddsVolumeUtil> mocked = mockStatic(HddsVolumeUtil.class, Mockito.CALLS_REAL_METHODS)) {
+      // Simulating the init DB Exception
+      mocked.when(() -> HddsVolumeUtil.initPerDiskDBStore(Mockito.anyString(), Mockito.any(), Mockito.anyBoolean()))
+          .thenThrow(new IOException("Mocked Exception"));
+
+      reinitVolumes();
+      for (HddsVolume hddsVolume : StorageVolumeUtil.getHddsVolumesList(
+          hddsVolumeSet.getVolumesList())) {
+        assertThrowsExactly(IOException.class, () -> hddsVolume.loadDbStore(true));
+        // If the Volume init DB is abnormal, the Volume should be recognized as a failed Volume
+        assertEquals(VolumeCheckResult.FAILED, hddsVolume.check(false));
+        assertTrue(hddsVolume.isDbLoadFailure());
+        assertFalse(hddsVolume.isDbLoaded());
+      }
+    }
+
   }
 
   @Test

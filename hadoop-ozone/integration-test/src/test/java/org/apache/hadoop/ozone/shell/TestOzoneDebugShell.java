@@ -21,6 +21,8 @@ package org.apache.hadoop.ozone.shell;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hdds.client.ECReplicationConfig;
+import org.apache.hadoop.hdds.client.ReplicationConfig;
 import org.apache.hadoop.hdds.client.ReplicationFactor;
 import org.apache.hadoop.hdds.client.ReplicationType;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
@@ -39,13 +41,15 @@ import org.apache.hadoop.ozone.debug.OzoneDebug;
 import org.apache.hadoop.ozone.debug.RDBParser;
 import org.apache.hadoop.ozone.om.OMConfigKeys;
 import org.apache.hadoop.ozone.om.OMStorage;
+import org.apache.hadoop.ozone.om.helpers.BucketLayout;
 import org.apache.hadoop.ozone.om.helpers.OmKeyArgs;
 import org.apache.hadoop.ozone.om.helpers.OmKeyLocationInfo;
 import org.apache.ozone.test.GenericTestUtils;
 import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import picocli.CommandLine;
 
 import java.io.File;
@@ -68,6 +72,8 @@ import static org.apache.hadoop.hdds.scm.ScmConfigKeys.OZONE_SCM_HEARTBEAT_PROCE
 import static org.apache.hadoop.ozone.OzoneConsts.OM_KEY_PREFIX;
 import static org.apache.hadoop.ozone.OzoneConsts.OM_SNAPSHOT_CHECKPOINT_DIR;
 import static org.apache.hadoop.ozone.OzoneConsts.OM_DB_NAME;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /**
  * Test Ozone Debug shell.
@@ -75,8 +81,6 @@ import static org.apache.hadoop.ozone.OzoneConsts.OM_DB_NAME;
 public class TestOzoneDebugShell {
 
   private static String omServiceId;
-  private static String clusterId;
-  private static String scmId;
 
   private static MiniOzoneCluster cluster = null;
   private static OzoneClient client;
@@ -86,13 +90,8 @@ public class TestOzoneDebugShell {
   protected static void startCluster() throws Exception {
     // Init HA cluster
     omServiceId = "om-service-test1";
-    clusterId = UUID.randomUUID().toString();
-    scmId = UUID.randomUUID().toString();
-    final int numDNs = 3;
+    final int numDNs = 5;
     cluster = MiniOzoneCluster.newBuilder(conf)
-        .setClusterId(clusterId)
-        .setScmId(scmId)
-        .setOMServiceId(omServiceId)
         .setNumDatanodes(numDNs)
         .build();
     cluster.waitForClusterToBeReady();
@@ -117,21 +116,22 @@ public class TestOzoneDebugShell {
     startCluster();
   }
 
-  @Test
-  public void testChunkInfoCmdBeforeAfterCloseContainer() throws Exception {
+  @ParameterizedTest
+  @ValueSource(booleans = {true, false})
+  public void testChunkInfoCmdBeforeAfterCloseContainer(boolean isEcKey) throws Exception {
     final String volumeName = UUID.randomUUID().toString();
     final String bucketName = UUID.randomUUID().toString();
     final String keyName = UUID.randomUUID().toString();
 
-    writeKey(volumeName, bucketName, keyName);
+    writeKey(volumeName, bucketName, keyName, isEcKey);
 
     int exitCode = runChunkInfoCommand(volumeName, bucketName, keyName);
-    Assertions.assertEquals(0, exitCode);
+    assertEquals(0, exitCode);
 
     closeContainerForKey(volumeName, bucketName, keyName);
 
     exitCode = runChunkInfoCommand(volumeName, bucketName, keyName);
-    Assertions.assertEquals(0, exitCode);
+    assertEquals(0, exitCode);
   }
 
   @Test
@@ -139,9 +139,9 @@ public class TestOzoneDebugShell {
     final String volumeName = UUID.randomUUID().toString();
     final String bucketName = UUID.randomUUID().toString();
     final String keyName = UUID.randomUUID().toString();
-    writeKey(volumeName, bucketName, keyName);
+    writeKey(volumeName, bucketName, keyName, false);
     int exitCode = runChunkInfoAndVerifyPaths(volumeName, bucketName, keyName);
-    Assertions.assertEquals(0, exitCode);
+    assertEquals(0, exitCode);
   }
 
   @Test
@@ -155,14 +155,14 @@ public class TestOzoneDebugShell {
     final String bucketName = UUID.randomUUID().toString();
     final String keyName = UUID.randomUUID().toString();
 
-    writeKey(volumeName, bucketName, keyName);
+    writeKey(volumeName, bucketName, keyName, false);
 
     String snapshotName =
         client.getObjectStore().createSnapshot(volumeName, bucketName, "snap1");
     OzoneSnapshot snapshot =
         client.getObjectStore().listSnapshot(volumeName, bucketName, null, null)
             .next();
-    Assertions.assertEquals(snapshotName, snapshot.getName());
+    assertEquals(snapshotName, snapshot.getName());
     String dbPath = getSnapshotDBPath(snapshot.getCheckpointDir());
     String snapshotCurrent = dbPath + OM_KEY_PREFIX + "CURRENT";
     GenericTestUtils
@@ -170,9 +170,9 @@ public class TestOzoneDebugShell {
     String[] args =
         new String[] {"--db=" + dbPath, "scan", "--cf", "keyTable"};
     int exitCode = cmd.execute(args);
-    Assertions.assertEquals(0, exitCode);
+    assertEquals(0, exitCode);
     String cmdOut = stdout.toString();
-    Assertions.assertTrue(cmdOut.contains(keyName));
+    assertThat(cmdOut).contains(keyName);
   }
 
   private static String getSnapshotDBPath(String checkPointDir) {
@@ -181,14 +181,22 @@ public class TestOzoneDebugShell {
         OM_DB_NAME + checkPointDir;
   }
 
-
   private static void writeKey(String volumeName, String bucketName,
-      String keyName) throws IOException {
+      String keyName, boolean isEcKey) throws IOException {
+    ReplicationConfig repConfig;
+    if (isEcKey) {
+      repConfig = new ECReplicationConfig(3, 2);
+    } else {
+      repConfig = ReplicationConfig.fromTypeAndFactor(ReplicationType.RATIS,
+          ReplicationFactor.THREE);
+    }
     try (OzoneClient client = OzoneClientFactory.getRpcClient(conf)) {
-      TestDataUtil.createVolumeAndBucket(client, volumeName, bucketName);
+      // see HDDS-10091 for making this work with FILE_SYSTEM_OPTIMIZED layout
+      TestDataUtil.createVolumeAndBucket(client, volumeName, bucketName,
+          BucketLayout.LEGACY);
       TestDataUtil.createKey(
           client.getObjectStore().getVolume(volumeName).getBucket(bucketName),
-          keyName, ReplicationFactor.THREE, ReplicationType.RATIS, "test");
+          keyName, repConfig, "test");
     }
   }
 
@@ -231,7 +239,7 @@ public class TestOzoneDebugShell {
       // DN storage directories are set differently for each DN
       // in MiniOzoneCluster as datanode-0,datanode-1,datanode-2 which is why
       // we expect 3 paths here in the set.
-      Assertions.assertEquals(3, blockFilePaths.size());
+      assertEquals(3, blockFilePaths.size());
     }
     return exitCode;
   }

@@ -96,10 +96,15 @@ public class DatanodeSchemaOneDBDefinition
     return METADATA;
   }
 
-  @Override
   public DBColumnFamilyDefinition<String, ChunkInfoList>
       getDeletedBlocksColumnFamily() {
     return DELETED_BLOCKS;
+  }
+
+  @Override
+  public DBColumnFamilyDefinition<String, BlockData>
+      getLastChunkInfoColumnFamily() {
+    return null;
   }
 
   @Override

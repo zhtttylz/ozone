@@ -48,7 +48,7 @@ the key to the Ozone Manager. Ozone manager returns the list of Ozone blocks
 that make up that key.
 
 An Ozone block contains the container ID and a local ID. The figure below
-shows the logical layout out of Ozone block.
+shows the logical layout of the Ozone block.
 
 ![Ozone Block](OzoneBlock.png)
 
@@ -76,3 +76,15 @@ blocks that get reported. That is a 40x reduction in the block reports.
 This extra indirection helps tremendously with scaling Ozone. SCM has far
 less block data to process and the namespace service (Ozone Manager) as a
 different service are critical to scaling Ozone.
+
+
+## Notable configurations
+
+key | default | <div style="width: 300px;">description</div>
+----|---------|------------
+dfs.container.ratis.datanode.storage.dir | none | This directory is used for storing Ratis metadata like logs.
+ozone.scm.datanode.id.dir | none | The path that datanodes will use to store the datanode ID.
+hdds.datanode.dir | none | Determines where HDDS data will be stored on the local filesystem.
+hdds.datanode.dir.du.reserved | none | Reserved space in bytes per volume. Always leave this much space free for non dfs use.
+ozone.metadata.dirs | none | Directory to store persisted data (RocksDB).
+ozone.recon.address | 0.0.0.0:9891 | RPC address of the Recon. Use <host:port> to connect Recon.

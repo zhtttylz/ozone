@@ -22,14 +22,12 @@ import com.google.common.base.Preconditions;
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.RemovalListener;
-import com.google.common.collect.Lists;
 
 import org.apache.hadoop.fs.FileUtil;
 import org.apache.hadoop.hdds.client.BlockID;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos;
 import org.apache.hadoop.hdds.scm.container.common.helpers.StorageContainerException;
 import org.apache.hadoop.ozone.common.ChunkBuffer;
-import org.apache.hadoop.ozone.common.utils.BufferUtils;
 import org.apache.hadoop.ozone.container.common.helpers.BlockData;
 import org.apache.hadoop.ozone.container.common.helpers.ChunkInfo;
 import org.apache.hadoop.ozone.container.common.helpers.ContainerMetrics;
@@ -75,7 +73,10 @@ public class FilePerBlockStrategy implements ChunkManager {
 
   private final boolean doSyncWrite;
   private final OpenFiles files = new OpenFiles();
-  private final long defaultReadBufferCapacity;
+  private final int defaultReadBufferCapacity;
+  private final int readMappedBufferThreshold;
+  private final int readMappedBufferMaxCount;
+  private final MappedBufferManager mappedBufferManager;
   private final VolumeSet volumeSet;
 
   public FilePerBlockStrategy(boolean sync, BlockManager manager,
@@ -83,7 +84,17 @@ public class FilePerBlockStrategy implements ChunkManager {
     doSyncWrite = sync;
     this.defaultReadBufferCapacity = manager == null ? 0 :
         manager.getDefaultReadBufferCapacity();
+    this.readMappedBufferThreshold = manager == null ? 0
+        : manager.getReadMappedBufferThreshold();
+    this.readMappedBufferMaxCount = manager == null ? 0
+        : manager.getReadMappedBufferMaxCount();
+    LOG.info("ozone.chunk.read.mapped.buffer.max.count is load with {}", readMappedBufferMaxCount);
     this.volumeSet = volSet;
+    if (this.readMappedBufferMaxCount > 0) {
+      mappedBufferManager = new MappedBufferManager(this.readMappedBufferMaxCount);
+    } else {
+      mappedBufferManager = null;
+    }
   }
 
   private static void checkLayoutVersion(Container container) {
@@ -95,7 +106,7 @@ public class FilePerBlockStrategy implements ChunkManager {
   public String streamInit(Container container, BlockID blockID)
       throws StorageContainerException {
     checkLayoutVersion(container);
-    File chunkFile = getChunkFile(container, blockID, null);
+    final File chunkFile = getChunkFile(container, blockID);
     return chunkFile.getAbsolutePath();
   }
 
@@ -104,7 +115,7 @@ public class FilePerBlockStrategy implements ChunkManager {
           Container container, BlockID blockID, ContainerMetrics metrics)
           throws StorageContainerException {
     checkLayoutVersion(container);
-    File chunkFile = getChunkFile(container, blockID, null);
+    final File chunkFile = getChunkFile(container, blockID);
     return new KeyValueStreamDataChannel(chunkFile,
         container.getContainerData(), metrics);
   }
@@ -136,7 +147,7 @@ public class FilePerBlockStrategy implements ChunkManager {
     KeyValueContainerData containerData = (KeyValueContainerData) container
         .getContainerData();
 
-    File chunkFile = getChunkFile(container, blockID, info);
+    final File chunkFile = getChunkFile(container, blockID);
     long len = info.getLen();
     long offset = info.getOffset();
 
@@ -187,19 +198,14 @@ public class FilePerBlockStrategy implements ChunkManager {
 
     HddsVolume volume = containerData.getVolume();
 
-    File chunkFile = getChunkFile(container, blockID, info);
+    final File chunkFile = getChunkFile(container, blockID);
 
-    int len = (int) info.getLen();
+    final long len = info.getLen();
     long offset = info.getOffset();
-    long bufferCapacity =  ChunkManager.getBufferCapacityForChunkRead(info,
+    int bufferCapacity = ChunkManager.getBufferCapacityForChunkRead(info,
         defaultReadBufferCapacity);
-
-    ByteBuffer[] dataBuffers = BufferUtils.assignByteBuffers(len,
-        bufferCapacity);
-
-    ChunkUtils.readData(chunkFile, dataBuffers, offset, len, volume);
-
-    return ChunkBuffer.wrap(Lists.newArrayList(dataBuffers));
+    return ChunkUtils.readData(len, bufferCapacity, chunkFile, offset, volume,
+        readMappedBufferThreshold, readMappedBufferMaxCount > 0, mappedBufferManager);
   }
 
   @Override
@@ -217,13 +223,30 @@ public class FilePerBlockStrategy implements ChunkManager {
   @Override
   public void finishWriteChunks(KeyValueContainer container,
       BlockData blockData) throws IOException {
-    File chunkFile = getChunkFile(container, blockData.getBlockID(), null);
+    final File chunkFile = getChunkFile(container, blockData.getBlockID());
     try {
       files.close(chunkFile);
       verifyChunkFileExists(chunkFile);
     } catch (IOException e) {
       onFailure(container.getContainerData().getVolume());
       throw e;
+    }
+  }
+
+  @Override
+  public void finalizeWriteChunk(KeyValueContainer container,
+      BlockID blockId) throws IOException {
+    synchronized (container) {
+      File chunkFile = getChunkFile(container, blockId);
+      try {
+        if (files.isOpen(chunkFile)) {
+          files.close(chunkFile);
+        }
+        verifyChunkFileExists(chunkFile);
+      } catch (IOException e) {
+        onFailure(container.getContainerData().getVolume());
+        throw e;
+      }
     }
   }
 
@@ -234,7 +257,7 @@ public class FilePerBlockStrategy implements ChunkManager {
 
     Preconditions.checkNotNull(blockID, "Block ID cannot be null.");
 
-    File file = getChunkFile(container, blockID, info);
+    final File file = getChunkFile(container, blockID);
 
     // if the chunk file does not exist, it might have already been deleted.
     // The call might be because of reapply of transactions on datanode
@@ -254,10 +277,8 @@ public class FilePerBlockStrategy implements ChunkManager {
     LOG.info("Deleted block file: {}", file);
   }
 
-  private File getChunkFile(Container container, BlockID blockID,
-      ChunkInfo info) throws StorageContainerException {
-    return FILE_PER_BLOCK.getChunkFile(container.getContainerData(), blockID,
-        info);
+  private static File getChunkFile(Container container, BlockID blockID) throws StorageContainerException {
+    return FILE_PER_BLOCK.getChunkFile(container.getContainerData(), blockID, null);
   }
 
   private static void checkFullDelete(ChunkInfo info, File chunkFile)
@@ -308,6 +329,11 @@ public class FilePerBlockStrategy implements ChunkManager {
       if (file != null) {
         files.invalidate(file.getPath());
       }
+    }
+
+    public boolean isOpen(File file) {
+      return file != null &&
+          files.getIfPresent(file.getPath()) != null;
     }
 
     private static void close(String filename, OpenFile openFile) {

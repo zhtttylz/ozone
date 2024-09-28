@@ -24,7 +24,8 @@ import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ContainerCommandRequestProto;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ContainerCommandResponseProto;
-import org.apache.hadoop.hdds.scm.XceiverClientManager;
+import org.apache.hadoop.hdds.scm.XceiverClientCreator;
+import org.apache.hadoop.hdds.scm.XceiverClientFactory;
 import org.apache.hadoop.hdds.scm.XceiverClientSpi;
 import org.apache.hadoop.hdds.scm.pipeline.Pipeline;
 import org.apache.hadoop.hdds.scm.protocol.StorageContainerLocationProtocol;
@@ -91,8 +92,8 @@ public class DatanodeChunkValidator extends BaseFreonGenerator
                  createStorageContainerLocationClient(ozoneConf)) {
       Pipeline pipeline = findPipelineForTest(pipelineId, scmClient, LOG);
 
-      try (XceiverClientManager xceiverClientManager =
-                   new XceiverClientManager(ozoneConf)) {
+      try (XceiverClientFactory xceiverClientManager =
+                   new XceiverClientCreator(ozoneConf)) {
         xceiverClient = xceiverClientManager.acquireClientForReadData(pipeline);
 
         checksumProtobuf = ContainerProtos.ChecksumData.newBuilder()
@@ -193,7 +194,7 @@ public class DatanodeChunkValidator extends BaseFreonGenerator
       throws OzoneChecksumException {
     ContainerProtos.ReadChunkResponseProto readChunk = response.getReadChunk();
     if (readChunk.hasData()) {
-      return checksum.computeChecksum(readChunk.getData().toByteArray());
+      return checksum.computeChecksum(readChunk.getData().asReadOnlyByteBuffer());
     } else {
       return checksum.computeChecksum(
           readChunk.getDataBuffers().getBuffersList());

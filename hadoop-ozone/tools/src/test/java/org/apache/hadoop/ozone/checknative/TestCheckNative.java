@@ -19,17 +19,18 @@
 package org.apache.hadoop.ozone.checknative;
 
 import org.apache.hadoop.ozone.shell.checknative.CheckNative;
-import org.junit.After;
-import org.junit.AfterClass;
-import org.junit.BeforeClass;
-import org.junit.Test;
-
+import org.apache.ozone.test.tag.Native;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.Test;
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
 import java.io.UnsupportedEncodingException;
 
+import static org.apache.hadoop.hdds.utils.NativeConstants.ROCKS_TOOLS_NATIVE_LIBRARY_NAME;
+import static org.assertj.core.api.Assertions.assertThat;
 import static java.nio.charset.StandardCharsets.UTF_8;
-import static org.junit.Assert.assertTrue;
 
 /**
  * Tests for {@link CheckNative}.
@@ -41,7 +42,7 @@ public class TestCheckNative {
 
   private static final String DEFAULT_ENCODING = UTF_8.name();
 
-  @BeforeClass
+  @BeforeAll
   public static void init() throws UnsupportedEncodingException {
     psBackup = System.out;
     outputStream = new ByteArrayOutputStream();
@@ -57,17 +58,33 @@ public class TestCheckNative {
     // trims multiple spaces
     String stdOut = outputStream.toString(DEFAULT_ENCODING)
         .replaceAll(" +", " ");
-    assertTrue(stdOut.contains("Native library checking:"));
-    assertTrue(stdOut.contains("hadoop: false"));
-    assertTrue(stdOut.contains("ISA-L: false"));
+    assertThat(stdOut).contains("Native library checking:");
+    assertThat(stdOut).contains("hadoop: false");
+    assertThat(stdOut).contains("ISA-L: false");
+    assertThat(stdOut).contains("rocks-tools: false");
   }
 
-  @After
+  @Native(ROCKS_TOOLS_NATIVE_LIBRARY_NAME)
+  @Test
+  public void testCheckNativeRocksToolsLoaded() throws UnsupportedEncodingException {
+    outputStream.reset();
+    new CheckNative()
+        .run(new String[] {});
+    // trims multiple spaces
+    String stdOut = outputStream.toString(DEFAULT_ENCODING)
+        .replaceAll(" +", " ");
+    assertThat(stdOut).contains("Native library checking:");
+    assertThat(stdOut).contains("hadoop: false");
+    assertThat(stdOut).contains("ISA-L: false");
+    assertThat(stdOut).contains("rocks-tools: true");
+  }
+
+  @AfterEach
   public void setUp() {
     outputStream.reset();
   }
 
-  @AfterClass
+  @AfterAll
   public static void tearDown() {
     System.setOut(psBackup);
   }

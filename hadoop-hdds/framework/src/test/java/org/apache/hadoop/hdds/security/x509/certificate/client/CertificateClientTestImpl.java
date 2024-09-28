@@ -18,8 +18,10 @@ package org.apache.hadoop.hdds.security.x509.certificate.client;
 
 import java.io.IOException;
 import java.math.BigInteger;
+import java.security.GeneralSecurityException;
 import java.security.InvalidKeyException;
 import java.security.KeyPair;
+import java.security.KeyStore;
 import java.security.NoSuchAlgorithmException;
 import java.security.NoSuchProviderException;
 import java.security.PrivateKey;
@@ -46,20 +48,17 @@ import java.util.function.Function;
 
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
-import org.apache.hadoop.hdds.security.ssl.KeyStoresFactory;
+import org.apache.hadoop.hdds.scm.client.ClientTrustManager;
+import org.apache.hadoop.hdds.security.exception.SCMSecurityException;
 import org.apache.hadoop.hdds.security.SecurityConfig;
-import org.apache.hadoop.hdds.security.x509.certificate.authority.CAType;
+import org.apache.hadoop.hdds.security.ssl.ReloadingX509KeyManager;
+import org.apache.hadoop.hdds.security.ssl.ReloadingX509TrustManager;
 import org.apache.hadoop.hdds.security.x509.certificate.authority.DefaultApprover;
 import org.apache.hadoop.hdds.security.x509.certificate.authority.profile.DefaultProfile;
 import org.apache.hadoop.hdds.security.x509.certificate.utils.CertificateSignRequest;
 import org.apache.hadoop.hdds.security.x509.certificate.utils.SelfSignedCertificate;
 import org.apache.hadoop.hdds.security.x509.exception.CertificateException;
 import org.apache.hadoop.hdds.security.x509.keys.HDDSKeyGenerator;
-
-import org.apache.hadoop.hdds.security.x509.keys.SecurityUtil;
-import org.bouncycastle.cert.X509CertificateHolder;
-import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
-import org.bouncycastle.pkcs.PKCS10CertificationRequest;
 
 import static org.apache.hadoop.hdds.HddsConfigKeys.HDDS_X509_DEFAULT_DURATION;
 import static org.apache.hadoop.hdds.HddsConfigKeys.HDDS_X509_DEFAULT_DURATION_DEFAULT;
@@ -83,8 +82,8 @@ public class CertificateClientTestImpl implements CertificateClient {
 
   private HDDSKeyGenerator keyGen;
   private DefaultApprover approver;
-  private KeyStoresFactory serverKeyStoresFactory;
-  private KeyStoresFactory clientKeyStoresFactory;
+  private ReloadingX509KeyManager keyManager;
+  private ReloadingX509TrustManager trustManager;
   private Map<String, X509Certificate> certificateMap;
   private ScheduledExecutorService executorService;
   private Set<CertificateNotification> notificationReceivers;
@@ -108,18 +107,16 @@ public class CertificateClientTestImpl implements CertificateClient {
     LocalDateTime end = start.plus(Duration.parse(rootCACertDuration));
 
     // Generate RootCA certificate
-    SelfSignedCertificate.Builder builder =
-        SelfSignedCertificate.newBuilder()
-            .setBeginDate(start)
-            .setEndDate(end)
-            .setClusterID("cluster1")
-            .setKey(rootKeyPair)
-            .setSubject("rootCA@localhost")
-            .setConfiguration(securityConfig)
-            .setScmID("scm1")
-            .makeCA();
-    rootCert = new JcaX509CertificateConverter().getCertificate(
-        builder.build());
+    rootCert = SelfSignedCertificate.newBuilder()
+        .setBeginDate(start)
+        .setEndDate(end)
+        .setClusterID("cluster1")
+        .setKey(rootKeyPair)
+        .setSubject("rootCA@localhost")
+        .setConfiguration(securityConfig)
+        .setScmID("scm1")
+        .makeCA()
+        .build();
     certificateMap.put(rootCert.getSerialNumber().toString(), rootCert);
     rootCerts.add(rootCert);
 
@@ -140,23 +137,18 @@ public class CertificateClientTestImpl implements CertificateClient {
     start = LocalDateTime.now();
     String certDuration = conf.get(HDDS_X509_DEFAULT_DURATION,
         HDDS_X509_DEFAULT_DURATION_DEFAULT);
-    X509CertificateHolder certificateHolder =
-        approver.sign(securityConfig, rootKeyPair.getPrivate(),
-            new X509CertificateHolder(rootCert.getEncoded()),
+    //TODO: generateCSR should not be called...
+    x509Certificate = approver.sign(securityConfig, rootKeyPair.getPrivate(),
+            rootCert,
             Date.from(start.atZone(ZoneId.systemDefault()).toInstant()),
             Date.from(start.plus(Duration.parse(certDuration))
                 .atZone(ZoneId.systemDefault()).toInstant()),
-            csrBuilder.build(), "scm1", "cluster1");
-    x509Certificate =
-        new JcaX509CertificateConverter().getCertificate(certificateHolder);
+            csrBuilder.build().generateCSR(), "scm1", "cluster1",
+            String.valueOf(System.nanoTime()));
     certificateMap.put(x509Certificate.getSerialNumber().toString(),
         x509Certificate);
 
     notificationReceivers = new HashSet<>();
-    serverKeyStoresFactory = SecurityUtil.getServerKeyStoresFactory(
-        securityConfig, this, true);
-    clientKeyStoresFactory = SecurityUtil.getClientKeyStoresFactory(
-        securityConfig, this, true);
 
     if (autoRenew) {
       Duration gracePeriod = securityConfig.getRenewalGracePeriod();
@@ -221,11 +213,6 @@ public class CertificateClientTestImpl implements CertificateClient {
   }
 
   @Override
-  public byte[] signData(byte[] data) throws CertificateException {
-    return new byte[0];
-  }
-
-  @Override
   public boolean verifySignature(byte[] data, byte[] signature,
       X509Certificate cert) throws CertificateException {
     try {
@@ -243,24 +230,12 @@ public class CertificateClientTestImpl implements CertificateClient {
   }
 
   @Override
-  public CertificateSignRequest.Builder getCSRBuilder() {
+  public CertificateSignRequest.Builder configureCSRBuilder() throws SCMSecurityException {
     return new CertificateSignRequest.Builder();
   }
 
   @Override
-  public String signAndStoreCertificate(PKCS10CertificationRequest request)
-      throws CertificateException {
-    return null;
-  }
-
-  @Override
-  public void storeCertificate(String cert, CAType caType)
-      throws CertificateException {
-  }
-
-  @Override
-  public InitResponse init() throws CertificateException {
-    return null;
+  public void initWithRecovery() throws IOException {
   }
 
   @Override
@@ -283,38 +258,21 @@ public class CertificateClientTestImpl implements CertificateClient {
     return rootCerts;
   }
 
-  @Override
-  public List<String> getCAList() {
-    return null;
-  }
-
-  @Override
-  public List<String> listCA() throws IOException {
-    return null;
-  }
-
-  @Override
-  public List<String> updateCAList() throws IOException  {
-    return null;
-  }
-
   public void renewRootCA() throws Exception {
     LocalDateTime start = LocalDateTime.now();
     Duration rootCACertDuration = securityConfig.getMaxCertificateDuration();
     LocalDateTime end = start.plus(rootCACertDuration);
     rootKeyPair = keyGen.generateKey();
-    SelfSignedCertificate.Builder builder =
-        SelfSignedCertificate.newBuilder()
-            .setBeginDate(start)
-            .setEndDate(end)
-            .setClusterID("cluster1")
-            .setKey(rootKeyPair)
-            .setSubject("rootCA-new@localhost")
-            .setConfiguration(securityConfig)
-            .setScmID("scm1")
-            .makeCA(BigInteger.ONE.add(BigInteger.ONE));
-    rootCert = new JcaX509CertificateConverter().getCertificate(
-        builder.build());
+    rootCert = SelfSignedCertificate.newBuilder()
+        .setBeginDate(start)
+        .setEndDate(end)
+        .setClusterID("cluster1")
+        .setKey(rootKeyPair)
+        .setSubject("rootCA-new@localhost")
+        .setConfiguration(securityConfig)
+        .setScmID("scm1")
+        .makeCA(BigInteger.ONE.add(BigInteger.ONE))
+        .build();
     certificateMap.put(rootCert.getSerialNumber().toString(), rootCert);
     rootCerts.add(rootCert);
   }
@@ -333,13 +291,12 @@ public class CertificateClientTestImpl implements CertificateClient {
 
     Duration certDuration = securityConfig.getDefaultCertDuration();
     Date start = new Date();
-    X509CertificateHolder certificateHolder =
-        approver.sign(securityConfig, rootKeyPair.getPrivate(),
-            new X509CertificateHolder(rootCert.getEncoded()), start,
-            new Date(start.getTime() + certDuration.toMillis()),
-            csrBuilder.build(), "scm1", "cluster1");
+    //TODO: get rid of generateCSR call here, once the server side changes happened.
     X509Certificate newX509Certificate =
-        new JcaX509CertificateConverter().getCertificate(certificateHolder);
+        approver.sign(securityConfig, rootKeyPair.getPrivate(), rootCert, start,
+            new Date(start.getTime() + certDuration.toMillis()), csrBuilder.build().generateCSR(), "scm1", "cluster1",
+            String.valueOf(System.nanoTime())
+        );
 
     // Save the new private key and certificate to file
     // Save certificate and private key to keyStore
@@ -348,7 +305,6 @@ public class CertificateClientTestImpl implements CertificateClient {
     x509Certificate = newX509Certificate;
     certificateMap.put(x509Certificate.getSerialNumber().toString(),
         x509Certificate);
-    System.out.println(new Date() + " certificated is renewed");
 
     // notify notification receivers
     notificationReceivers.forEach(r -> r.notifyCertificateRenewed(this,
@@ -372,13 +328,42 @@ public class CertificateClientTestImpl implements CertificateClient {
   }
 
   @Override
-  public KeyStoresFactory getServerKeyStoresFactory() {
-    return serverKeyStoresFactory;
+  public ReloadingX509KeyManager getKeyManager() throws CertificateException {
+    try {
+      if (keyManager == null) {
+        keyManager = new ReloadingX509KeyManager(
+            KeyStore.getDefaultType(), getComponentName(), getPrivateKey(), getTrustChain());
+        notificationReceivers.add(keyManager);
+      }
+      return keyManager;
+    } catch (IOException | GeneralSecurityException e) {
+      throw new CertificateException("Failed to init keyManager", e, CertificateException.ErrorCode.KEYSTORE_ERROR);
+    }
   }
 
   @Override
-  public KeyStoresFactory getClientKeyStoresFactory() {
-    return clientKeyStoresFactory;
+  public ReloadingX509TrustManager getTrustManager() throws CertificateException {
+    try {
+      if (trustManager == null) {
+        Set<X509Certificate> newRootCaCerts = getAllRootCaCerts().isEmpty() ? getAllCaCerts() : getAllRootCaCerts();
+        trustManager = new ReloadingX509TrustManager(KeyStore.getDefaultType(), new ArrayList<>(newRootCaCerts));
+        notificationReceivers.add(trustManager);
+      }
+      return trustManager;
+    } catch (IOException | GeneralSecurityException e) {
+      throw new CertificateException("Failed to init trustManager", e);
+    }
+  }
+
+  @Override
+  public ClientTrustManager createClientTrustManager() throws IOException {
+    CACertificateProvider caCertificateProvider = () -> {
+      List<X509Certificate> caCerts = new ArrayList<>();
+      caCerts.addAll(getAllCaCerts());
+      caCerts.addAll(getAllRootCaCerts());
+      return caCerts;
+    };
+    return new ClientTrustManager(caCertificateProvider, caCertificateProvider);
   }
 
   @Override
@@ -397,14 +382,6 @@ public class CertificateClientTestImpl implements CertificateClient {
 
   @Override
   public void close() throws IOException {
-    if (serverKeyStoresFactory != null) {
-      serverKeyStoresFactory.destroy();
-    }
-
-    if (clientKeyStoresFactory != null) {
-      clientKeyStoresFactory.destroy();
-    }
-
     if (executorService != null) {
       executorService.shutdown();
     }

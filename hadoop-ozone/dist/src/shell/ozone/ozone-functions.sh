@@ -687,9 +687,8 @@ function ozone_find_confdir
 ## @return       will exit on failure conditions
 function ozone_verify_confdir
 {
-  # Check only log4j.properties by default.
-  # --loglevel does not work without logger settings in log4j.properties.
-  [[ -f "${1:?ozone_verify_confir requires parameter}/log4j.properties" ]]
+  # Check ozone-site.xml by default.
+  [[ -f "${1:?ozone_verify_confir requires parameter}/ozone-site.xml" ]]
 }
 
 ## @description  Import the ozone-env.sh settings
@@ -1405,6 +1404,44 @@ function ozone_java_setup
   if [[ ! -x "$JAVA" ]]; then
     ozone_error "ERROR: $JAVA is not executable."
     exit 1
+  fi
+
+  # Get the version string
+  JAVA_VERSION_STRING=$(${JAVA} -version 2>&1 | head -n 1)
+
+  # Extract the major version number
+  JAVA_MAJOR_VERSION=$(echo "$JAVA_VERSION_STRING" | sed -E -n 's/.* version "([^.-]*).*"/\1/p' | cut -d' ' -f1)
+
+  # Add JVM parameter (org.apache.ratis.thirdparty.io.netty.tryReflectionSetAccessible=true)
+  # to allow netty unsafe memory allocation in Java 9+.
+  RATIS_OPTS="${RATIS_OPTS:-}"
+
+  if [[ "${JAVA_MAJOR_VERSION}" -ge 9 ]]; then
+    RATIS_OPTS="-Dorg.apache.ratis.thirdparty.io.netty.tryReflectionSetAccessible=true ${RATIS_OPTS}"
+  fi
+
+  ozone_set_module_access_args
+}
+
+## @description  Set OZONE_MODULE_ACCESS_ARGS based on Java version
+## @audience     private
+## @stability    evolving
+## @replaceable  yes
+function ozone_set_module_access_args
+{
+  if [[ -z "${JAVA_MAJOR_VERSION}" ]]; then
+    return
+  fi
+
+  # populate JVM args based on java version
+  if [[ "${JAVA_MAJOR_VERSION}" -ge 17 ]]; then
+    OZONE_MODULE_ACCESS_ARGS="${OZONE_MODULE_ACCESS_ARGS} --add-opens java.management/com.sun.jmx.mbeanserver=ALL-UNNAMED"
+    OZONE_MODULE_ACCESS_ARGS="${OZONE_MODULE_ACCESS_ARGS} --add-exports java.management/com.sun.jmx.mbeanserver=ALL-UNNAMED"
+  fi
+  if [[ "${JAVA_MAJOR_VERSION}" -ge 9 ]]; then
+    OZONE_MODULE_ACCESS_ARGS="${OZONE_MODULE_ACCESS_ARGS} --add-opens java.base/java.nio=ALL-UNNAMED"
+    OZONE_MODULE_ACCESS_ARGS="${OZONE_MODULE_ACCESS_ARGS} --add-opens java.base/java.lang=ALL-UNNAMED"
+    OZONE_MODULE_ACCESS_ARGS="${OZONE_MODULE_ACCESS_ARGS} --add-opens java.base/java.lang.reflect=ALL-UNNAMED"
   fi
 }
 

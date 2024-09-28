@@ -36,7 +36,6 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.time.Clock;
 import java.util.OptionalLong;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -53,23 +52,24 @@ public class DeleteContainerCommandHandler implements CommandHandler {
   private final AtomicInteger invocationCount = new AtomicInteger(0);
   private final AtomicInteger timeoutCount = new AtomicInteger(0);
   private final AtomicLong totalTime = new AtomicLong(0);
-  private final ExecutorService executor;
+  private final ThreadPoolExecutor executor;
   private final Clock clock;
   private int maxQueueSize;
 
   public DeleteContainerCommandHandler(
-      int threadPoolSize, Clock clock, int queueSize) {
+      int threadPoolSize, Clock clock, int queueSize, String threadNamePrefix) {
     this(clock, new ThreadPoolExecutor(
-        threadPoolSize, threadPoolSize,
-        0L, TimeUnit.MILLISECONDS,
-        new LinkedBlockingQueue<>(queueSize),
-        new ThreadFactoryBuilder()
-            .setNameFormat("DeleteContainerThread-%d").build()),
+            threadPoolSize, threadPoolSize,
+            0L, TimeUnit.MILLISECONDS,
+            new LinkedBlockingQueue<>(queueSize),
+            new ThreadFactoryBuilder()
+                .setNameFormat(threadNamePrefix + "DeleteContainerThread-%d")
+                .build()),
         queueSize);
   }
 
   protected DeleteContainerCommandHandler(Clock clock,
-      ExecutorService executor, int queueSize) {
+      ThreadPoolExecutor executor, int queueSize) {
     this.executor = executor;
     this.clock = clock;
     maxQueueSize = queueSize;
@@ -130,7 +130,7 @@ public class DeleteContainerCommandHandler implements CommandHandler {
 
   @Override
   public int getQueuedCount() {
-    return ((ThreadPoolExecutor)executor).getQueue().size();
+    return executor.getQueue().size();
   }
 
   @Override
@@ -157,6 +157,16 @@ public class DeleteContainerCommandHandler implements CommandHandler {
   @Override
   public long getTotalRunTime() {
     return totalTime.get();
+  }
+
+  @Override
+  public int getThreadPoolMaxPoolSize() {
+    return executor.getMaximumPoolSize();
+  }
+
+  @Override
+  public int getThreadPoolActivePoolSize() {
+    return executor.getActiveCount();
   }
 
   @Override

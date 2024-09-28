@@ -24,7 +24,7 @@ import static org.apache.hadoop.ozone.OzoneConsts.OZONE_URI_DELIMITER;
 
 /**
  * Class representing an ozone object.
- * It can be a volume with non-null volumeName (bucketName=null & name=null)
+ * It can be a volume with non-null volumeName {@literal (bucketName=null & name=null)}
  * or a bucket with non-null volumeName and bucketName (name=null)
  * or a key with non-null volumeName, bucketName and key name
  * (via getKeyName)
@@ -184,6 +184,16 @@ public final class OzoneObjInfo extends OzoneObj {
           .setBucketName(args.getBucketName())
           .setKeyName(args.getKeyName())
           .setResType(ResourceType.KEY);
+    }
+
+    public static Builder fromOzoneObj(OzoneObj obj) {
+      return new Builder()
+          .setVolumeName(obj.getVolumeName())
+          .setBucketName(obj.getBucketName())
+          .setKeyName(obj.getKeyName())
+          .setResType(obj.getResourceType())
+          .setStoreType(obj.getStoreType())
+          .setOzonePrefixPath(obj.getOzonePrefixPathViewer());
     }
 
     public Builder setResType(OzoneObj.ResourceType res) {

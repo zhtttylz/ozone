@@ -18,7 +18,7 @@
 package org.apache.hadoop.ozone.recon.persistence;
 
 import static org.hadoop.ozone.recon.schema.ContainerSchemaDefinition.UnHealthyContainerStates.UNDER_REPLICATED;
-import static org.hadoop.ozone.recon.schema.ContainerSchemaDefinition.UnHealthyContainerStates.ALL_REPLICAS_UNHEALTHY;
+import static org.hadoop.ozone.recon.schema.ContainerSchemaDefinition.UnHealthyContainerStates.ALL_REPLICAS_BAD;
 import static org.hadoop.ozone.recon.schema.tables.UnhealthyContainersTable.UNHEALTHY_CONTAINERS;
 import static org.jooq.impl.DSL.count;
 
@@ -34,6 +34,9 @@ import org.jooq.Cursor;
 import org.jooq.DSLContext;
 import org.jooq.Record;
 import org.jooq.SelectQuery;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.util.List;
 
 /**
@@ -41,6 +44,8 @@ import java.util.List;
  */
 @Singleton
 public class ContainerHealthSchemaManager {
+  private static final Logger LOG =
+      LoggerFactory.getLogger(ContainerHealthSchemaManager.class);
 
   private final UnhealthyContainersDao unhealthyContainersDao;
   private final ContainerSchemaDefinition containerSchemaDefinition;
@@ -71,7 +76,7 @@ public class ContainerHealthSchemaManager {
     SelectQuery<Record> query = dslContext.selectQuery();
     query.addFrom(UNHEALTHY_CONTAINERS);
     if (state != null) {
-      if (state.equals(ALL_REPLICAS_UNHEALTHY)) {
+      if (state.equals(ALL_REPLICAS_BAD)) {
         query.addConditions(UNHEALTHY_CONTAINERS.CONTAINER_STATE
             .eq(UNDER_REPLICATED.toString()));
         query.addConditions(UNHEALTHY_CONTAINERS.ACTUAL_REPLICA_COUNT.eq(0));
@@ -113,6 +118,12 @@ public class ContainerHealthSchemaManager {
   }
 
   public void insertUnhealthyContainerRecords(List<UnhealthyContainers> recs) {
+    if (LOG.isDebugEnabled()) {
+      recs.forEach(rec -> {
+        LOG.debug("rec.getContainerId() : {}, rec.getContainerState(): {} ", rec.getContainerId(),
+            rec.getContainerState());
+      });
+    }
     unhealthyContainersDao.insert(recs);
   }
 
